@@ -183,6 +183,12 @@ Beyond the game/server basics, `config.toml` (see `config.default.toml` for the 
 
 The built-in HTTP server (see `ReplayServerPort`) also serves an auto-refreshing status page at `/` - the current map with its TMX preview image, the active preset, everyone currently racing and their live checkpoint progress, and the top finishers list. `/status.json` exposes the same data as JSON.
 
+## Development Note
+
+This mod was developed with the help of [Claude Code](https://claude.com/claude-code). The ideas, presets, design and testing are my own, with AI assisting throughout the development process. If you find a bug, please report it in the [issues](https://github.com/cheatoskar/randomizer-anywhere-100--tmx/issues).
+
+---
+
 ## Special thanks
 
 - To [BigBang1112](https://github.com/BigBang1112), for building Randomizer Anywhere and Randomizer TMF before it
