@@ -189,7 +189,9 @@ internal sealed partial class ServerSetup
                 return text;
             });
         }
-        contents = ValidationSeedRegex().Replace(contents, "<use_changing_validation_seed>True</use_changing_validation_seed>");
+        // Off on purpose: a changing seed perturbs the physics per run, so press-forward lines drift and
+        // blockmixed starts behave differently than offline. Server-saved ghost replays don't need it.
+        contents = ValidationSeedRegex().Replace(contents, "<use_changing_validation_seed>False</use_changing_validation_seed>");
 
         await File.WriteAllTextAsync(filePath, contents, cancellationToken);
     }
