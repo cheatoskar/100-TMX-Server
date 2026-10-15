@@ -40,6 +40,9 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
     // callback stream, that one lost reply froze every callback for the full 60 s handler cutoff.
     // Bounding each call keeps a single lost reply down to this long, and the caller gets an
     // ordinary exception it already knows how to handle.
+    // The lost replies themselves were ManiaAPI.XmlRpc <= 2.9.2 registering a call's reply slot only
+    // after sending it, so a fast reply could arrive first and be thrown away (the dedicated server's
+    // ConsoleLog shows those calls as "succeeded"); 2.9.5 registers first. The bound stays as a guard.
     private static readonly TimeSpan RpcTimeout = TimeSpan.FromSeconds(10);
 
     // Every call to the dedicated server goes through here so each one is timed and recorded in the
@@ -202,9 +205,20 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
 
     public bool SupportsWriteFile() => SupportedMethods.Contains("WriteFile");
 
+    // TMF refuses any XML-RPC request over 512 KB (the limit XAseco's GbxRemote enforces too), and
+    // it does so by dropping the connection - on 2026-10-10 a 934 KB map sent via /votemap took the
+    // whole server down twice in a row. WriteFile sends the map base64-encoded (4/3 the size) inside
+    // an XML envelope, so anything that would not fit goes straight to disk instead; the dedicated
+    // server always runs on this machine (we connect over loopback), so its Tracks folder is ours too.
+    private const int MaxRequestBytes = 512 * 1024 - 8;
+    private const int XmlEnvelopeAllowance = 4 * 1024;
+
+    private static bool FitsInOneRequest(byte[] fileData) =>
+        (fileData.Length + 2) / 3 * 4 + XmlEnvelopeAllowance <= MaxRequestBytes;
+
     public async Task WriteFileAsync(string filePath, byte[] fileData, CancellationToken cancellationToken = default)
     {
-        if (SupportedMethods.Contains("WriteFile"))
+        if (SupportedMethods.Contains("WriteFile") && FitsInOneRequest(fileData))
         {
             await CallAsync("WriteFile", [filePath, fileData], cancellationToken);
             return;
@@ -230,7 +244,7 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
         }
     }
 
-    public async Task<IEnumerable<XmlRpcMulticallResult>> SystemMulticallAsync(IEnumerable<XmlRpcMulticall> calls, CancellationToken cancellationToken = default)
+    public async Task<IEnumerable<XmlRpcCallResult>> SystemMulticallAsync(IEnumerable<XmlRpcCall> calls, CancellationToken cancellationToken = default)
     {
         var callList = calls.ToList();
         var startedAt = Stopwatch.GetTimestamp();

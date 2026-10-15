@@ -1818,13 +1818,27 @@ internal sealed partial class RandomizerGame
         votePresetName = presetName;
         voteYesLogins = [login];
 
-        await SendMessageAsync($"$FF0{GetNicknameOrLogin(login)} started a vote to switch to preset '{presetName}'. Type $0F0/yes$FF0 to support ({PresetVoteWindowMs / 1000}s window).", cancellationToken);
-        await client.SendManialinkPageAsync(BuildVotePopupManialink(presetName), cancellationToken: cancellationToken);
-
-        if (await HasVoteMajorityAsync(cancellationToken))
+        try
         {
-            await FinalizeVoteAsync(cancellationToken);
-            return;
+            await SendMessageAsync($"$FF0{GetNicknameOrLogin(login)} started a vote to switch to preset '{presetName}'. Type $0F0/yes$FF0 to support ({PresetVoteWindowMs / 1000}s window).", cancellationToken);
+            await client.SendManialinkPageAsync(BuildVotePopupManialink(presetName), cancellationToken: cancellationToken);
+
+            if (await HasVoteMajorityAsync(cancellationToken))
+            {
+                await FinalizeVoteAsync(cancellationToken);
+                return;
+            }
+        }
+        catch
+        {
+            // see VoteMapAsync - without this a failed announcement left the vote open for good
+            if (votePresetName == presetName)
+            {
+                votePresetName = null;
+                voteYesLogins = null;
+            }
+
+            throw;
         }
 
         _ = Task.Run(async () =>
@@ -2029,14 +2043,31 @@ internal sealed partial class RandomizerGame
         voteMapTrackId = trackId;
         voteYesLogins = [login];
 
-        var tagsSuffix = details.Tags.Count > 0 ? $" · {string.Join(", ", details.Tags)}" : string.Empty;
-        await SendMessageAsync($"$FF0{GetNicknameOrLogin(login)} started a vote to load $0F0{details.Name}$FF0 by {details.Author} ({details.DifficultyLabel}, AT {new TimeInt32(details.AuthorTimeMs)}{tagsSuffix}). Type $0F0/yes$FF0 to support ({PresetVoteWindowMs / 1000}s window).", cancellationToken);
-        await client.SendManialinkPageAsync(BuildMapVotePopupManialink(details), cancellationToken: cancellationToken);
-
-        if (await HasVoteMajorityAsync(cancellationToken))
+        try
         {
-            await FinalizeMapVoteAsync(cancellationToken);
-            return;
+            var tagsSuffix = details.Tags.Count > 0 ? $" · {string.Join(", ", details.Tags)}" : string.Empty;
+            await SendMessageAsync($"$FF0{GetNicknameOrLogin(login)} started a vote to load $0F0{details.Name}$FF0 by {details.Author} ({details.DifficultyLabel}, AT {new TimeInt32(details.AuthorTimeMs)}{tagsSuffix}). Type $0F0/yes$FF0 to support ({PresetVoteWindowMs / 1000}s window).", cancellationToken);
+            await client.SendManialinkPageAsync(BuildMapVotePopupManialink(details), cancellationToken: cancellationToken);
+
+            if (await HasVoteMajorityAsync(cancellationToken))
+            {
+                await FinalizeMapVoteAsync(cancellationToken);
+                return;
+            }
+        }
+        catch
+        {
+            // The vote is already marked active here, but the timer below that ends it hasn't
+            // started yet. On 2026-10-10 the announcement threw (a lost reply), the vote was never
+            // cleared, and every /votemap for the next hour answered "already in progress" until
+            // the service was restarted. Clear it so the player can simply try again.
+            if (voteMapTrackId == trackId)
+            {
+                voteMapTrackId = null;
+                voteYesLogins = null;
+            }
+
+            throw;
         }
 
         _ = Task.Run(async () =>
@@ -2412,7 +2443,7 @@ internal sealed partial class RandomizerGame
         var serverMessageType = GetServerMessageType(login);
 
         await client.SystemMulticallAsync(messageLines
-            .Select(msg => new XmlRpcMulticall(serverMessageType, login is null ? [msg] : [msg, login])), cancellationToken);
+            .Select(msg => new XmlRpcCall(serverMessageType, login is null ? [msg] : [msg, login])), cancellationToken);
     }
 
     private async Task SendMessageAsync(IEnumerable<string> messageLines, CancellationToken cancellationToken)
