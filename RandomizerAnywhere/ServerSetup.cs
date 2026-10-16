@@ -360,7 +360,9 @@ internal sealed partial class ServerSetup
             }
         }
 
-        var fallback = FindRecentLocalChallenge()
+        // a map of the preset's pool from the weekly local copy, else whatever was played last
+        var fallback = tmxRules.PickPoolCopyFileForWarmup()
+            ?? FindRecentLocalChallenge()
             ?? throw new InvalidOperationException("TMX is unreachable and there is no map on disk to start the server with.");
 
         var fallbackName = Path.GetFileName(fallback);

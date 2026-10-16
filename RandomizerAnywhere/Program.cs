@@ -59,6 +59,9 @@ try
 
     if (appConfig.DedicatedServerMode)
     {
+        // the weekly local copy of the map pool, for when TMX is down (see PoolCache)
+        _ = provider.GetRequiredService<TmxRules>().RunPoolCopyRefreshAsync(cts.Token);
+
         var statusDir = Path.Combine(AppContext.BaseDirectory, "WebStatus");
         var replayServer = new ReplayServer(serverSetup.ReplaysDir, statusDir, appConfig.ReplayServerPort, appConfig.ServerName, appConfig.FavoriteLogin);
 
@@ -160,6 +163,7 @@ finally
 [Singleton(typeof(DiscordNotifier))]
 [Singleton(typeof(Leaderboard))]
 [Singleton(typeof(MapPool))]
+[Singleton(typeof(PoolCache))]
 internal partial class AppServiceProvider
 {
     // Every TMX call on this client runs on the XML-RPC callback dispatch loop, which handles

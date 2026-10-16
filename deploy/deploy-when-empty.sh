@@ -54,6 +54,7 @@ EXCLUDES=(
   --exclude='./*.corrupt-*'
   --exclude=./WebStatus/status.json
   --exclude=./Servers
+  --exclude=./MapCache
   --exclude=./CANNOT_SEE_SERVER.txt
 )
 
@@ -154,7 +155,7 @@ for protected in config.toml leaderboard.json leaderboard.json.bak leaderboard.j
                  impossible-maps.json played-maps.json CANNOT_SEE_SERVER.txt WebStatus/status.json WebStatus/status.json.tmp; do
   rm -f "$build/$protected"
 done
-rm -rf "$build/Servers"
+rm -rf "$build/Servers" "$build/MapCache"
 find "$build" -name '*.corrupt-*' -delete
 
 # "active" -> running, needs the empty check and a restart; "inactive"/"failed" -> not running,

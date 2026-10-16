@@ -30,6 +30,7 @@ This project was made to support the [100% TMX Project](https://discord.gg/HRShW
 - Delivers a TMX-valid replay download link after every finish (TMX only accepts server-saved replays, not a client's own "save replay" button)
 - Permanent impossible-map exclusion, refreshed periodically from a shared list, plus in-session `/imp` and `/hard` reporting with Discord webhook alerts
 - Persistent server-side leaderboard (`/top`, `/rank`)
+- Keeps playing when TMX is down: every Sunday (and right away for a preset without one) the whole map pool of a listable preset is copied to `MapCache/` - the list and the map files, maps that left the pool are removed. While tm-exchange.com can't be reached, maps (and `/loadmap` ids that are in the copy) come from there, with the same no-repeat and impossible-list rules. Presets matching more than 3000 maps have no copy.
 - Curated genre presets, switchable instantly by an admin or via player vote (`/preset`, `/votepreset`)
 - `/rounds` switches a genuinely multilap map to Rounds mode on demand, so a full-length finish produces a valid replay, then reverts to TimeAttack automatically on the next map
 - Clickable in-game manialink widgets: preset picker, Yes/No vote popup, a Rounds-mode prompt on multilap maps, a live map-info panel (difficulty, TMX award count, author time), a map-history list (click a past map for its TMX link), and a gold/silver/bronze-highlighted top finishers panel

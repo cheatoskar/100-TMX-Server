@@ -2717,7 +2717,7 @@ internal sealed partial class RandomizerGame
         TmxRules.TrackDetails details;
         try
         {
-            details = await tmxRules.GetTrackDetailsAsync(trackId, cancellationToken);
+            details = await GetTrackDetailsOrCopyAsync(trackId, cancellationToken);
         }
         catch (Exception)
         {
@@ -2727,6 +2727,20 @@ internal sealed partial class RandomizerGame
 
         await SendMessageAsync($"$FF0{GetNicknameOrLogin(login)} is loading $0F0{details.Name}$FF0 (TMX {trackId})...", cancellationToken);
         await LoadForcedMapAsync(trackId, cancellationToken);
+    }
+
+    // TMX details for /loadmap and /votemap. While TMX is down a map from the local pool copy still
+    // loads, just without its details; anything else still fails as "could not find".
+    private async Task<TmxRules.TrackDetails> GetTrackDetailsOrCopyAsync(int trackId, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await tmxRules.GetTrackDetailsAsync(trackId, cancellationToken);
+        }
+        catch (Exception) when (!cancellationToken.IsCancellationRequested && tmxRules.IsInPoolCopy(trackId))
+        {
+            return new TmxRules.TrackDetails($"TMX {trackId} (local copy - TMX can't be reached)", "unknown", "unknown", 0, 0, []);
+        }
     }
 
     private async Task VoteMapAsync(int playerUid, string login, string[] args, CancellationToken cancellationToken)
@@ -2758,7 +2772,7 @@ internal sealed partial class RandomizerGame
         TmxRules.TrackDetails details;
         try
         {
-            details = await tmxRules.GetTrackDetailsAsync(trackId, cancellationToken);
+            details = await GetTrackDetailsOrCopyAsync(trackId, cancellationToken);
         }
         catch (Exception)
         {

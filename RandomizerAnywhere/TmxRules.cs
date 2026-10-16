@@ -30,6 +30,12 @@ internal sealed class TmxRules
     private readonly ImpossibleMaps impossibleMaps;
     private readonly SkippedMaps skippedMaps;
     private readonly MapPool mapPool;
+    private readonly PoolCache poolCache;
+
+    // After TMX failed to answer, maps come straight from the local pool copy for a while instead
+    // of every map switch first waiting for TMX to time out again.
+    private static readonly TimeSpan TmxOutageHold = TimeSpan.FromMinutes(10);
+    private DateTimeOffset tmxOutageUntil = DateTimeOffset.MinValue;
 
     // The full list of maps the current query matches, when it is small enough to load
     // (see MapPool). Refreshed regularly: new uploads join, and with the default preset's
@@ -135,13 +141,14 @@ internal sealed class TmxRules
         return bytes;
     }
 
-    public TmxRules(HttpClient http, AppConfig config, ImpossibleMaps impossibleMaps, SkippedMaps skippedMaps, MapPool mapPool)
+    public TmxRules(HttpClient http, AppConfig config, ImpossibleMaps impossibleMaps, SkippedMaps skippedMaps, MapPool mapPool, PoolCache poolCache)
     {
         this.http = http;
         this.config = config;
         this.impossibleMaps = impossibleMaps;
         this.skippedMaps = skippedMaps;
         this.mapPool = mapPool;
+        this.poolCache = poolCache;
 
         game = config.TmxGame ?? config.Game;
     }
@@ -281,15 +288,122 @@ internal sealed class TmxRules
     // not a random-pool pick that those exclusions are meant to filter
     public async Task<InMemoryFile> GetMapGbxByIdAsync(int trackId, CancellationToken cancellationToken = default)
     {
+        InMemoryFile map;
+        try
+        {
+            map = await DownloadMapAsync(trackId, cancellationToken);
+        }
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested && IsTmxOutage(ex) && poolCache.TryLoadMap(trackId) is { } copied)
+        {
+            Console.WriteLine($"TMX can't be reached ({ex.Message}) - map {trackId} comes from the local pool copy.");
+            map = copied;
+        }
+
+        MarkServed(trackId);
+        mapPool.MarkPlayed(trackId);
+        return map;
+    }
+
+    // Just the download - no "served"/"played" bookkeeping.
+    private async Task<InMemoryFile> DownloadMapAsync(int trackId, CancellationToken cancellationToken)
+    {
         using var response = await http.GetAsync(GetTrackGbxUrl(trackId.ToString(CultureInfo.InvariantCulture)), HttpCompletionOption.ResponseHeadersRead, cancellationToken);
 
         var gbxBytes = await ReadMapBytesAsync(response, trackId, cancellationToken);
         var fileName = response.Content.Headers.ContentDisposition?.FileNameStar
             ?? response.Content.Headers.ContentDisposition?.FileName ?? (response.RequestMessage?.RequestUri?.Segments.Last() + ".Gbx");
 
-        MarkServed(trackId);
-        mapPool.MarkPlayed(trackId);
         return new InMemoryFile(GetValidFileName(fileName), gbxBytes, trackId);
+    }
+
+    // The weekly copy of the pool (see PoolCache). Checks every half hour whether it is due; the
+    // first check right after the start fills the copy if there is none for the current preset.
+    public async Task RunPoolCopyRefreshAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                await RefreshPoolCopyIfDueAsync(cancellationToken);
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                Console.WriteLine($"Warning: updating the local pool copy failed, trying again later - {ex.Message}");
+            }
+
+            await Task.Delay(TimeSpan.FromMinutes(30), cancellationToken);
+        }
+    }
+
+    private async Task RefreshPoolCopyIfDueAsync(CancellationToken cancellationToken)
+    {
+        if (config.SourceFromImpossibleList)
+        {
+            return;
+        }
+
+        var query = config.TmxQueryOverride ?? BuildQuery();
+        var now = DateTimeOffset.UtcNow;
+        if (!poolCache.NeedsRefresh(query, now))
+        {
+            return;
+        }
+
+        using var listBudget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        listBudget.CancelAfter(TimeSpan.FromMinutes(2));
+        var (ids, complete) = await ListPoolAsync(query, listBudget.Token);
+
+        if (!complete)
+        {
+            // too big to copy - remember that, so it isn't listed again every half hour
+            await poolCache.SavePoolAsync(new PoolCache.CachedPool(query, now, false, []));
+            Console.WriteLine("Map pool copy: this preset matches too many maps to keep a local copy - TMX stays required.");
+            return;
+        }
+
+        var missing = ids.Where(id => !poolCache.HasMap(id) && !impossibleMaps.Contains(id) && !skippedMaps.Contains(id)).ToList();
+        Console.WriteLine($"Map pool copy: {ids.Length} map(s) in the pool, downloading {missing.Count} missing one(s).");
+
+        var failed = 0;
+        foreach (var id in missing)
+        {
+            try
+            {
+                var map = await DownloadMapAsync(id, cancellationToken);
+                await poolCache.StoreMapAsync(id, map.Data);
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                failed++;
+                if (IsTmxOutage(ex) && failed >= 5)
+                {
+                    // TMX went away mid-way: keep what we have, the list is saved next time
+                    throw;
+                }
+            }
+
+            // gently - this is a background job, nobody waits for it
+            await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+        }
+
+        await poolCache.SavePoolAsync(new PoolCache.CachedPool(query, now, true, ids));
+        poolCache.Prune(now);
+        Console.WriteLine($"Map pool copy updated: {ids.Count(poolCache.HasMap)} of {ids.Length} map(s) on disk{(failed > 0 ? $", {failed} couldn't be downloaded" : string.Empty)}.");
+    }
+
+    public bool IsInPoolCopy(int trackId) => poolCache.HasMap(trackId);
+
+    // A pool map from the local copy for the server's first map when TMX is down (see ServerSetup).
+    public string? PickPoolCopyFileForWarmup()
+    {
+        var query = config.TmxQueryOverride ?? BuildQuery();
+        if (poolCache.GetPool(query) is not { Complete: true } copy)
+        {
+            return null;
+        }
+
+        var candidates = copy.TrackIds.Where(id => poolCache.HasMap(id) && !impossibleMaps.Contains(id) && !skippedMaps.Contains(id)).ToArray();
+        return candidates.Length == 0 ? null : poolCache.MapFilePath(candidates[Random.Shared.Next(candidates.Length)]);
     }
 
     // Whether TMX has a record (world record replay) for this map: true/false, or null when TMX
@@ -341,6 +455,64 @@ internal sealed class TmxRules
 
     public async Task<InMemoryFile> NextMapGbxAsync(CancellationToken cancellationToken = default)
     {
+        if (DateTimeOffset.UtcNow < tmxOutageUntil && TryPickFromPoolCopy() is { } held)
+        {
+            return held;
+        }
+
+        try
+        {
+            var map = await NextMapGbxFromTmxAsync(cancellationToken);
+            tmxOutageUntil = DateTimeOffset.MinValue;
+            return map;
+        }
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested && IsTmxOutage(ex))
+        {
+            tmxOutageUntil = DateTimeOffset.UtcNow + TmxOutageHold;
+
+            if (TryPickFromPoolCopy() is { } copied)
+            {
+                Console.WriteLine($"TMX can't be reached ({ex.Message}) - playing maps from the local pool copy for the next {TmxOutageHold.TotalMinutes:0} minutes.");
+                return copied;
+            }
+
+            throw;
+        }
+    }
+
+    // No answer from TMX at all: refused, reset, timed out, or an error page instead of data.
+    // (A map TMX answered for but refused - 404, not a map - is a bad pick, not an outage.)
+    private static bool IsTmxOutage(Exception ex) => ex
+        is HttpRequestException { StatusCode: null or >= System.Net.HttpStatusCode.InternalServerError or System.Net.HttpStatusCode.TooManyRequests }
+        or TaskCanceledException or TimeoutException or JsonException or IOException;
+
+    // A map from the local copy of the pool - same rules as a pick from TMX: eligible maps only,
+    // every map once per round, never the one just served.
+    private InMemoryFile? TryPickFromPoolCopy()
+    {
+        var query = config.TmxQueryOverride ?? BuildQuery();
+        if (poolCache.GetPool(query) is not { Complete: true } copy)
+        {
+            return null;
+        }
+
+        var available = copy.TrackIds.Where(poolCache.HasMap).ToArray();
+        var picked = mapPool.Pick(available, IsEligibleForPool, out var state)
+            ?? mapPool.Pick(available, id => !impossibleMaps.Contains(id) && !skippedMaps.Contains(id), out state);
+
+        if (picked is not { } trackId || poolCache.TryLoadMap(trackId) is not { } map)
+        {
+            return null;
+        }
+
+        Console.WriteLine($"Next track ID: {trackId} (from the local pool copy, {state})");
+        MarkServed(trackId);
+        mapPool.MarkPlayed(trackId);
+        return map;
+    }
+
+    private async Task<InMemoryFile> NextMapGbxFromTmxAsync(CancellationToken cancellationToken)
+    {
         // a random pick whose file can't be downloaded (deleted, an error page) is just a bad
         // pick - take another one rather than failing the whole map switch
         for (var attempt = 1; ; attempt++)
@@ -360,6 +532,12 @@ internal sealed class TmxRules
                 }
                 catch (Exception ex) when (ex is HttpRequestException or InvalidOperationException && !cancellationToken.IsCancellationRequested)
                 {
+                    // no answer at all: TMX is down - the caller takes the map from the local copy
+                    if (IsTmxOutage(ex))
+                    {
+                        throw;
+                    }
+
                     // TMX answered but the map is gone or isn't a map: done with it for this round.
                     // No answer at all (StatusCode null) is TMX being down - the map stays in the bag.
                     if (ex is InvalidOperationException || ex is HttpRequestException { StatusCode: not null })
@@ -405,40 +583,9 @@ internal sealed class TmxRules
 
         try
         {
-            var ids = new List<int>();
-            int? after = null;
-            var complete = false;
+            var (ids, complete) = await ListPoolAsync(query, budget.Token);
 
-            for (var page = 0; page < MaxPoolPages; page++)
-            {
-                var url = $"https://{GetSiteUrl()}/api/tracks?{query}&fields=TrackId&count={PoolPageSize}"
-                    + (after is { } a ? $"&after={a.ToString(CultureInfo.InvariantCulture)}" : string.Empty);
-
-                using var response = await http.GetAsync(url, budget.Token);
-                response.EnsureSuccessStatusCode();
-
-                var payload = await response.Content.ReadFromJsonAsync<TmxApiTrackIdPage>(budget.Token)
-                    ?? throw new InvalidOperationException("TMX returned an empty page.");
-
-                var results = payload.Results ?? [];
-                ids.AddRange(results.Select(r => r.TrackId));
-
-                if (!payload.More)
-                {
-                    complete = true;
-                    break;
-                }
-
-                if (results.Count == 0)
-                {
-                    // "more" but nothing on the page: don't trust this list to be the whole pool
-                    break;
-                }
-
-                after = results[^1].TrackId;
-            }
-
-            loadedPool = new LoadedPool(query, [.. ids.Distinct()], complete, DateTimeOffset.UtcNow);
+            loadedPool = new LoadedPool(query, ids, complete, DateTimeOffset.UtcNow);
 
             if (current?.Query != query || current.Complete != complete)
             {
@@ -456,6 +603,43 @@ internal sealed class TmxRules
             Console.WriteLine($"Warning: couldn't load the map pool from TMX - {ex.Message}");
             return current is { Complete: true } && current.Query == query ? current.TrackIds : null;
         }
+    }
+
+    // Every map the query matches (up to MaxPoolPages pages); Complete=false when there are more.
+    private async Task<(int[] Ids, bool Complete)> ListPoolAsync(string query, CancellationToken cancellationToken)
+    {
+        var ids = new List<int>();
+        int? after = null;
+
+        for (var page = 0; page < MaxPoolPages; page++)
+        {
+            var url = $"https://{GetSiteUrl()}/api/tracks?{query}&fields=TrackId&count={PoolPageSize}"
+                + (after is { } a ? $"&after={a.ToString(CultureInfo.InvariantCulture)}" : string.Empty);
+
+            using var response = await http.GetAsync(url, cancellationToken);
+            response.EnsureSuccessStatusCode();
+
+            var payload = await response.Content.ReadFromJsonAsync<TmxApiTrackIdPage>(cancellationToken)
+                ?? throw new InvalidOperationException("TMX returned an empty page.");
+
+            var results = payload.Results ?? [];
+            ids.AddRange(results.Select(r => r.TrackId));
+
+            if (!payload.More)
+            {
+                return ([.. ids.Distinct()], true);
+            }
+
+            if (results.Count == 0)
+            {
+                // "more" but nothing on the page: don't trust this list to be the whole pool
+                break;
+            }
+
+            after = results[^1].TrackId;
+        }
+
+        return ([.. ids.Distinct()], false);
     }
 
     private sealed record TmxApiTrackIdPage(bool More, List<TmxApiTrackIdResult>? Results);
