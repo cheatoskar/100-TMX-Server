@@ -37,6 +37,16 @@ internal sealed class ReplayServer
         builder.Logging.ClearProviders();
         builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 
+        // This listens on the internet inside the game process, on a 1 GB machine: a flood of
+        // connections must not starve the controller. Nothing here takes a request body.
+        builder.WebHost.ConfigureKestrel(options =>
+        {
+            options.AddServerHeader = false;
+            options.Limits.MaxConcurrentConnections = 200;
+            options.Limits.MaxRequestBodySize = 0;
+            options.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(10);
+        });
+
         app = builder.Build();
 
         app.MapGet("/", () => Results.Content(indexHtml, "text/html"));
@@ -46,12 +56,32 @@ internal sealed class ReplayServer
             FileProvider = new PhysicalFileProvider(replaysDir),
             RequestPath = "/replays",
             ServeUnknownFileTypes = true,
+            // a replay is a download, never something a browser should try to render
+            DefaultContentType = "application/octet-stream",
+            OnPrepareResponse = context =>
+            {
+                var headers = context.Context.Response.Headers;
+                headers["X-Content-Type-Options"] = "nosniff";
+                // a saved replay never changes under its name
+                headers.CacheControl = "public, max-age=31536000, immutable";
+            },
         });
 
         app.UseStaticFiles(new StaticFileOptions
         {
             FileProvider = new PhysicalFileProvider(statusDir),
             RequestPath = "",
+            OnPrepareResponse = context =>
+            {
+                var headers = context.Context.Response.Headers;
+                headers["X-Content-Type-Options"] = "nosniff";
+
+                // status.json changes every 10 seconds - never serve a cached one
+                if (context.File.Name.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+                {
+                    headers.CacheControl = "no-cache";
+                }
+            },
         });
 
         await app.StartAsync();

@@ -166,9 +166,9 @@ Beyond the game/server basics, `config.toml` (see `config.default.toml` for the 
 | `/start` | Starts a new randomizer session and queues the first random challenge. |
 | `/stop`, `/end` | Stops the active session and resets the current challenge. |
 | `/skip` | Skips the current challenge for a new random one. |
-| `/imp` | Marks the current challenge as impossible so it won't appear again, and reports it to Discord for review. `/imp -1`, `/imp -2`, ... reports a past map instead (see `/history`). |
-| `/hard` | Flags the current challenge as hard for review, without excluding it. Reports to Discord. `/hard -1`, `/hard -2`, ... flags a past map instead. |
-| `/rounds` | Switches the current map to Rounds mode if it's a genuine multilap challenge, so a full finish produces a TMX-valid replay. Reverts to TimeAttack automatically once the map ends. |
+| `/imp` | Marks the current challenge as impossible so it won't appear again, and reports it to Discord for review. `/imp -1`, `/imp -2`, ... reports a past map instead (see `/history`). One report per player per minute; a map already reported during this run is not posted to Discord again. |
+| `/hard` | Flags the current challenge as hard for review, without excluding it. Reports to Discord. `/hard -1`, `/hard -2`, ... flags a past map instead. Same cooldown as `/imp`. |
+| `/rounds` | Switches the current map to Rounds mode if it's a genuine multilap challenge, so a full finish produces a TMX-valid replay. Reverts to TimeAttack automatically once the map ends. Once per map, and not while the next map is already loading. |
 | `/top` | Shows the top finishers on this server. |
 | `/rank` | Shows your own rank and finish count. |
 | `/map` | Shows the current map's TMX link. `/map -1`, `/map -2`, ... shows a past map (see `/history`). |
@@ -179,8 +179,8 @@ Beyond the game/server basics, `config.toml` (see `config.default.toml` for the 
 | `/votepreset <name>` | Starts a vote to switch preset; other players support it with `/yes` (or the Yes/No widget) within the vote window. |
 | `/loadmap <TMX id>` | Loads a specific TMX map by id directly, no vote (admin only if `AdminLogins` is set). |
 | `/blockmap [-1..-10]` | Adds the current (or a past) map to this server's own skip list (`skipped-maps.json`) and skips it now. For maps that can't be played here, e.g. built with blocks the game doesn't have. Permanent, local to the server, never sent to Discord or the shared sheet (admin only if `AdminLogins` is set). |
-| `/votemap <TMX id>` | Starts a vote to load a specific TMX map by id - shows its name, author, difficulty, awards, author time, and style tags in chat and a clickable widget; other players support it with `/yes` within the vote window. |
-| `/yes`, `/no` | Supports or withdraws support from an active preset or map vote. |
+| `/votemap <TMX id>` | Starts a vote to load a specific TMX map by id - shows its name, author, difficulty, awards, author time, and style tags in chat and a clickable widget; other players support it with `/yes` within the vote window. Finishes on a map loaded this way (or with `/loadmap`) don't count for the leaderboard. |
+| `/yes`, `/no` | Supports or withdraws support from an active preset or map vote. The skip vote (`/skip` with several players) is TrackMania's own vote - agree with F5. |
 | `/commands` | Lists every raw command name. |
 | `/info` | Shows a summary of what the server can do. |
 | `/source` | Links to the source code of this modified server (AGPLv3 compliance). |
