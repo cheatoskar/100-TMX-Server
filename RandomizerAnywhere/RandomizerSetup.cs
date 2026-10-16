@@ -12,8 +12,6 @@ internal sealed class RandomizerSetup
     private readonly TmxRules tmxRules;
     private readonly AppConfig config;
 
-    private readonly HashSet<string> commands = ["help", "commands", "info", "source", "start", "skip", "imp", "hard", "top", "rank", "map", "history", "rounds", "testhud", "tmxquery", "timelimit", "tl", "stop", "preset", "presets", "votepreset", "yes", "no", "loadmap", "votemap", "blockmap"];
-
     public RandomizerSetup(RemoteClient client, TmxRules tmxRules, AppConfig config)
     {
         this.client = client;
@@ -66,7 +64,9 @@ internal sealed class RandomizerSetup
             await client.CallAsync("StartServerLan", [], cancellationToken);
         }
 
-        await client.SystemMulticallAsync(commands.Select(cmd => new XmlRpcCall("AddChatCommand", [cmd])), cancellationToken);
+        // the same list RandomizerGame dispatches on - two hand-kept lists had drifted apart
+        // ("/end" was handled but never registered, "/tmxquery" registered but never handled)
+        await client.RegisterChatCommandsAsync(RandomizerGame.ChatCommandNames, cancellationToken);
     }
 
     private static async Task SetupCannotSeeServerAsync(CancellationToken cancellationToken)
