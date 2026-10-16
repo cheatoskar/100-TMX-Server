@@ -159,6 +159,12 @@ internal sealed partial class RandomizerGame
     private int? forcedMapQueuedTrackId;
     private bool currentMapIsForced;
 
+    // A forced map that had no record on TMX when it was loaded is one of the project's open maps,
+    // so finishing it counts - but only once per player and map, or /votemap could farm it.
+    private bool forcedMapQueuedHasNoRecord;
+    private bool currentForcedMapHasNoRecord;
+    private readonly HashSet<(string Login, int TrackId)> forcedMapCredits = [];
+
     private readonly SkippedMaps skippedMaps;
 
     private string? votePresetName;
@@ -579,9 +585,11 @@ internal sealed partial class RandomizerGame
                     roundsModeActive = false;
 
                     currentMapIsForced = currentMapTrackId is { } startedId && startedId == forcedMapQueuedTrackId;
+                    currentForcedMapHasNoRecord = currentMapIsForced && forcedMapQueuedHasNoRecord;
                     if (currentMapIsForced)
                     {
                         forcedMapQueuedTrackId = null;
+                        forcedMapQueuedHasNoRecord = false;
                     }
                 }
 
@@ -2884,7 +2892,10 @@ internal sealed partial class RandomizerGame
 
         // The credit first: it is the one part that must not depend on chat messages reaching a
         // player who may already be gone. A failed save must not cost the rest either.
-        if (!currentMapIsForced)
+        var counts = !currentMapIsForced
+            || (currentForcedMapHasNoRecord && currentMapTrackId is { } forcedId && forcedMapCredits.Add((login, forcedId)));
+
+        if (counts)
         {
             try
             {
@@ -2911,7 +2922,9 @@ internal sealed partial class RandomizerGame
 
         if (currentMapIsForced)
         {
-            await SendMessageAsync(login, "$888Maps loaded with /votemap or /loadmap don't count for the leaderboard.", cancellationToken);
+            await SendMessageAsync(login, counts
+                ? "$888This map was loaded with /votemap or /loadmap but has no record on TMX yet - your finish counts."
+                : "$888Maps loaded with /votemap or /loadmap only count for the leaderboard if they have no record on TMX yet, once per player.", cancellationToken);
         }
     }
 
@@ -3081,6 +3094,10 @@ internal sealed partial class RandomizerGame
                     var map = forcedTrackId is { } forcedId
                         ? await tmxRules.GetMapGbxByIdAsync(forcedId, token)
                         : await tmxRules.NextMapGbxAsync(token);
+
+                    // unknown (TMX didn't answer) counts as "has a record": no credit
+                    forcedMapQueuedHasNoRecord = forcedTrackId is { } checkedId
+                        && await tmxRules.HasRecordAsync(checkedId, token) == false;
 
                     // A random pick of the map that is running right now would only restart it (the
                     // recent-maps list is in memory and starts empty after every restart).

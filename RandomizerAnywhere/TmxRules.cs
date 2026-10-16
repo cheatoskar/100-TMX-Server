@@ -5,6 +5,7 @@ using System.Globalization;
 using System.Linq;
 using System.Net.Http.Json;
 using System.Text;
+using System.Text.Json;
 
 namespace RandomizerAnywhere;
 
@@ -274,6 +275,35 @@ internal sealed class TmxRules
 
         MarkServed(trackId);
         return new InMemoryFile(GetValidFileName(fileName), gbxBytes, trackId);
+    }
+
+    // Whether TMX has a record (world record replay) for this map: true/false, or null when TMX
+    // can't be asked right now.
+    public async Task<bool?> HasRecordAsync(int trackId, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            budget.CancelAfter(TimeSpan.FromSeconds(10));
+
+            var url = $"https://{GetSiteUrl()}/api/tracks?id={trackId.ToString(CultureInfo.InvariantCulture)}&fields=TrackId,WRReplay.ReplayId";
+            using var response = await http.GetAsync(url, budget.Token);
+            response.EnsureSuccessStatusCode();
+
+            using var document = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync(budget.Token), cancellationToken: budget.Token);
+            var results = document.RootElement.GetProperty("Results");
+            if (results.GetArrayLength() == 0)
+            {
+                return null;
+            }
+
+            return results[0].TryGetProperty("WRReplay", out var record) && record.ValueKind == JsonValueKind.Object;
+        }
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            Console.WriteLine($"Warning: couldn't ask TMX whether map {trackId} has a record - {ex.Message}");
+            return null;
+        }
     }
 
     public string GetSiteUrl() => game switch
