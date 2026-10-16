@@ -1702,8 +1702,23 @@ internal sealed partial class RandomizerGame
     // map actually running" drift apart, and the file name is the only thing that ties a running
     // challenge back to the id it came from. Observed live on 2026-09-11: the controller had
     // /map, the TMX link and the status page preview all pointing at a map from 15 minutes back.
-    private static string InsertedChallengePath(InMemoryFile map) =>
-        Path.Combine("_RandomizerAny", $"{DateTimeOffset.UtcNow.Ticks}_tmx{map.TrackId}_{map.FileName}");
+    // The map name is capped: the game server refuses to write a path that ends up too long
+    // ("couldn't write file"), and the map is found by its _tmx<id>_ marker anyway.
+    private static string InsertedChallengePath(InMemoryFile map)
+    {
+        const string extension = ".Challenge.Gbx";
+        const int maxNameLength = 40;
+        var name = map.FileName.EndsWith(extension, StringComparison.OrdinalIgnoreCase)
+            ? map.FileName[..^extension.Length]
+            : map.FileName;
+
+        if (name.Length > maxNameLength)
+        {
+            name = name[..(char.IsHighSurrogate(name[maxNameLength - 1]) ? maxNameLength - 1 : maxNameLength)].TrimEnd();
+        }
+
+        return Path.Combine("_RandomizerAny", $"{DateTimeOffset.UtcNow.Ticks}_tmx{map.TrackId}_{name}{extension}");
+    }
 
     // The server reports challenge paths in its own shape (directory separators differ, and it may
     // hand back more or less of the path than we passed in), so match on the bare file name.
