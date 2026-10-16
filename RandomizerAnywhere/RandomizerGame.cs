@@ -153,6 +153,18 @@ internal sealed partial class RandomizerGame
     // "this specific TMX id" without duplicating the enqueue/insert/gamemode plumbing
     private int? forcedNextMapTrackId;
 
+    // A map loaded by /loadmap or /votemap rather than drawn at random. Finishes on it don't count
+    // for the leaderboard: with one player online /votemap passes on its own vote, so anyone could
+    // load the same five-second map over and over and collect a finish each time.
+    private int? forcedMapQueuedTrackId;
+    private bool currentMapIsForced;
+
+    // A forced map that had no record on TMX when it was loaded is one of the project's open maps,
+    // so finishing it counts - but only once per player and map, or /votemap could farm it.
+    private bool forcedMapQueuedHasNoRecord;
+    private bool currentForcedMapHasNoRecord;
+    private readonly HashSet<(string Login, int TrackId)> forcedMapCredits = [];
+
     private readonly SkippedMaps skippedMaps;
 
     private string? votePresetName;
@@ -448,7 +460,8 @@ internal sealed partial class RandomizerGame
         this.discordNotifier = discordNotifier;
         this.leaderboard = leaderboard;
 
-        commandHandlers = new()
+        // case-insensitive: "/Skip" and "/SKIP" are the same command to a player
+        commandHandlers = new(StringComparer.OrdinalIgnoreCase)
         {
             ["start"] = StartAsync,
             ["stop"] = StopAsync,
@@ -478,7 +491,7 @@ internal sealed partial class RandomizerGame
             ["votemap"] = VoteMapAsync
         };
 
-        if (!commandHandlers.Keys.ToHashSet().SetEquals(ChatCommandNames))
+        if (!commandHandlers.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase).SetEquals(ChatCommandNames))
         {
             Console.WriteLine("Warning: ChatCommandNames and the command handlers disagree - some commands won't work.");
         }
@@ -568,8 +581,21 @@ internal sealed partial class RandomizerGame
 
                 if (mapChanged)
                 {
+                    // Measured from when this MAP started, not this race: the idle probe restarts
+                    // the map every 20 minutes and would otherwise reset the watchdog forever.
+                    stalledWatchStartedAt = DateTimeOffset.UtcNow;
+                    playerConnectsOnCurrentMap = 0;
+
                     // /rounds only ever applies to the map it was used on
                     roundsModeActive = false;
+
+                    currentMapIsForced = currentMapTrackId is { } startedId && startedId == forcedMapQueuedTrackId;
+                    currentForcedMapHasNoRecord = currentMapIsForced && forcedMapQueuedHasNoRecord;
+                    if (currentMapIsForced)
+                    {
+                        forcedMapQueuedTrackId = null;
+                        forcedMapQueuedHasNoRecord = false;
+                    }
                 }
 
                 lastRunningTrackId = currentMapTrackId;
@@ -693,6 +719,8 @@ internal sealed partial class RandomizerGame
 
         OnGameCallback("TrackMania.PlayerConnect", async (methodParams, cancellationToken) =>
         {
+            playerConnectsOnCurrentMap++;
+
             try
             {
                 var login = (string)methodParams[0];
@@ -1435,7 +1463,7 @@ internal sealed partial class RandomizerGame
         var racers = onlinePlayers
             .Select(p => new
             {
-                Nickname = TmFormatCodeRegex().Replace(p.NickName, string.Empty),
+                Nickname = StripTmCodes(p.NickName),
                 // Kept alongside the stripped name so the website can render the
                 // colours people actually play under. Consumers that want plain
                 // text keep reading Nickname and are unaffected.
@@ -1475,8 +1503,10 @@ internal sealed partial class RandomizerGame
 
         SetStatusStage("writing status.json to disk");
         Directory.CreateDirectory(Path.GetDirectoryName(statusFilePath)!);
+        // Atomic: the website and the deploy script poll this file every few seconds and used to
+        // catch it empty or half-written now and then.
         var json = JsonSerializer.Serialize(status);
-        await File.WriteAllTextAsync(statusFilePath, json, cancellationToken);
+        await AtomicFile.WriteAllTextAsync(statusFilePath, json);
         SetStatusStage("idle");
     }
 
@@ -1605,6 +1635,18 @@ internal sealed partial class RandomizerGame
     // night and churn through the pool for no reason.
     private static readonly TimeSpan StalledMapTimeout = TimeSpan.FromMinutes(15);
 
+    // ...but only when somebody actually came by. On a server nobody joined, every map looked
+    // "stalled" after 15 minutes: ~90 map switches a day for an empty room, each one a TMX download
+    // and a map used up from a small pool. Without any join the map just stays, and moves on
+    // slowly so the status page doesn't show the same map all night.
+    private static readonly TimeSpan IdleRotationTimeout = TimeSpan.FromHours(3);
+
+    // PlayerConnect callbacks since the current map started
+    private int playerConnectsOnCurrentMap;
+
+    // when the current map (not race - see BeginRace) started; null while a skip is in flight
+    private DateTimeOffset? stalledWatchStartedAt;
+
     // The last map the watchdog already skipped, so a map that fails to advance
     // cannot be reported over and over.
     private int? lastStalledMapTrackId;
@@ -1616,7 +1658,9 @@ internal sealed partial class RandomizerGame
             return;
         }
 
-        if (currentMapStartedAt is not { } startedAt || DateTimeOffset.UtcNow - startedAt < StalledMapTimeout)
+        var timeout = playerConnectsOnCurrentMap > 0 ? StalledMapTimeout : IdleRotationTimeout;
+
+        if (stalledWatchStartedAt is not { } startedAt || DateTimeOffset.UtcNow - startedAt < timeout)
         {
             return;
         }
@@ -1643,11 +1687,11 @@ internal sealed partial class RandomizerGame
 
         // Clear first: the advance below takes a moment, and the watchdog must not fire
         // a second time for the same map while it is in flight.
-        currentMapStartedAt = null;
+        stalledWatchStartedAt = null;
         lastStalledMapTrackId = trackId;
 
-        Console.WriteLine($"Stalled-map watchdog: no players and no checkpoints for {StalledMapTimeout.TotalMinutes:F0} minutes, skipping map {trackId}.");
-        await SendMessageAsync($"$F80No players and no checkpoints for {StalledMapTimeout.TotalMinutes:F0} minutes - skipping this map.", cancellationToken);
+        Console.WriteLine($"Stalled-map watchdog: no players and no checkpoints for {timeout.TotalMinutes:F0} minutes, skipping map {trackId} ({playerConnectsOnCurrentMap} join(s) during it).");
+        await SendMessageAsync($"$F80No players and no checkpoints for {timeout.TotalMinutes:F0} minutes - skipping this map.", cancellationToken);
 
         // Deliberately no Discord post: this fires on an empty server, potentially
         // several times a night, and nobody needs a notification for a map that had
@@ -1685,15 +1729,54 @@ internal sealed partial class RandomizerGame
     // the map that just ended, "/imp -3" for three maps ago - see /history for what's available).
     // IsCurrent is false for any "-N" - callers use it to skip current-map-only side effects like
     // advancing to a new map or reading live checkpoint info for a map that isn't loaded anymore
-    private (int? TrackId, bool IsCurrent) ResolveMapReference(string[] args)
+    // Anything else as the argument is a mistake, not "the current map": "/imp 12345" (a TMX id)
+    // used to silently report - and skip - whatever was running.
+    private (int? TrackId, bool IsCurrent, bool Invalid) ResolveMapReference(string[] args)
     {
-        if (args.Length > 0 && int.TryParse(args[0], out var offset) && offset < 0)
+        if (args.Length == 0)
         {
-            var historyIndex = -offset - 1;
-            return (historyIndex < mapHistory.Count ? mapHistory[historyIndex] : null, false);
+            return (DisplayedMapTrackId, true, false);
         }
 
-        return (DisplayedMapTrackId, true);
+        if (int.TryParse(args[0], out var offset) && offset < 0)
+        {
+            var historyIndex = -offset - 1;
+            return (historyIndex < mapHistory.Count ? mapHistory[historyIndex] : null, false, false);
+        }
+
+        return (null, false, true);
+    }
+
+    private Task SendMapReferenceUsageAsync(string login, string command, CancellationToken cancellationToken) =>
+        SendMessageAsync(login, $"$F00Use $FF0/{command}$F00 for the current map, or $FF0/{command} -1$F00 ... $FF0-{MaxMapHistory}$F00 for a past one (see $FF0/history$F00).", cancellationToken);
+
+    // /imp and /hard post to Discord and /votemap asks TMX, so each player gets one per cooldown.
+    // Without it a single player could flood the review channel (and hit Discord's rate limit).
+    private static readonly TimeSpan ReportCooldown = TimeSpan.FromSeconds(60);
+    private readonly Dictionary<string, DateTimeOffset> lastReportAt = new(StringComparer.OrdinalIgnoreCase);
+
+    // the same map reported again (by anyone) during this run is not posted again
+    private readonly HashSet<(string Kind, int TrackId)> reportedMaps = [];
+
+    private async Task<bool> CheckCooldownAsync(string login, string kind, CancellationToken cancellationToken)
+    {
+        var key = $"{kind}:{login}";
+        var now = DateTimeOffset.UtcNow;
+
+        if (lastReportAt.TryGetValue(key, out var last) && now - last < ReportCooldown)
+        {
+            var wait = ReportCooldown - (now - last);
+            await SendMessageAsync(login, $"$F00Please wait {Math.Ceiling(wait.TotalSeconds):0}s before using /{kind} again.", cancellationToken);
+            return false;
+        }
+
+        if (lastReportAt.Count > 1000)
+        {
+            lastReportAt.Clear();
+        }
+
+        lastReportAt[key] = now;
+        return true;
     }
 
     // The path a fetched TMX map gets inserted under. The TMX id goes into the name on purpose:
@@ -1799,11 +1882,22 @@ internal sealed partial class RandomizerGame
 
     private async Task ImpossibleAsync(int playerUid, string login, string[] args, CancellationToken cancellationToken)
     {
-        var (trackId, isCurrent) = ResolveMapReference(args);
+        var (trackId, isCurrent, invalid) = ResolveMapReference(args);
+
+        if (invalid)
+        {
+            await SendMapReferenceUsageAsync(login, "imp", cancellationToken);
+            return;
+        }
 
         if (trackId is not { } id)
         {
             await SendMessageAsync(login, "$F00No map is currently loaded.", cancellationToken);
+            return;
+        }
+
+        if (!await CheckCooldownAsync(login, "imp", cancellationToken))
+        {
             return;
         }
 
@@ -1813,7 +1907,11 @@ internal sealed partial class RandomizerGame
 
         var skipSuffix = isCurrent ? ", skipping" : string.Empty;
         await SendMessageAsync($"$F00Map {id} reported impossible by {GetNicknameOrLogin(login)} - won't be shown again until reviewed{skipSuffix}.", cancellationToken);
-        await discordNotifier.PostAsync($"{DiscordServerTag}**{GetPlainNickname(login)}** reported map **{id}** as impossible: {tmxUrl}", cancellationToken);
+
+        if (reportedMaps.Add(("imp", id)))
+        {
+            await discordNotifier.PostAsync($"{DiscordServerTag}**{DiscordNotifier.FormatPlayerName(GetPlainNickname(login))}** reported map **{id}** as impossible: {tmxUrl}", cancellationToken);
+        }
 
         // only advance the session if we're reporting the map that's actually loaded right now -
         // "/imp -1" reports a map that's already gone, the current one has nothing to do with it
@@ -1835,7 +1933,13 @@ internal sealed partial class RandomizerGame
             return;
         }
 
-        var (trackId, isCurrent) = ResolveMapReference(args);
+        var (trackId, isCurrent, invalid) = ResolveMapReference(args);
+
+        if (invalid)
+        {
+            await SendMapReferenceUsageAsync(login, "blockmap", cancellationToken);
+            return;
+        }
 
         if (trackId is not { } id)
         {
@@ -1867,7 +1971,13 @@ internal sealed partial class RandomizerGame
 
     private async Task HardAsync(int playerUid, string login, string[] args, CancellationToken cancellationToken)
     {
-        var (trackId, _) = ResolveMapReference(args);
+        var (trackId, _, invalid) = ResolveMapReference(args);
+
+        if (invalid)
+        {
+            await SendMapReferenceUsageAsync(login, "hard", cancellationToken);
+            return;
+        }
 
         if (trackId is not { } id)
         {
@@ -1875,10 +1985,19 @@ internal sealed partial class RandomizerGame
             return;
         }
 
+        if (!await CheckCooldownAsync(login, "hard", cancellationToken))
+        {
+            return;
+        }
+
         var tmxUrl = $"https://{tmxRules.GetSiteUrl()}/trackshow/{id}";
 
         await SendMessageAsync($"$FF0Map {id} flagged as hard by {GetNicknameOrLogin(login)} for review.", cancellationToken);
-        await discordNotifier.PostHardAsync($"{DiscordServerTag}**{GetPlainNickname(login)}** flagged map **{id}** as hard: {tmxUrl}", cancellationToken);
+
+        if (reportedMaps.Add(("hard", id)))
+        {
+            await discordNotifier.PostHardAsync($"{DiscordServerTag}**{DiscordNotifier.FormatPlayerName(GetPlainNickname(login))}** flagged map **{id}** as hard: {tmxUrl}", cancellationToken);
+        }
     }
 
     private async Task TopAsync(int playerUid, string login, string[] args, CancellationToken cancellationToken)
@@ -1910,7 +2029,13 @@ internal sealed partial class RandomizerGame
 
     private async Task MapAsync(int playerUid, string login, string[] args, CancellationToken cancellationToken)
     {
-        var (trackId, isCurrent) = ResolveMapReference(args);
+        var (trackId, isCurrent, invalid) = ResolveMapReference(args);
+
+        if (invalid)
+        {
+            await SendMapReferenceUsageAsync(login, "map", cancellationToken);
+            return;
+        }
 
         if (trackId is not { } id)
         {
@@ -2083,7 +2208,7 @@ internal sealed partial class RandomizerGame
             "$FF0/top$FFF - show the top finishers on this server",
             "$FF0/rank$FFF - show your own rank and finish count",
             "$FF0/votepreset <name>$FFF - propose switching preset, others confirm with $0F0/yes$FFF ($FF0/presets$FFF for names)",
-            "$FF0/votemap <TMX id>$FFF - propose loading a specific TMX map by id, shows name/author/difficulty/AT/tags, others confirm with $0F0/yes$FFF",
+            "$FF0/votemap <TMX id>$FFF - propose loading a specific TMX map by id, shows name/author/difficulty/AT/tags, others confirm with $0F0/yes$FFF (doesn't count for the leaderboard)",
             "$FF0/commands$FFF - list every raw command name",
             "$FF0/source$FFF - get the source code link for this modified server (AGPLv3)",
             "Admin-only: $FF0/start$FFF, $FF0/stop$FFF, $FF0/preset$FFF, $FF0/loadmap <TMX id>$FFF, $FF0/blockmap$FFF (server-only skip list), $FF0/timelimit$FFF",
@@ -2592,7 +2717,7 @@ internal sealed partial class RandomizerGame
         TmxRules.TrackDetails details;
         try
         {
-            details = await tmxRules.GetTrackDetailsAsync(trackId, cancellationToken);
+            details = await GetTrackDetailsOrCopyAsync(trackId, cancellationToken);
         }
         catch (Exception)
         {
@@ -2602,6 +2727,20 @@ internal sealed partial class RandomizerGame
 
         await SendMessageAsync($"$FF0{GetNicknameOrLogin(login)} is loading $0F0{details.Name}$FF0 (TMX {trackId})...", cancellationToken);
         await LoadForcedMapAsync(trackId, cancellationToken);
+    }
+
+    // TMX details for /loadmap and /votemap. While TMX is down a map from the local pool copy still
+    // loads, just without its details; anything else still fails as "could not find".
+    private async Task<TmxRules.TrackDetails> GetTrackDetailsOrCopyAsync(int trackId, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await tmxRules.GetTrackDetailsAsync(trackId, cancellationToken);
+        }
+        catch (Exception) when (!cancellationToken.IsCancellationRequested && tmxRules.IsInPoolCopy(trackId))
+        {
+            return new TmxRules.TrackDetails($"TMX {trackId} (local copy - TMX can't be reached)", "unknown", "unknown", 0, 0, []);
+        }
     }
 
     private async Task VoteMapAsync(int playerUid, string login, string[] args, CancellationToken cancellationToken)
@@ -2624,10 +2763,16 @@ internal sealed partial class RandomizerGame
             return;
         }
 
+        // every attempt is a TMX request made from the callback stream
+        if (!await CheckCooldownAsync(login, "votemap", cancellationToken))
+        {
+            return;
+        }
+
         TmxRules.TrackDetails details;
         try
         {
-            details = await tmxRules.GetTrackDetailsAsync(trackId, cancellationToken);
+            details = await GetTrackDetailsOrCopyAsync(trackId, cancellationToken);
         }
         catch (Exception)
         {
@@ -2782,13 +2927,19 @@ internal sealed partial class RandomizerGame
 
         // The credit first: it is the one part that must not depend on chat messages reaching a
         // player who may already be gone. A failed save must not cost the rest either.
-        try
+        var counts = !currentMapIsForced
+            || (currentForcedMapHasNoRecord && currentMapTrackId is { } forcedId && forcedMapCredits.Add((login, forcedId)));
+
+        if (counts)
         {
-            await leaderboard.RecordFinishAsync(login, GetPlainNickname(login), GetRawNickname(login), cancellationToken);
-        }
-        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
-        {
-            Console.WriteLine($"ERROR: couldn't record {login}'s finish on the leaderboard - {ex.Message}");
+            try
+            {
+                await leaderboard.RecordFinishAsync(login, GetPlainNickname(login), GetRawNickname(login), cancellationToken);
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                Console.WriteLine($"ERROR: couldn't record {login}'s finish on the leaderboard - {ex.Message}");
+            }
         }
 
         if (await client.IsMultiplePlayersAsync(cancellationToken))
@@ -2803,6 +2954,13 @@ internal sealed partial class RandomizerGame
 
         await SendTop10PanelAsync(cancellationToken);
         await SendReplayLinkAsync(login, cancellationToken);
+
+        if (currentMapIsForced)
+        {
+            await SendMessageAsync(login, counts
+                ? "$888This map was loaded with /votemap or /loadmap but has no record on TMX yet - your finish counts."
+                : "$888Maps loaded with /votemap or /loadmap only count for the leaderboard if they have no record on TMX yet, once per player.", cancellationToken);
+        }
     }
 
     // Players get ReplaySaveGraceMs to save their replay before the map goes away. That wait used
@@ -2962,6 +3120,7 @@ internal sealed partial class RandomizerGame
                 SetAdvanceStage("picking and downloading the next map from TMX");
                 var forcedTrackId = forcedNextMapTrackId;
                 forcedNextMapTrackId = null;
+                forcedMapQueuedTrackId = forcedTrackId;
 
                 var generationBeforeFetch = mapGeneration;
                 var sessionBeforeFetch = sessionStopwatch;
@@ -2970,6 +3129,10 @@ internal sealed partial class RandomizerGame
                     var map = forcedTrackId is { } forcedId
                         ? await tmxRules.GetMapGbxByIdAsync(forcedId, token)
                         : await tmxRules.NextMapGbxAsync(token);
+
+                    // unknown (TMX didn't answer) counts as "has a record": no credit
+                    forcedMapQueuedHasNoRecord = forcedTrackId is { } checkedId
+                        && await tmxRules.HasRecordAsync(checkedId, token) == false;
 
                     // A random pick of the map that is running right now would only restart it (the
                     // recent-maps list is in memory and starts empty after every restart).
@@ -2988,6 +3151,7 @@ internal sealed partial class RandomizerGame
                 if (mapGeneration != generationBeforeFetch || !ReferenceEquals(sessionStopwatch, sessionBeforeFetch))
                 {
                     Console.WriteLine($"Map {nextMap.TrackId} was downloaded, but the map or the session changed meanwhile - not switching.");
+                    forcedMapQueuedTrackId = null;
                     return false;
                 }
 
@@ -3659,8 +3823,16 @@ internal sealed partial class RandomizerGame
     private string GetPlainNickname(string login)
     {
         var nickname = nicknameCache.TryGetValue(login, out var nick) ? nick : login;
-        return TmFormatCodeRegex().Replace(nickname, string.Empty);
+        return StripTmCodes(nickname);
     }
+
+    // Plain text from a TrackMania-formatted string. $l / $h / $p are links ("$l[http://...]text$l")
+    // and must not survive into Discord or the status page as text either.
+    private static string StripTmCodes(string formatted) =>
+        TmFormatCodeRegex().Replace(TmLinkCodeRegex().Replace(formatted, string.Empty), string.Empty);
+
+    [GeneratedRegex(@"\$[lhpLHP](\[[^\]]*\])?")]
+    private static partial Regex TmLinkCodeRegex();
 
     // nickname with its original $-formatting codes intact, for HUD/manialink text (which renders
     // them the same way in-game chat does) - not safe for Discord/the status page, see GetPlainNickname
@@ -3672,7 +3844,8 @@ internal sealed partial class RandomizerGame
     [GeneratedRegex(@"[^\s""]+|""[^""]*""")]
     private static partial Regex CommandArgsRegex();
 
-    [GeneratedRegex(@"\$([0-9a-fA-F]{3}|[<>oiswnmgzt$])")]
+    // case-insensitive: TrackMania accepts $S as well as $s (map names showed up as "$S[Mini Trial]")
+    [GeneratedRegex(@"\$([0-9a-fA-F]{3}|[<>oiswnmgzt$])", RegexOptions.IgnoreCase)]
     private static partial Regex TmFormatCodeRegex();
 
     // the "_tmx<id>_" marker InsertedChallengePath puts into every map path we insert

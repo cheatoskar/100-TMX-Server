@@ -55,9 +55,11 @@ internal sealed class ImpossibleMaps
                     }
                 }
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
             {
-                Console.WriteLine($"Warning: failed to read impossible-maps.json - {ex.Message}");
+                // the sheet refresh below fills the list again; the unreadable file is kept for a look
+                var quarantined = AtomicFile.QuarantineCorrupt(filePath);
+                Console.WriteLine($"Warning: failed to read impossible-maps.json - {ex.Message}{(quarantined is null ? string.Empty : $" (kept as {Path.GetFileName(quarantined)})")}");
             }
         }
 
@@ -121,7 +123,16 @@ internal sealed class ImpossibleMaps
         while (true)
         {
             await Task.Delay(interval, cancellationToken);
-            await RefreshFromSheetAsync(cancellationToken);
+
+            // one failed save used to end this loop for good, and nobody noticed
+            try
+            {
+                await RefreshFromSheetAsync(cancellationToken);
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                Console.WriteLine($"Warning: impossible-maps refresh failed, trying again next time - {ex.Message}");
+            }
         }
     }
 
@@ -154,7 +165,16 @@ internal sealed class ImpossibleMaps
         }
 
         var json = JsonSerializer.Serialize(ids);
-        await File.WriteAllTextAsync(filePath, json, cancellationToken);
+
+        // only a cache of the sheet plus local entries - a failed write must not stop the start
+        try
+        {
+            await AtomicFile.WriteAllTextAsync(filePath, json);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Console.WriteLine($"Warning: couldn't save impossible-maps.json - {ex.Message}");
+        }
     }
 
     private static string[] ParseCsvLine(string line)

@@ -30,6 +30,7 @@ This project was made to support the [100% TMX Project](https://discord.gg/HRShW
 - Delivers a TMX-valid replay download link after every finish (TMX only accepts server-saved replays, not a client's own "save replay" button)
 - Permanent impossible-map exclusion, refreshed periodically from a shared list, plus in-session `/imp` and `/hard` reporting with Discord webhook alerts
 - Persistent server-side leaderboard (`/top`, `/rank`)
+- Keeps playing when TMX is down: every Sunday (and right away for a preset without one) the whole map pool of a listable preset is copied to `MapCache/` - the list and the map files, maps that left the pool are removed. While tm-exchange.com can't be reached, maps (and `/loadmap` ids that are in the copy) come from there, with the same no-repeat and impossible-list rules. Presets matching more than 3000 maps have no copy.
 - Curated genre presets, switchable instantly by an admin or via player vote (`/preset`, `/votepreset`)
 - `/rounds` switches a genuinely multilap map to Rounds mode on demand, so a full-length finish produces a valid replay, then reverts to TimeAttack automatically on the next map
 - Clickable in-game manialink widgets: preset picker, Yes/No vote popup, a Rounds-mode prompt on multilap maps, a live map-info panel (difficulty, TMX award count, author time), a map-history list (click a past map for its TMX link), and a gold/silver/bronze-highlighted top finishers panel
@@ -138,6 +139,10 @@ The final configuration state is then written into session data for leaderboard 
 
 ## Configuration (`config.toml`)
 
+A `config.toml` that does not parse stops the controller with exit code 78 and a message saying
+why, instead of silently running on defaults (which used to mean an empty `AdminLogins`, i.e.
+every player is an admin).
+
 Beyond the game/server basics, `config.toml` (see `config.default.toml` for the full annotated template) controls this fork's own features:
 
 | Field | Description |
@@ -150,6 +155,9 @@ Beyond the game/server basics, `config.toml` (see `config.default.toml` for the 
 | `DiscordWebhookUrl` / `DiscordWebhookUrlHard` | Discord webhook URLs for `/imp` and `/hard` reports. Leave `DiscordWebhookUrlHard` empty to send both to the same channel as `DiscordWebhookUrl`. Leave both empty to disable Discord alerts entirely. |
 | `ServerComment` | Shown in the game's server browser. |
 | `WelcomeMessage` | Multi-line chat message sent to everyone on connect. |
+| `ConnectionUploadRate` | The dedicated server's total upload budget in kbit/s, written into `dedicated_cfg.txt` at every start. Every joining player downloads the random map through it. `0` (default) leaves the file alone - TMF's template ships `512`, about 64 KB/s for everybody together. |
+| `DisableVerboseRpc` | `true` stops starting the dedicated server with `/verbose_rpc`. Leave it off: the ConsoleLog's per-call lines are the only record of whether a call reached the server. |
+| `KeepConsoleLogs` | How many of the dedicated server's `ConsoleLog.<pid>.txt` files (one per start) to keep. Default `30`. |
 | `SourceFromImpossibleList` (preset-only) | When `true` on a preset, that preset cycles only through maps already flagged impossible, instead of querying TMX - used by the bundled `impossible_review_tmnf` preset. |
 
 ## In-game chat commands
@@ -159,9 +167,9 @@ Beyond the game/server basics, `config.toml` (see `config.default.toml` for the 
 | `/start` | Starts a new randomizer session and queues the first random challenge. |
 | `/stop`, `/end` | Stops the active session and resets the current challenge. |
 | `/skip` | Skips the current challenge for a new random one. |
-| `/imp` | Marks the current challenge as impossible so it won't appear again, and reports it to Discord for review. `/imp -1`, `/imp -2`, ... reports a past map instead (see `/history`). |
-| `/hard` | Flags the current challenge as hard for review, without excluding it. Reports to Discord. `/hard -1`, `/hard -2`, ... flags a past map instead. |
-| `/rounds` | Switches the current map to Rounds mode if it's a genuine multilap challenge, so a full finish produces a TMX-valid replay. Reverts to TimeAttack automatically once the map ends. |
+| `/imp` | Marks the current challenge as impossible so it won't appear again, and reports it to Discord for review. `/imp -1`, `/imp -2`, ... reports a past map instead (see `/history`). One report per player per minute; a map already reported during this run is not posted to Discord again. |
+| `/hard` | Flags the current challenge as hard for review, without excluding it. Reports to Discord. `/hard -1`, `/hard -2`, ... flags a past map instead. Same cooldown as `/imp`. |
+| `/rounds` | Switches the current map to Rounds mode if it's a genuine multilap challenge, so a full finish produces a TMX-valid replay. Reverts to TimeAttack automatically once the map ends. Once per map, and not while the next map is already loading. |
 | `/top` | Shows the top finishers on this server. |
 | `/rank` | Shows your own rank and finish count. |
 | `/map` | Shows the current map's TMX link. `/map -1`, `/map -2`, ... shows a past map (see `/history`). |
@@ -172,8 +180,8 @@ Beyond the game/server basics, `config.toml` (see `config.default.toml` for the 
 | `/votepreset <name>` | Starts a vote to switch preset; other players support it with `/yes` (or the Yes/No widget) within the vote window. |
 | `/loadmap <TMX id>` | Loads a specific TMX map by id directly, no vote (admin only if `AdminLogins` is set). |
 | `/blockmap [-1..-10]` | Adds the current (or a past) map to this server's own skip list (`skipped-maps.json`) and skips it now. For maps that can't be played here, e.g. built with blocks the game doesn't have. Permanent, local to the server, never sent to Discord or the shared sheet (admin only if `AdminLogins` is set). |
-| `/votemap <TMX id>` | Starts a vote to load a specific TMX map by id - shows its name, author, difficulty, awards, author time, and style tags in chat and a clickable widget; other players support it with `/yes` within the vote window. |
-| `/yes`, `/no` | Supports or withdraws support from an active preset or map vote. |
+| `/votemap <TMX id>` | Starts a vote to load a specific TMX map by id - shows its name, author, difficulty, awards, author time, and style tags in chat and a clickable widget; other players support it with `/yes` within the vote window. Finishes on a map loaded this way (or with `/loadmap`) don't count for the leaderboard. |
+| `/yes`, `/no` | Supports or withdraws support from an active preset or map vote. The skip vote (`/skip` with several players) is TrackMania's own vote - agree with F5. |
 | `/commands` | Lists every raw command name. |
 | `/info` | Shows a summary of what the server can do. |
 | `/source` | Links to the source code of this modified server (AGPLv3 compliance). |

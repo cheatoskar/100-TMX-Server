@@ -9,40 +9,76 @@ using System.Runtime.InteropServices;
 
 using var cts = new CancellationTokenSource();
 
-var provider = new AppServiceProvider();
+// Exit codes systemd sees. Anything non-zero is restarted (Restart=always); 78 (EX_CONFIG) is the
+// one a restart can't fix, so the journal should say so plainly.
+const int ExitConfigError = 78;
+const int ExitUnexpectedError = 1;
 
-var impossibleMaps = provider.GetRequiredService<ImpossibleMaps>();
-await impossibleMaps.LoadAsync();
-_ = impossibleMaps.RunPeriodicRefreshAsync(TimeSpan.FromHours(24), cts.Token);
-
-var skippedMaps = provider.GetRequiredService<SkippedMaps>();
-await skippedMaps.LoadAsync();
-
-var leaderboard = provider.GetRequiredService<Leaderboard>();
-await leaderboard.LoadAsync();
-
-var serverSetup = provider.GetRequiredService<ServerSetup>();
-await serverSetup.TrySetupAsync();
-
+// SIGTERM only asks for a shutdown. The handler used to cancel AND stop the dedicated server
+// right there on the signal thread, racing Main's own finally doing the same; an exception
+// escaping on that thread aborted the runtime ("Cannot print exception string", SIGABRT, core
+// dump - twice on a plain `systemctl stop`). Main's finally is now the only place that tears down.
 using var sigTermRegistration = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx =>
 {
     ctx.Cancel = true;
-    cts.Cancel();
-    serverSetup.StopServer();
+    _ = Task.Run(cts.Cancel);
 });
 
-var appConfig = provider.GetRequiredService<AppConfig>();
-if (appConfig.DedicatedServerMode)
-{
-    var statusDir = Path.Combine(AppContext.BaseDirectory, "WebStatus");
-    var replayServer = new ReplayServer(serverSetup.ReplaysDir, statusDir, appConfig.ReplayServerPort, appConfig.ServerName, appConfig.FavoriteLogin);
-    await replayServer.StartAsync();
-}
-
-await Task.Delay(1000, cts.Token);
+var provider = new AppServiceProvider();
+ServerSetup? serverSetup = null;
 
 try
 {
+    AppConfig appConfig;
+    try
+    {
+        appConfig = provider.GetRequiredService<AppConfig>();
+    }
+    catch (Exception ex) when (ex is not OperationCanceledException)
+    {
+        // Anything that goes wrong while reading the configuration (a broken file, a wrong value
+        // type, an unknown [DownloadUrls] key, a missing config.default.toml) is not fixed by
+        // starting again - exit 78 so systemd stops instead of looping through the whole setup.
+        Console.WriteLine($"ERROR: {(ex is ConfigException ? ex.Message : $"couldn't load the configuration - {ex.GetType().Name}: {ex.Message}")}");
+        Console.WriteLine("Fix the configuration and start again - restarting won't help until then.");
+        return ExitConfigError;
+    }
+
+    var impossibleMaps = provider.GetRequiredService<ImpossibleMaps>();
+    await impossibleMaps.LoadAsync(cts.Token);
+    _ = impossibleMaps.RunPeriodicRefreshAsync(TimeSpan.FromHours(24), cts.Token);
+
+    var skippedMaps = provider.GetRequiredService<SkippedMaps>();
+    await skippedMaps.LoadAsync(cts.Token);
+
+    var leaderboard = provider.GetRequiredService<Leaderboard>();
+    await leaderboard.LoadAsync(cts.Token);
+
+    serverSetup = provider.GetRequiredService<ServerSetup>();
+    await serverSetup.TrySetupAsync(cts.Token);
+
+    if (appConfig.DedicatedServerMode)
+    {
+        // the weekly local copy of the map pool, for when TMX is down (see PoolCache)
+        _ = provider.GetRequiredService<TmxRules>().RunPoolCopyRefreshAsync(cts.Token);
+
+        var statusDir = Path.Combine(AppContext.BaseDirectory, "WebStatus");
+        var replayServer = new ReplayServer(serverSetup.ReplaysDir, statusDir, appConfig.ReplayServerPort, appConfig.ServerName, appConfig.FavoriteLogin);
+
+        // The web page (replays, status.json) is an extra - a port already in use must not stop
+        // the game server, or it crash-loops through the whole setup every 5 seconds.
+        try
+        {
+            await replayServer.StartAsync();
+        }
+        catch (Exception ex) when (!cts.IsCancellationRequested)
+        {
+            Console.WriteLine($"ERROR: the web server on port {appConfig.ReplayServerPort} could not start - replay links and the status page are off until the next restart. {ex.Message}");
+        }
+    }
+
+    await Task.Delay(1000, cts.Token);
+
     const int maxSetupAttempts = 3;
     var setupCompleted = false;
 
@@ -88,25 +124,36 @@ try
 
     var randomizerGame = provider.GetRequiredService<RandomizerGame>();
     await randomizerGame.RunAsync(cts.Token);
+    return 0;
 }
-catch (OperationCanceledException) when (cts.IsCancellationRequested)
+catch (Exception) when (cts.IsCancellationRequested)
 {
-    // graceful shutdown requested (e.g. systemd stop)
+    // A shutdown was asked for (systemd stop). Whatever is thrown on the way out - a cancelled
+    // call, the XML-RPC socket dropping while the dedicated server goes down, "not connected" -
+    // is part of stopping, not a failure. Only IOException/SocketException used to be excused;
+    // anything else became an unhandled exception and a core dump on a plain stop.
+    return 0;
 }
-catch (Exception ex) when (cts.IsCancellationRequested && ex is IOException or SocketException)
+catch (Exception ex)
 {
-    // the XML-RPC socket can drop out from under us while the dedicated server process is
-    // being killed during shutdown; expected in that case, not a real failure
+    // One readable line instead of an unhandled-exception abort and a core dump; systemd
+    // restarts us either way.
+    Console.WriteLine($"ERROR: the controller stopped on an unexpected error - {ex.GetType().Name}: {ex.Message}");
+    Console.WriteLine(ex.StackTrace);
+    return ExitUnexpectedError;
 }
 finally
 {
-    serverSetup.StopServer();
+    serverSetup?.StopServer();
 }
 
 [ServiceProvider]
 [Singleton(typeof(HttpClient), Factory = nameof(CreateHttpClient))]
 [Singleton(typeof(AppConfig), Factory = nameof(CreateAppConfig))]
-[Transient(typeof(TmxRules))]
+// Singleton: the recently-played list and the /imp session exclusions are per process, not per
+// consumer - as a transient, ServerSetup's warmup pick and the game each had their own and the
+// game could pick the warmup map again right away.
+[Singleton(typeof(TmxRules))]
 [Transient(typeof(ServerSetup))]
 [Transient(typeof(RandomizerSetup))]
 [Singleton(typeof(RemoteClient))]
@@ -115,6 +162,8 @@ finally
 [Singleton(typeof(SkippedMaps))]
 [Singleton(typeof(DiscordNotifier))]
 [Singleton(typeof(Leaderboard))]
+[Singleton(typeof(MapPool))]
+[Singleton(typeof(PoolCache))]
 internal partial class AppServiceProvider
 {
     // Every TMX call on this client runs on the XML-RPC callback dispatch loop, which handles
@@ -132,6 +181,10 @@ internal partial class AppServiceProvider
     private static readonly TimeSpan HttpAttemptTimeout = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan HttpTotalTimeout = TimeSpan.FromSeconds(40);
 
+    // Says who is asking, so TMX can tell this server apart (and reach its owner) instead of
+    // seeing an anonymous .NET client.
+    private const string UserAgent = "RandomizerAnywhere-100TMX (+https://github.com/cheatoskar/randomizer-anywhere-100--tmx)";
+
     public static HttpClient CreateHttpClient()
     {
         var httpResilienceOptions = new HttpStandardResilienceOptions();
@@ -143,7 +196,7 @@ internal partial class AppServiceProvider
             .AddTimeout(HttpAttemptTimeout)
             .Build();
 
-        return new HttpClient(new ResilienceHandler(httpRetryPipeline)
+        var client = new HttpClient(new ResilienceHandler(httpRetryPipeline)
         {
             InnerHandler = new SocketsHttpHandler
             {
@@ -157,6 +210,9 @@ internal partial class AppServiceProvider
             // to sit on the callback loop.
             Timeout = HttpTotalTimeout
         };
+
+        client.DefaultRequestHeaders.UserAgent.ParseAdd(UserAgent);
+        return client;
     }
 
     public static AppConfig CreateAppConfig()
@@ -169,6 +225,7 @@ internal partial class AppServiceProvider
             File.Copy(defaultConfigPath, configPath);
         }
 
+        // throws ConfigException on a broken file - see TomlLoader
         var globalConfig = TomlLoader.LoadGlobalConfig(configPath);
         var cmdConfig = CmdConfig.Parse(Environment.GetCommandLineArgs());
         var appConfig = new AppConfig
@@ -206,6 +263,9 @@ internal partial class AppServiceProvider
             ServerValidationKey = Configurator.GetString(globalConfig.ServerValidationKey, cmdValue: null, "RANDANY_SERVER_VALIDATION_KEY"),
             DiscordWebhookUrl = Configurator.GetString(globalConfig.DiscordWebhookUrl, cmdValue: null, "RANDANY_DISCORD_WEBHOOK_URL"),
             DiscordWebhookUrlHard = Configurator.GetString(globalConfig.DiscordWebhookUrlHard, cmdValue: null, "RANDANY_DISCORD_WEBHOOK_URL_HARD"),
+            ConnectionUploadRate = Math.Max(globalConfig.ConnectionUploadRate, 0),
+            VerboseRpc = !globalConfig.DisableVerboseRpc,
+            KeepConsoleLogs = globalConfig.KeepConsoleLogs > 0 ? globalConfig.KeepConsoleLogs : 30,
         };
 
         if (!string.IsNullOrWhiteSpace(globalConfig.Preset))
@@ -214,14 +274,26 @@ internal partial class AppServiceProvider
 
             if (File.Exists(presetPath))
             {
-                var presetConfig = TomlLoader.LoadPresetConfig(presetPath);
-                presetConfig?.Apply(appConfig);
+                var presetConfig = TomlLoader.LoadPresetConfig(presetPath)
+                    ?? throw new ConfigException($"the preset '{globalConfig.Preset}' in config.toml could not be read (see the line above).");
+
+                if (!presetConfig.IsValid(out var invalidReason))
+                {
+                    throw new ConfigException($"the preset '{globalConfig.Preset}' in config.toml is broken: {invalidReason}.");
+                }
+
+                presetConfig.Apply(appConfig);
                 appConfig.LastPreset = presetConfig;
             }
             else
             {
-                Console.WriteLine($"Preset '{globalConfig.Preset}' not found.");
+                Console.WriteLine($"Warning: preset '{globalConfig.Preset}' not found - running with config.toml's own settings.");
             }
+        }
+
+        if (appConfig.AdminLogins.Count == 0)
+        {
+            Console.WriteLine("Warning: AdminLogins is empty - EVERY player can use the admin commands (/stop, /preset, /loadmap, /blockmap, /timelimit).");
         }
 
         return appConfig;

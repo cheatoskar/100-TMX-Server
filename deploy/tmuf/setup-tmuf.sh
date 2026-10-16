@@ -30,7 +30,7 @@ mkdir -p "$DST/WebStatus"
 rsync -a \
   --exclude '/Servers/' --exclude '/WebStatus/' --exclude '/config.toml' \
   --exclude '/leaderboard.json' --exclude '/skipped-maps.json' --exclude '/impossible-maps.json' \
-  --exclude '/CANNOT_SEE_SERVER.txt' \
+  --exclude '/CANNOT_SEE_SERVER.txt' --exclude '/played-maps.json' --exclude '/MapCache/' \
   "$SRC/" "$DST/"
 cp "$SRC/WebStatus/discord.png" "$SRC/WebStatus/favorite.png" "$DST/WebStatus/"
 

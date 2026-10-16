@@ -40,7 +40,10 @@ internal sealed class PresetConfig
     public void Apply(AppConfig config)
     {
         config.TimeLimit = new TimeInt32(TimeLimit);
-        config.AutoSkipMode = Enum.Parse<AutoSkipMode>(AutoSkipMode, ignoreCase: true);
+        // IsValid is checked before every Apply, so this can't throw half-way through
+        config.AutoSkipMode = Enum.TryParse<AutoSkipMode>(AutoSkipMode, ignoreCase: true, out var autoSkipMode)
+            ? autoSkipMode
+            : config.AutoSkipMode;
 
         if (ServerName is not null) config.ServerName = ServerName;
         if (WelcomeMessage is not null) config.WelcomeMessage = WelcomeMessage.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);

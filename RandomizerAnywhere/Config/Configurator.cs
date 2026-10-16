@@ -25,6 +25,13 @@ internal static class Configurator
             return parsed;
         }
 
+        // Under systemd stdin is /dev/null: ReadLine returns null at once and this loop spun at
+        // 100% CPU, flooding the journal. Without a terminal there is nobody to ask.
+        if (Console.IsInputRedirected)
+        {
+            throw new ConfigException($"no valid {humanizedName} configured (config.toml, command line or {envVariableName}). Allowed: {string.Join(", ", Enum.GetNames<T>())}.");
+        }
+
         while (true)
         {
             Console.Write($"Select {humanizedName} ({string.Join(", ", Enum.GetNames<T>())}): ");

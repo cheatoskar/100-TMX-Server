@@ -42,4 +42,8 @@ internal sealed class AppConfig
     public required string DiscordWebhookUrl { get; init; }
     public required string DiscordWebhookUrlHard { get; init; }
     public PresetConfig? LastPreset { get; set; }
+
+    public int ConnectionUploadRate { get; init; }
+    public bool VerboseRpc { get; init; } = true;
+    public int KeepConsoleLogs { get; init; } = 30;
 }
