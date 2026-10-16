@@ -1,5 +1,6 @@
 using ManiaAPI.XmlRpc;
 using RandomizerAnywhere.Config;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
@@ -60,6 +61,91 @@ internal sealed partial class RandomizerGame
     // MaxMapHistory so this can't grow unbounded over a long-running session.
     private readonly List<int> mapHistory = [];
     private const int MaxMapHistory = 10;
+
+    // The TMX id of the map that last STARTED (BeginRace), kept across EndRace so the next
+    // BeginRace can put it into the history. null when that map couldn't be identified.
+    private int? lastRunningTrackId;
+
+    private void PushMapHistory(int trackId)
+    {
+        mapHistory.Insert(0, trackId);
+        if (mapHistory.Count > MaxMapHistory)
+        {
+            mapHistory.RemoveAt(mapHistory.Count - 1);
+        }
+    }
+
+    // true while the current map runs in Rounds mode because of /rounds; the next advance has to
+    // switch back to TimeAttack even when it reuses an already queued map
+    private bool roundsModeActive;
+
+    // Fire-and-forget with a log line instead of a silently lost exception.
+    private void RunInBackground(string what, Func<Task> work)
+    {
+        _ = Task.Run(async () =>
+        {
+            // started from inside a locked job, the flag would be inherited although this
+            // task holds no lock - and WithoutGameLockIfBackgroundAsync would release someone else's
+            holdsGameLockInBackground.Value = false;
+
+            try
+            {
+                await work();
+            }
+            catch (OperationCanceledException) when (appToken.IsCancellationRequested)
+            {
+                // shutting down
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Warning: {what} failed - {ex.Message}");
+            }
+        });
+    }
+
+    // TMX metadata does not change while a map is played; caching it means the widget for a late
+    // joiner costs nothing, and BeginRace never waits for tm-exchange.com.
+    private readonly ConcurrentDictionary<int, (string DifficultyLabel, int Awards)> trackMetaCache = new();
+    private readonly ConcurrentDictionary<int, string> trackNameCache = new();
+    private static readonly TimeSpan TrackMetaBudget = TimeSpan.FromSeconds(15);
+
+    // login null = everyone
+    private void ShowMapInfoWidgetInBackground(int trackId, int authorTime, string? login)
+    {
+        RunInBackground($"showing the map info widget for {trackId}", async () =>
+        {
+            if (!trackMetaCache.TryGetValue(trackId, out var meta))
+            {
+                using var budget = CancellationTokenSource.CreateLinkedTokenSource(appToken);
+                budget.CancelAfter(TrackMetaBudget);
+                meta = await tmxRules.GetTrackMetaAsync(trackId, budget.Token);
+
+                if (trackMetaCache.Count > 500)
+                {
+                    trackMetaCache.Clear();
+                }
+
+                trackMetaCache[trackId] = meta;
+            }
+
+            // the map may have changed while TMX was answering - don't show stale info
+            if (currentMapTrackId != trackId)
+            {
+                return;
+            }
+
+            var manialink = BuildMapInfoManialink(meta.DifficultyLabel, meta.Awards, authorTime);
+
+            if (login is null)
+            {
+                await client.SendManialinkPageAsync(manialink, cancellationToken: appToken);
+            }
+            else
+            {
+                await client.SendManialinkPageToLoginAsync(login, manialink, cancellationToken: appToken);
+            }
+        });
+    }
     private string? randomEnqueuedMapFileName;
 
     // set by /loadmap or a passed /votemap vote, consumed (and cleared) by the next
@@ -105,27 +191,136 @@ internal sealed partial class RandomizerGame
         var now = DateTimeOffset.UtcNow;
         var lastCallbackAge = (now - client.LastCallbackAt).TotalSeconds;
         var racingGap = lastRacingProgressAt is { } racingAt ? (racingAt - client.LastCallbackAt).TotalSeconds : (double?)null;
-        var mapGap = currentMapStartedAt is { } startedAt ? (lastPolledMapChangedAt - startedAt).TotalSeconds : (double?)null;
+        var sinceMapChange = (now - lastPolledMapChangedAt).TotalSeconds;
 
         return $"callbacks: received={client.CallbacksReceived} lastCallbackAge={lastCallbackAge:0.0}s "
             + $"racingProgressAhead={(racingGap is { } r ? $"{r:0.0}s (limit {CallbackRacingGracePeriod.TotalSeconds:0}s)" : "n/a")} "
-            + $"mapChangeWithoutBeginRace={(mapGap is { } m ? $"{m:0.0}s (limit {CallbackGracePeriod.TotalSeconds:0}s)" : "n/a")} "
-            + $"rankedCount={lastPolledRankedCount} players={lastOnlinePlayerCount} advancing={isAdvancingToNextMap} reconnecting={reconnectInProgress}";
+            + $"polledMap='{lastPolledMapName}' beginRaceMap='{lastBeginRaceMapName}' "
+            + $"sinceMapChange={sinceMapChange:0.0}s (grace {CallbackGracePeriod.TotalSeconds:0}s) "
+            + $"rankedCount={lastPolledRankedCount} players={lastOnlinePlayerCount} advancing={isAdvancingToNextMap} "
+            + $"mapGeneration={mapGeneration} switchClaimed={SwitchAlreadyClaimed} reconnecting={reconnectInProgress}";
     }
 
     // An advance still "in flight" after this long is treated as dead rather than blocking
     // every future one. Without it a single hung RPC latched the guard permanently and
     // /skip, /votemap and the finish-advance all became silent no-ops until a restart.
-    private static readonly TimeSpan AdvanceStallTimeout = TimeSpan.FromSeconds(30);
+    // It has to be longer than the advance can legitimately take: the TMX search alone may use
+    // 30s plus a 40s request, then a 40s download - 30s here let a second advance start while the
+    // first was still running. AdvanceBudget below bounds the advance itself, so this is only
+    // the backstop.
+    private static readonly TimeSpan AdvanceStallTimeout = TimeSpan.FromSeconds(150);
+    private static readonly TimeSpan AdvanceBudget = TimeSpan.FromSeconds(120);
+
+    // which advance owns advanceStartedAt, so a stalled one finishing late cannot clear the guard
+    // of the advance that replaced it
+    private long advanceCounter;
+    private long advanceOwner;
 
     private bool isAdvancingToNextMap =>
         advanceStartedAt is { } startedAt && DateTimeOffset.UtcNow - startedAt < AdvanceStallTimeout;
 
+    // Counts BeginRace callbacks, i.e. maps that actually started. A map switch that has been
+    // asked for is "claimed" for the generation it switches AWAY from, so everything still queued
+    // for the old map - the second finisher's PlayerFinish, a /skip typed during the podium, the
+    // stalled-map watchdog - sees the claim and does not ask for another switch. That second
+    // NextChallenge is what skipped the freshly loaded map or failed with "Change in progress"
+    // (81 times in the old host's log), because the guard above only stops two advances running
+    // at the same moment, not one right after the other.
+    private int mapGeneration;
+    private int? advanceClaimGeneration;
+    private DateTimeOffset advanceClaimedAt;
+
+    // If the new map's BeginRace never arrives the claim must not block switching for good.
+    private static readonly TimeSpan AdvanceClaimTimeout = TimeSpan.FromSeconds(90);
+
+    private bool SwitchAlreadyClaimed =>
+        advanceClaimGeneration == mapGeneration && DateTimeOffset.UtcNow - advanceClaimedAt < AdvanceClaimTimeout;
+
+    // Which claim is the current one. A finish schedules its switch for later; if something else
+    // (a session start, a /preset) switched the map in between, the claim has a new id and the
+    // finish's switch must not run a second time.
+    private int claimCounter;
+    private int advanceClaimId;
+
+    private int ClaimSwitch()
+    {
+        advanceClaimGeneration = mapGeneration;
+        advanceClaimedAt = DateTimeOffset.UtcNow;
+        return advanceClaimId = ++claimCounter;
+    }
+
+    private void ReleaseSwitchClaim() => advanceClaimGeneration = null;
+
+    // Everything that decides about the game - callback handlers, vote timers, the watchdog,
+    // background advances - runs under this one lock. Callbacks were already handled one at a
+    // time, but the vote timers, the stalled-map watchdog and the delayed finish-advance ran on
+    // the thread pool next to them and raced on the same unlocked fields. The status writer only
+    // reads and never takes it, so a long advance can never make status.json go stale.
+    private readonly SemaphoreSlim gameLock = new(1, 1);
+
+    // How long a background job waits for the lock before giving up on this round.
+    private static readonly TimeSpan GameLockWait = TimeSpan.FromSeconds(150);
+
+    // The process-wide token from RunAsync. Background jobs use this one: a callback handler's
+    // token belongs to that single callback and is cancelled/disposed once the handler returns.
+    private CancellationToken appToken;
+
+    private async Task<bool> RunUnderGameLockAsync(string what, Func<CancellationToken, Task> action)
+    {
+        if (!await gameLock.WaitAsync(GameLockWait, appToken))
+        {
+            Console.WriteLine($"Warning: {what} skipped - the game was busy for {GameLockWait.TotalSeconds:0}s.");
+            return false;
+        }
+
+        try
+        {
+            holdsGameLockInBackground.Value = true;
+            await action(appToken);
+            return true;
+        }
+        finally
+        {
+            holdsGameLockInBackground.Value = false;
+            gameLock.Release();
+        }
+    }
+
+    // True inside RunUnderGameLockAsync, i.e. a background job (finish switch, watchdog, session
+    // keeper, AutoStart) that holds the lock - as opposed to a callback handler.
+    private static readonly AsyncLocal<bool> holdsGameLockInBackground = new();
+
+    // The TMX search and download can take a minute or more. A background job that held the lock
+    // all that time blocked every callback behind it, and the callback client cuts a handler off
+    // after 60s - finishes, joins and BeginRace were lost. Background jobs let go of the lock for
+    // that part (their advance stays guarded by isAdvancingToNextMap). A callback handler keeps
+    // it: the stream waits for the handler anyway, so letting go would gain nothing.
+    private async Task<T> WithoutGameLockIfBackgroundAsync<T>(Func<Task<T>> work)
+    {
+        if (!holdsGameLockInBackground.Value)
+        {
+            return await work();
+        }
+
+        gameLock.Release();
+        try
+        {
+            return await work();
+        }
+        finally
+        {
+            // no token: the caller's finally releases the lock, so it must be held again here
+            await gameLock.WaitAsync(CancellationToken.None);
+        }
+    }
+
     private int? currentMapCheckpointTotal;
-    private readonly Dictionary<string, int> playerCheckpointProgress = [];
+    // Concurrent: written by checkpoint callbacks, enumerated by the status writer (which does
+    // not take the game lock) - a plain Dictionary can throw "collection was modified" there.
+    private readonly ConcurrentDictionary<string, int> playerCheckpointProgress = [];
     // tie-breaks the live "who's leading" ranking on the status page: same checkpoint count ->
     // whoever reached it first is ahead
-    private readonly Dictionary<string, DateTimeOffset> playerCheckpointTimestamp = [];
+    private readonly ConcurrentDictionary<string, DateTimeOffset> playerCheckpointTimestamp = [];
 
     // Set every time a map actually begins; the stalled-map watchdog measures from here.
     private DateTimeOffset? currentMapStartedAt;
@@ -202,21 +397,47 @@ internal sealed partial class RandomizerGame
                 return false;
             }
 
-            if (currentMapStartedAt is not { } startedAt)
+            if (lastBeginRaceMapName is null || lastPolledMapName is null)
             {
                 // No BeginRace seen yet - nothing to compare against. The first map after a
                 // restart is a known blind spot, so never call it dead on that alone.
                 return true;
             }
 
-            // If BeginRace stops arriving, startedAt stays pinned to the previous map while
-            // the poll keeps moving forward, so this gap grows without bound. In normal
-            // operation it is a few seconds - the poll interval - and never grows.
-            return lastPolledMapChangedAt - startedAt < CallbackGracePeriod;
+            // The poll sees which map is running; the last BeginRace says which map the callback
+            // stream last reported. If they differ for longer than the grace period, the BeginRace
+            // for the running map never came: the stream is dead.
+            //
+            // This used to compare TIMES: "poll saw the change" minus "last BeginRace". But the poll
+            // often sees the new map before its BeginRace has been handled, and at that moment the
+            // last BeginRace is the PREVIOUS map's, so the "gap" was really how long the previous
+            // map had been played. Any map longer than two minutes could trip it: 39 verdicts on
+            // the old host, every one with callbacks less than a second old, each followed by a
+            // needless reconnect that dropped whatever callbacks arrived meanwhile. Comparing the
+            // map names needs no timing guess at all.
+            // The grace runs from whichever came last: the poll seeing a new map, or a BeginRace.
+            // A BeginRace for a map the poll hasn't seen yet (the poll failed or is behind) is
+            // proof the stream works, not that it is dead.
+            var lastSign = lastBeginRaceAt > lastPolledMapChangedAt ? lastBeginRaceAt : lastPolledMapChangedAt;
+            return lastBeginRaceMapName == lastPolledMapName
+                || DateTimeOffset.UtcNow - lastSign < CallbackGracePeriod;
         }
     }
 
+    // The map name (formatting removed, as the poll stores it) from the last BeginRace callback.
+    private string? lastBeginRaceMapName;
+    private DateTimeOffset lastBeginRaceAt;
+
     private bool SessionActive => sessionStopwatch is not null;
+
+    // Registered with the game server as chat commands (RandomizerSetup) - must match the keys of
+    // commandHandlers, which the constructor checks.
+    internal static readonly string[] ChatCommandNames =
+    [
+        "start", "stop", "end", "skip", "imp", "blockmap", "hard", "top", "rank", "map", "history",
+        "rounds", "info", "help", "testhud", "votepreset", "yes", "no", "commands", "source",
+        "timelimit", "tl", "preset", "presets", "loadmap", "votemap",
+    ];
 
     public RandomizerGame(RemoteClient client, TmxRules tmxRules, AppConfig config, DiscordNotifier discordNotifier, Leaderboard leaderboard, SkippedMaps skippedMaps)
     {
@@ -242,6 +463,7 @@ internal sealed partial class RandomizerGame
             ["history"] = HistoryAsync,
             ["rounds"] = RoundsAsync,
             ["info"] = InfoAsync,
+            ["help"] = InfoAsync,
             ["testhud"] = TestHudAsync,
             ["votepreset"] = VotePresetAsync,
             ["yes"] = YesAsync,
@@ -256,6 +478,11 @@ internal sealed partial class RandomizerGame
             ["votemap"] = VoteMapAsync
         };
 
+        if (!commandHandlers.Keys.ToHashSet().SetEquals(ChatCommandNames))
+        {
+            Console.WriteLine("Warning: ChatCommandNames and the command handlers disagree - some commands won't work.");
+        }
+
         /*client.Callback += async (methodName, methodParams, cancellationToken) =>
         {
             Console.WriteLine($"{methodName} {string.Join(' ', methodParams.Select(x =>
@@ -267,13 +494,44 @@ internal sealed partial class RandomizerGame
         };*/
     }
 
+    // Every game callback takes the game lock (see gameLock). Callbacks still arrive one at a time;
+    // the lock only keeps the vote timers, the watchdog and background advances out while one runs.
+    // A handler that cannot get the lock in time hits RemoteClient's handler cutoff like any other
+    // slow handler, so the stream keeps moving.
+    private void OnGameCallback(string method, Func<object[], CancellationToken, Task> handler)
+    {
+        client.On(method, async (methodParams, cancellationToken) =>
+        {
+            await gameLock.WaitAsync(cancellationToken);
+            try
+            {
+                await handler(methodParams, cancellationToken);
+            }
+            finally
+            {
+                gameLock.Release();
+            }
+        });
+    }
+
     private void RegisterCallbacks()
     {
-        client.On("TrackMania.BeginRace", async (methodParams, cancellationToken) =>
+        OnGameCallback("TrackMania.BeginRace", async (methodParams, cancellationToken) =>
         {
+            // a new map has started: whatever switch was claimed for the previous one is done
+            mapGeneration++;
+
             try
             {
                 var mapInfo = (Dictionary<string, object>)methodParams[0];
+
+                // straight from the callback, before any call that could fail - the health check
+                // compares it with the map the status poll sees
+                if (mapInfo.TryGetValue("Name", out var beginRaceName) && beginRaceName is string name)
+                {
+                    lastBeginRaceMapName = TmFormatCodeRegex().Replace(name, string.Empty);
+                    lastBeginRaceAt = DateTimeOffset.UtcNow;
+                }
 
                 currentMap = new MapInfo(
                     AuthorTime: (int)mapInfo["AuthorTime"],
@@ -296,6 +554,26 @@ internal sealed partial class RandomizerGame
                 currentMapTrackId = ResolveRunningTrackId(info.FileName);
                 currentMapIdentified = true;
 
+                var mapChanged = previousMapFileName is null
+                    || !ChallengeFileKey(previousMapFileName).Equals(ChallengeFileKey(info.FileName ?? string.Empty), StringComparison.OrdinalIgnoreCase);
+
+                // History is "the maps before this one", so it is written when a DIFFERENT map
+                // starts. It used to be written on every EndRace, and a ChallengeRestart (the idle
+                // probe, /rounds, /stop) ends a race without changing the map - the current map then
+                // showed up as "-1" and "/imp -1" reported the map still being played.
+                if (mapChanged && lastRunningTrackId is { } previousTrackId)
+                {
+                    PushMapHistory(previousTrackId);
+                }
+
+                if (mapChanged)
+                {
+                    // /rounds only ever applies to the map it was used on
+                    roundsModeActive = false;
+                }
+
+                lastRunningTrackId = currentMapTrackId;
+
                 LogMapTransition(info);
 
                 // Drop the map we just came off the server's playlist. Until this existed the
@@ -303,8 +581,7 @@ internal sealed partial class RandomizerGame
                 // served an already-played one - which is what players see as "it keeps giving us
                 // maps we already finished". Done here rather than in EndRace because the outgoing
                 // map is only safely removable once a different one is confirmed running.
-                if (previousMapFileName is not null
-                    && !ChallengeFileKey(previousMapFileName).Equals(ChallengeFileKey(info.FileName ?? string.Empty), StringComparison.OrdinalIgnoreCase))
+                if (previousMapFileName is not null && mapChanged)
                 {
                     await RemovePlayedChallengeAsync(previousMapFileName, cancellationToken);
                 }
@@ -319,17 +596,18 @@ internal sealed partial class RandomizerGame
                 if (currentMapTrackId is { } skippedId && skippedMaps.Contains(skippedId) && SessionActive)
                 {
                     Console.WriteLine($"Skip list: map {skippedId} came up but is on this server's skip list - moving on.");
-                    _ = Task.Run(async () =>
+                    var generation = mapGeneration;
+                    RunInBackground($"skipping past skip-listed map {skippedId}", async () =>
                     {
-                        try
+                        await Task.Delay(1500, appToken);
+                        await RunUnderGameLockAsync($"skipping past skip-listed map {skippedId}", async token =>
                         {
-                            await Task.Delay(1500);
-                            await NextRandomMapAsync(goalReached: false, CancellationToken.None);
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"Warning: couldn't skip past skip-listed map {skippedId} - {ex.Message}");
-                        }
+                            // something else already moved the server on in the meantime
+                            if (mapGeneration == generation)
+                            {
+                                await NextRandomMapAsync(goalReached: false, token);
+                            }
+                        });
                     });
                 }
 
@@ -352,15 +630,9 @@ internal sealed partial class RandomizerGame
 
                 if (currentMapTrackId is { } trackIdForMeta)
                 {
-                    try
-                    {
-                        var meta = await tmxRules.GetTrackMetaAsync(trackIdForMeta, cancellationToken);
-                        await client.SendManialinkPageAsync(BuildMapInfoManialink(meta.DifficultyLabel, meta.Awards, info.AuthorTime), cancellationToken: cancellationToken);
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"Warning: failed to fetch TMX map metadata - {ex.Message}");
-                    }
+                    // TMX is slow at times (up to its 40s budget) and this handler holds the whole
+                    // callback stream, so the info widget is filled in from the side
+                    ShowMapInfoWidgetInBackground(trackIdForMeta, info.AuthorTime, login: null);
                 }
             }
             catch (Exception ex)
@@ -372,22 +644,10 @@ internal sealed partial class RandomizerGame
             }
         });
 
-        client.On("TrackMania.EndRace", async (methodParams, cancellationToken) =>
+        OnGameCallback("TrackMania.EndRace", async (methodParams, cancellationToken) =>
         {
             try
             {
-                // capture the outgoing map's id for "/map -1"/"-2"/... etc. BEFORE it gets cleared
-                // below - BeginRace can't do this itself since EndRace has already nulled
-                // currentMapTrackId by the time the next BeginRace fires
-                if (currentMapTrackId is { } endedTrackId)
-                {
-                    mapHistory.Insert(0, endedTrackId);
-                    if (mapHistory.Count > MaxMapHistory)
-                    {
-                        mapHistory.RemoveAt(mapHistory.Count - 1);
-                    }
-                }
-
                 currentMap = null;
                 currentMapTrackId = null;
                 currentMapIdentified = false;
@@ -405,7 +665,7 @@ internal sealed partial class RandomizerGame
             }
         });
 
-        client.On("TrackMania.PlayerCheckpoint", async (methodParams, cancellationToken) =>
+        OnGameCallback("TrackMania.PlayerCheckpoint", async (methodParams, cancellationToken) =>
         {
             try
             {
@@ -431,7 +691,7 @@ internal sealed partial class RandomizerGame
             }
         });
 
-        client.On("TrackMania.PlayerConnect", async (methodParams, cancellationToken) =>
+        OnGameCallback("TrackMania.PlayerConnect", async (methodParams, cancellationToken) =>
         {
             try
             {
@@ -449,7 +709,7 @@ internal sealed partial class RandomizerGame
             }
         });
 
-        client.On("TrackMania.PlayerChat", async (methodParams, cancellationToken) =>
+        OnGameCallback("TrackMania.PlayerChat", async (methodParams, cancellationToken) =>
         {
             // Pulled out of the try so the catch below can still answer the player.
             var login = methodParams.Length > 1 ? methodParams[1] as string : null;
@@ -475,7 +735,8 @@ internal sealed partial class RandomizerGame
                 {
                     try
                     {
-                        await SendMessageAsync(login, $"$F00That command failed: {ex.Message}", cancellationToken);
+                        // appToken: when the handler was cut off, its own token is already cancelled
+                        await SendMessageAsync(login, $"$F00That command failed: {ex.Message}", appToken);
                     }
                     catch (Exception replyEx)
                     {
@@ -485,7 +746,7 @@ internal sealed partial class RandomizerGame
             }
         });
 
-        client.On("TrackMania.PlayerFinish", async (methodParams, cancellationToken) =>
+        OnGameCallback("TrackMania.PlayerFinish", async (methodParams, cancellationToken) =>
         {
             try
             {
@@ -501,7 +762,7 @@ internal sealed partial class RandomizerGame
             }
         });
 
-        client.On("TrackMania.StatusChanged", async (methodParams, cancellationToken) =>
+        OnGameCallback("TrackMania.StatusChanged", async (methodParams, cancellationToken) =>
         {
             try
             {
@@ -526,7 +787,7 @@ internal sealed partial class RandomizerGame
             }
         });
 
-        client.On("TrackMania.EndRound", async (methodParams, cancellationToken) =>
+        OnGameCallback("TrackMania.EndRound", async (methodParams, cancellationToken) =>
         {
             try
             {
@@ -538,7 +799,7 @@ internal sealed partial class RandomizerGame
             }
         });
 
-        client.On("TrackMania.PlayerManialinkPageAnswer", async (methodParams, cancellationToken) =>
+        OnGameCallback("TrackMania.PlayerManialinkPageAnswer", async (methodParams, cancellationToken) =>
         {
             try
             {
@@ -641,6 +902,9 @@ internal sealed partial class RandomizerGame
         if (sessionExpired)
         {
             await SendMessageAsync("$FF0Time limit reached! Stopping the session.", cancellationToken);
+
+            // like /stop: the session keeper must not start it again half a minute later
+            sessionStoppedByAdmin = true;
             await StopSessionAsync(cancellationToken);
         }
         else
@@ -669,6 +933,7 @@ internal sealed partial class RandomizerGame
 
     public async Task RunAsync(CancellationToken cancellationToken = default)
     {
+        appToken = cancellationToken;
         RegisterCallbacks();
 
         // The dedicated server's own anti-cheat bans players for "Time incoherence", and on a
@@ -718,17 +983,25 @@ internal sealed partial class RandomizerGame
             // below still exists for the milder, catchable case.
             await Task.Delay(3000, cancellationToken);
 
+            // These retries used to do nothing: StartSessionAsync marked the session active before
+            // its first await, so attempts 2-5 returned at once and reported success while the
+            // server sat on the warmup map. It now only counts as started once the first map is
+            // on its way, and the session keeper in the watchdog loop keeps retrying after these.
             for (var attempt = 1; attempt <= 5; attempt++)
             {
                 try
                 {
-                    await StartSessionAsync(cancellationToken);
+                    await RunUnderGameLockAsync("starting the session", StartSessionAsync);
                     break;
                 }
-                catch (Exception ex) when (attempt < 5)
+                catch (Exception ex) when (attempt < 5 && !cancellationToken.IsCancellationRequested)
                 {
                     Console.WriteLine($"Warning: StartSessionAsync attempt {attempt} failed - {ex.Message}");
                     await Task.Delay(2000, cancellationToken);
+                }
+                catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+                {
+                    Console.WriteLine($"Warning: StartSessionAsync attempt {attempt} failed - {ex.Message}. The session keeper will keep trying.");
                 }
             }
         }
@@ -738,6 +1011,24 @@ internal sealed partial class RandomizerGame
         // whether a reconnect caused it and re-attach to the new connection if so.
         while (!cancellationToken.IsCancellationRequested)
         {
+            // A reconnect that failed leaves no connection at all. Waiting on it would throw at
+            // once and be read as "the game server closed the connection" - exit 75, even with
+            // players on. Keep redialling instead; TryRecoverCallbacksAsync decides when giving up
+            // and restarting is acceptable.
+            if (reconnectInProgress)
+            {
+                // a reconnect is swapping the connection right now - wait for it to finish
+                await Task.Delay(200, cancellationToken);
+                continue;
+            }
+
+            if (!client.IsConnected)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(10), cancellationToken);
+                await TryRecoverCallbacksAsync(cancellationToken, ignoreCooldown: true);
+                continue;
+            }
+
             var generation = Volatile.Read(ref reconnectGeneration);
             Exception? closeError = null;
             var closeWaitStartedAt = Stopwatch.GetTimestamp();
@@ -757,7 +1048,7 @@ internal sealed partial class RandomizerGame
                 break;
             }
 
-            if (Volatile.Read(ref reconnectGeneration) == generation)
+            if (Volatile.Read(ref reconnectGeneration) == generation && !reconnectInProgress)
             {
                 // The game server closed the connection and no reconnect of ours caused it.
                 // Falling out of RunAsync here ends Main and exits with code 0, which
@@ -791,9 +1082,15 @@ internal sealed partial class RandomizerGame
 
     // Step 1 of never letting a stall matter: rebuild the connection instead of restarting the
     // process. Works with a full server, takes seconds, and nobody is kicked.
-    private async Task TryRecoverCallbacksAsync(CancellationToken cancellationToken)
+    private async Task TryRecoverCallbacksAsync(CancellationToken cancellationToken, bool ignoreCooldown = false)
     {
-        if (DateTimeOffset.UtcNow - lastCallbackRecoveryAt < CallbackRecoveryCooldown)
+        if (!ignoreCooldown && DateTimeOffset.UtcNow - lastCallbackRecoveryAt < CallbackRecoveryCooldown)
+        {
+            return;
+        }
+
+        // the status loop, the probe and the keep-alive loop can all ask for this; one at a time
+        if (Interlocked.Exchange(ref recoveryRunning, 1) == 1)
         {
             return;
         }
@@ -806,13 +1103,20 @@ internal sealed partial class RandomizerGame
 
         try
         {
-            await client.ReconnectAsync(cancellationToken);
+            // A dedicated server that accepts the TCP connection but never answers (a hung main
+            // loop) would otherwise keep this waiting forever - and with it reconnectInProgress,
+            // the keep-alive loop and every future recovery.
+            using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            budget.CancelAfter(ReconnectBudget);
+            await client.ReconnectAsync(budget.Token);
 
             // Give the fresh connection a clean slate rather than judging it on the old one's
             // evidence; if it is still deaf, the next map change re-detects it.
             var now = DateTimeOffset.UtcNow;
             currentMapStartedAt = now;
             lastPolledMapChangedAt = now;
+            lastBeginRaceMapName = lastPolledMapName;
+            lastBeginRaceAt = now;
             lastPolledRankedCount = 0;
             lastRacingProgressAt = null;
             callbackLossReported = false;
@@ -820,25 +1124,32 @@ internal sealed partial class RandomizerGame
 
             Console.WriteLine("Reconnected - callback stream restored without a restart.");
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
         {
             failedRecoveries++;
             Console.WriteLine($"ERROR: reconnect failed ({failedRecoveries}) - {ex.Message}");
 
             // Last resort only: if redialling keeps failing and nobody is racing, hand the
             // problem to systemd. Never while players are on - a dead controller is bad, but
-            // kicking people mid-race to fix it is not our call.
-            if (failedRecoveries >= 3 && lastOnlinePlayerCount == 0)
+            // kicking people mid-race to fix it is not our call. After several minutes of not
+            // being able to reach the game server at all, though, nobody is being served by
+            // this process anyway, and the player count it remembers is just as old.
+            if ((failedRecoveries >= 3 && lastOnlinePlayerCount == 0) || failedRecoveries >= 6)
             {
-                Console.WriteLine("Reconnect keeps failing and nobody is online - restarting the controller.");
+                Console.WriteLine("Reconnect keeps failing - restarting the controller.");
+                await Console.Out.FlushAsync(CancellationToken.None);
                 Environment.Exit(70);
             }
         }
         finally
         {
             reconnectInProgress = false;
+            Volatile.Write(ref recoveryRunning, 0);
         }
     }
+
+    private int recoveryRunning;
+    private static readonly TimeSpan ReconnectBudget = TimeSpan.FromSeconds(30);
 
     // Step 2: on a busy server a dead stream shows up at the next map change. On an idle empty
     // one nothing changes at all, so the stall hides until somebody joins and hits it. Provoke a
@@ -846,31 +1157,46 @@ internal sealed partial class RandomizerGame
     // restarting the current map costs nothing.
     private async Task ProbeCallbacksAsync(CancellationToken cancellationToken)
     {
-        if (!SessionActive || lastOnlinePlayerCount > 0 || reconnectInProgress || isAdvancingToNextMap)
+        long before = 0;
+        var probed = false;
+
+        // The restart itself runs under the game lock, the 10s wait for its callback must not:
+        // that callback needs the lock to be handled.
+        await RunUnderGameLockAsync("probing the callback stream", async token =>
+        {
+            if (!SessionActive || lastOnlinePlayerCount > 0 || reconnectInProgress || isAdvancingToNextMap || SwitchAlreadyClaimed)
+            {
+                return;
+            }
+
+            var now = DateTimeOffset.UtcNow;
+
+            if (now - client.LastCallbackAt < CallbackProbeIdle || now - lastCallbackProbeAt < CallbackProbeIdle)
+            {
+                return;
+            }
+
+            // isAdvancingToNextMap only covers our own call; the dedicated server keeps switching
+            // for several seconds after it returns, and a ChallengeRestart in that window eats the
+            // change. Stay well clear of any map that has just started.
+            if (now - lastPolledMapChangedAt < CallbackProbeMapSettleTime)
+            {
+                return;
+            }
+
+            lastCallbackProbeAt = now;
+            before = client.CallbacksReceived;
+
+            Console.WriteLine("No callbacks for a while on an empty server - probing the stream.");
+            await CallWithTransitionRetryAsync("ChallengeRestart", [], token);
+            probed = true;
+        });
+
+        if (!probed)
         {
             return;
         }
 
-        var now = DateTimeOffset.UtcNow;
-
-        if (now - client.LastCallbackAt < CallbackProbeIdle || now - lastCallbackProbeAt < CallbackProbeIdle)
-        {
-            return;
-        }
-
-        // isAdvancingToNextMap only covers our own call; the dedicated server keeps switching
-        // for several seconds after it returns, and a ChallengeRestart in that window eats the
-        // change. Stay well clear of any map that has just started.
-        if (now - lastPolledMapChangedAt < CallbackProbeMapSettleTime)
-        {
-            return;
-        }
-
-        lastCallbackProbeAt = now;
-        var before = client.CallbacksReceived;
-
-        Console.WriteLine("No callbacks for a while on an empty server - probing the stream.");
-        await CallWithTransitionRetryAsync("ChallengeRestart", [], cancellationToken);
         await Task.Delay(TimeSpan.FromSeconds(10), cancellationToken);
 
         if (client.CallbacksReceived == before)
@@ -890,9 +1216,9 @@ internal sealed partial class RandomizerGame
 
             try
             {
-                await CheckStalledMapAsync(cancellationToken);
+                await RunUnderGameLockAsync("stalled-map watchdog", CheckStalledMapAsync);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
             {
                 Console.WriteLine($"Warning: stalled-map watchdog failed - {ex.Message}");
             }
@@ -901,12 +1227,60 @@ internal sealed partial class RandomizerGame
             {
                 await ProbeCallbacksAsync(cancellationToken);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
             {
                 Console.WriteLine($"Warning: callback probe failed - {ex.Message}");
             }
+
+            try
+            {
+                await RunUnderGameLockAsync("session keeper", KeepSessionRunningAsync);
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                Console.WriteLine($"Warning: couldn't restart the session - {ex.Message}");
+            }
         }
     }
+
+    // Set by /stop, /end and the time limit running out: the session is meant to be off, so the
+    // keeper below leaves it off.
+    private bool sessionStoppedByAdmin;
+
+    // With AutoStart the session is supposed to run whenever the server does. Anything that ends
+    // it by accident - a failed start at boot, a preset switch whose first map could not be
+    // fetched - used to leave the server parked on its current map until someone typed /start,
+    // with the stalled-map watchdog switched off too (it only runs during a session).
+    private async Task KeepSessionRunningAsync(CancellationToken cancellationToken)
+    {
+        if (!config.AutoStart || SessionActive || sessionStoppedByAdmin || reconnectInProgress || !client.IsConnected)
+        {
+            return;
+        }
+
+        if (DateTimeOffset.UtcNow < keeperRetryAfter)
+        {
+            return;
+        }
+
+        Console.WriteLine("Session keeper: AutoStart is on but no session is running - starting one.");
+
+        try
+        {
+            await StartSessionAsync(cancellationToken);
+            keeperFailures = 0;
+        }
+        catch
+        {
+            // TMX down: every attempt holds up the game for its download - back off up to 5 min
+            keeperFailures++;
+            keeperRetryAfter = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(Math.Min(300, 30 * keeperFailures));
+            throw;
+        }
+    }
+
+    private int keeperFailures;
+    private DateTimeOffset keeperRetryAfter;
 
     private int statusTicks;
 
@@ -922,6 +1296,9 @@ internal sealed partial class RandomizerGame
             }
             catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
             {
+                // statusStage names the step that used up the budget: the RPC polls no longer
+                // swallow the cancellation, so a slow game server is no longer reported as
+                // "stuck on writing status.json to disk" (~370 times on the old host).
                 Console.WriteLine($"Warning: status.json write timed out (stuck on '{statusStage}'), retrying next tick.");
                 Diagnostics.Dump($"status.json write timed out on '{statusStage}'", recentLines: 25);
             }
@@ -930,55 +1307,76 @@ internal sealed partial class RandomizerGame
                 Console.WriteLine($"Warning: failed to write status.json - {ex.Message}");
             }
 
-            // A quiet baseline (one line every 5 minutes) so that when something stalls it can be
-            // compared with what "normal" looked like: dedicated server CPU, thread pool, load.
-            if (++statusTicks % 30 == 0)
+            try
             {
-                Console.WriteLine($"[diag] health: {Diagnostics.Snapshot()} | {DescribeCallbackState()}");
+                await CheckCallbackHealthAsync(cancellationToken);
             }
-
-            if (CallbacksHealthy)
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
             {
-                callbackLossReported = false;
-            }
-            else
-            {
-                if (!callbackLossReported)
-                {
-                    callbackLossReported = true;
-                    Console.WriteLine(
-                        "ERROR: the callback stream from the dedicated server is dead. The controller "
-                        + "is still polling but no longer driving the game - no chat commands, widgets "
-                        + "or map picks, and the playlist will just repeat. Restarting once empty.");
-
-                    // 42 of these in 15 days, most of them right after a map change - so log the
-                    // numbers behind the verdict and the last minutes of activity, to learn whether
-                    // the stream really died or the check fired while a map swap was in progress.
-                    Diagnostics.Dump(
-                        "callback stream judged dead",
-                        $"{DescribeCallbackState()} | advance stage='{advanceStage}' | status stage='{statusStage}'");
-                }
-
-                // Rebuild the connection rather than the process: this works with a full
-                // server and costs seconds, so a stall no longer waits for the server to empty.
-                await TryRecoverCallbacksAsync(cancellationToken);
+                // this loop is what keeps status.json fresh - it must never die on its own
+                Console.WriteLine($"Warning: callback health check failed - {ex.Message}");
             }
 
             await Task.Delay(TimeSpan.FromSeconds(10), cancellationToken);
         }
     }
 
+    private async Task CheckCallbackHealthAsync(CancellationToken cancellationToken)
+    {
+        // A quiet baseline (one line every 5 minutes) so that when something stalls it can be
+        // compared with what "normal" looked like: dedicated server CPU, thread pool, load.
+        if (++statusTicks % 30 == 0)
+        {
+            Console.WriteLine($"[diag] health: {Diagnostics.Snapshot()} | {DescribeCallbackState()}");
+        }
+
+        if (CallbacksHealthy)
+        {
+            callbackLossReported = false;
+        }
+        else
+        {
+            if (!callbackLossReported)
+            {
+                callbackLossReported = true;
+                Console.WriteLine(
+                    "ERROR: the callback stream from the dedicated server is dead. The controller "
+                    + "is still polling but no longer driving the game - no chat commands, widgets "
+                    + "or map picks, and the playlist will just repeat. Restarting once empty.");
+
+                // 42 of these in 15 days, most of them right after a map change - so log the
+                // numbers behind the verdict and the last minutes of activity, to learn whether
+                // the stream really died or the check fired while a map swap was in progress.
+                Diagnostics.Dump(
+                    "callback stream judged dead",
+                    $"{DescribeCallbackState()} | advance stage='{advanceStage}' | status stage='{statusStage}'");
+            }
+
+            // Rebuild the connection rather than the process: this works with a full
+            // server and costs seconds, so a stall no longer waits for the server to empty.
+            await TryRecoverCallbacksAsync(cancellationToken);
+        }
+    }
+
+    private IReadOnlyList<PlayerSummary> lastPolledPlayers = [];
+
     private async Task WriteStatusAsync(CancellationToken cancellationToken)
     {
-        IReadOnlyList<PlayerSummary> onlinePlayers = [];
+        // A failed poll reports the last list that was actually seen, not "nobody". status.json's
+        // PlayerCount is what the deploy script and the website treat as "the server is empty",
+        // and a server that is merely slow to answer is not an empty one.
+        var onlinePlayers = lastPolledPlayers;
+        var playersStale = false;
         SetStatusStage("GetPlayerList");
         try
         {
             onlinePlayers = await client.GetPlayersAsync(cancellationToken);
+            lastPolledPlayers = onlinePlayers;
         }
-        catch (Exception)
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
         {
-            // controller not fully connected yet, report nobody online for now
+            // not connected (yet), or the call failed - keep the last known list for this tick
+            playersStale = true;
         }
 
         var displayedTrackId = DisplayedMapTrackId;
@@ -995,7 +1393,7 @@ internal sealed partial class RandomizerGame
             mapName = TmFormatCodeRegex().Replace(info.Name, string.Empty);
             nbCheckpoints = info.NbCheckpoints;
         }
-        catch (Exception)
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
         {
             // map info not available yet
         }
@@ -1027,7 +1425,7 @@ internal sealed partial class RandomizerGame
                 lastRacingProgressAt = DateTimeOffset.UtcNow;
             }
         }
-        catch (Exception)
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
         {
             // ranking not available right now - just skip this witness for this tick
         }
@@ -1057,6 +1455,8 @@ internal sealed partial class RandomizerGame
             config.ServerName,
             SessionActive,
             PlayerCount = onlinePlayers.Count,
+            // true when this tick could not ask the game server and PlayerCount is the last known one
+            PlayerCountStale = playersStale,
             PresetDisplayName = config.LastPreset?.DisplayName,
             CurrentMapName = mapName,
             CurrentMapCheckpoints = nbCheckpoints,
@@ -1088,23 +1488,47 @@ internal sealed partial class RandomizerGame
             return;
         }
 
+        sessionStoppedByAdmin = false;
         await StartSessionAsync(cancellationToken);
     }
 
     private async Task StartSessionAsync(CancellationToken cancellationToken)
     {
-        if (!SessionActive)
+        if (SessionActive)
         {
-            sessionStopwatch = new();
+            return;
+        }
+
+        sessionStopwatch = new();
+
+        try
+        {
             await SetTimeLimitAsync(cancellationToken);
+
+            // ownsClaim: a pending finish switch must not swallow the session's first map (after
+            // /preset the old preset's map kept running) - the finish switch sees the newer claim
+            // and stands down
+            if (!await NextRandomMapAsync(goalReached: false, cancellationToken, ownsClaim: true))
+            {
+                Console.WriteLine("Session started - a map switch was already on its way and becomes its first map.");
+            }
+
+            // only now: when TMX is down the session keeper retries, and players got "Let's begin!"
+            // every half minute for a session that never began
             await SendMessageAsync([string.Empty, "$0F0Let's begin!"], cancellationToken);
 
             if (config.TimeLimit.TotalMilliseconds > 0)
             {
                 await SendMessageAsync($"Time limit set to $FF0{new TimeSpan(config.TimeLimit.Ticks):g}", cancellationToken);
             }
-
-            await NextRandomMapAsync(goalReached: false, cancellationToken);
+        }
+        catch
+        {
+            // Only a session whose first map is on its way counts as started. Leaving it marked
+            // active after a failure is what made the AutoStart retries no-ops and stranded the
+            // server on the warmup map; this way the next attempt really tries again.
+            sessionStopwatch = null;
+            throw;
         }
     }
 
@@ -1122,6 +1546,8 @@ internal sealed partial class RandomizerGame
             return;
         }
 
+        // the session keeper must not start it again behind the admin's back
+        sessionStoppedByAdmin = true;
         await StopSessionAsync(cancellationToken);
 
         if (await client.IsMultiplePlayersAsync(cancellationToken))
@@ -1185,7 +1611,7 @@ internal sealed partial class RandomizerGame
 
     private async Task CheckStalledMapAsync(CancellationToken cancellationToken)
     {
-        if (!SessionActive || isAdvancingToNextMap)
+        if (!SessionActive || isAdvancingToNextMap || SwitchAlreadyClaimed)
         {
             return;
         }
@@ -1232,15 +1658,26 @@ internal sealed partial class RandomizerGame
 
     private async Task SkipAsync(int playerUid, string login, string[] args, CancellationToken cancellationToken)
     {
-        if (await client.IsMultiplePlayersAsync(cancellationToken))
+        if (!SessionActive)
         {
-            await SendMessageAsync($"Player {GetNicknameOrLogin(login)} wants to skip the current challenge - this starts a vote.", cancellationToken);
+            await SendMessageAsync(login, "$F00No session is running - nothing to skip.", cancellationToken);
+            return;
         }
-        else
+
+        if (isAdvancingToNextMap || SwitchAlreadyClaimed)
+        {
+            await SendMessageAsync(login, "$FF0The next map is already on its way.", cancellationToken);
+            return;
+        }
+
+        var multiplePlayers = await client.IsMultiplePlayersAsync(cancellationToken);
+
+        if (!multiplePlayers)
         {
             await SendMessageAsync("Skipping the current challenge...", cancellationToken);
         }
 
+        // With 2+ players this opens a vote, and NextRandomMapAsync announces that itself.
         await NextRandomMapAsync(goalReached: false, cancellationToken);
     }
 
@@ -1265,8 +1702,23 @@ internal sealed partial class RandomizerGame
     // map actually running" drift apart, and the file name is the only thing that ties a running
     // challenge back to the id it came from. Observed live on 2026-09-11: the controller had
     // /map, the TMX link and the status page preview all pointing at a map from 15 minutes back.
-    private static string InsertedChallengePath(InMemoryFile map) =>
-        Path.Combine("_RandomizerAny", $"{DateTimeOffset.UtcNow.Ticks}_tmx{map.TrackId}_{map.FileName}");
+    // The map name is capped: the game server refuses to write a path that ends up too long
+    // ("couldn't write file"), and the map is found by its _tmx<id>_ marker anyway.
+    private static string InsertedChallengePath(InMemoryFile map)
+    {
+        const string extension = ".Challenge.Gbx";
+        const int maxNameLength = 40;
+        var name = map.FileName.EndsWith(extension, StringComparison.OrdinalIgnoreCase)
+            ? map.FileName[..^extension.Length]
+            : map.FileName;
+
+        if (name.Length > maxNameLength)
+        {
+            name = name[..(char.IsHighSurrogate(name[maxNameLength - 1]) ? maxNameLength - 1 : maxNameLength)].TrimEnd();
+        }
+
+        return Path.Combine("_RandomizerAny", $"{DateTimeOffset.UtcNow.Ticks}_tmx{map.TrackId}_{name}{extension}");
+    }
 
     // The server reports challenge paths in its own shape (directory separators differ, and it may
     // hand back more or less of the path than we passed in), so match on the bare file name.
@@ -1519,22 +1971,42 @@ internal sealed partial class RandomizerGame
         var shownTrackIds = new List<int>();
         var shownNames = new List<string>();
 
-        for (var i = 0; i < Math.Min(mapHistory.Count, HistoryDisplayCount); i++)
+        // All names at once with one short budget: one after the other, each with TMX's full 40s
+        // allowance, five lookups could hold the callback stream past its 60s cutoff.
+        var trackIds = mapHistory.Take(HistoryDisplayCount).ToList();
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        budget.CancelAfter(TrackMetaBudget);
+
+        var names = await Task.WhenAll(trackIds.Select(async trackId =>
         {
-            var trackId = mapHistory[i];
-            string name;
+            if (trackNameCache.TryGetValue(trackId, out var cached))
+            {
+                return cached;
+            }
+
             try
             {
-                name = await tmxRules.GetTrackNameAsync(trackId, cancellationToken);
+                var name = await tmxRules.GetTrackNameAsync(trackId, budget.Token);
+
+                if (trackNameCache.Count > 500)
+                {
+                    trackNameCache.Clear();
+                }
+
+                trackNameCache[trackId] = name;
+                return name;
             }
             catch (Exception)
             {
-                name = $"Track {trackId}";
+                return $"Track {trackId}";
             }
+        }));
 
-            lines.Add($"$FF0-{i + 1}$FFF: {name}");
-            shownTrackIds.Add(trackId);
-            shownNames.Add(name);
+        for (var i = 0; i < trackIds.Count; i++)
+        {
+            lines.Add($"$FF0-{i + 1}$FFF: {names[i]}");
+            shownTrackIds.Add(trackIds[i]);
+            shownNames.Add(names[i]);
         }
 
         await SendMessageAsync(login, lines, cancellationToken);
@@ -1553,6 +2025,22 @@ internal sealed partial class RandomizerGame
         if (!SessionActive)
         {
             await SendMessageAsync(login, "$F00No session is active.", cancellationToken);
+            return;
+        }
+
+        // /rounds restarts the map for everyone, so it must not land in the middle of a map switch
+        // (a ChallengeRestart there cancels the switch and reloads the old map) and must not be
+        // repeatable to reset everybody's runs. Right at the start of a map it is fine - that is
+        // when players switch a multilap map to Rounds anyway.
+        if (isAdvancingToNextMap || SwitchAlreadyClaimed)
+        {
+            await SendMessageAsync(login, "$F00The next map is already on its way.", cancellationToken);
+            return;
+        }
+
+        if (roundsModeActive)
+        {
+            await SendMessageAsync(login, "$FF0This map is already in Rounds mode.", cancellationToken);
             return;
         }
 
@@ -1575,7 +2063,8 @@ internal sealed partial class RandomizerGame
 
         await client.CallAsync("SetGameMode", [0], cancellationToken); // 0 = Rounds
         await client.CallAsync("SetRoundForcedLaps", [0], cancellationToken); // 0 = use the map's own lap count
-        await client.CallAsync("ChallengeRestart", [], cancellationToken);
+        roundsModeActive = true;
+        await CallWithTransitionRetryAsync("ChallengeRestart", [], cancellationToken);
 
         var lapsSuffix = info.NbLaps > 0 ? $" ({info.NbLaps} laps)" : string.Empty;
         await SendMessageAsync($"$0F0{GetNicknameOrLogin(login)} switched this multilap map to Rounds mode{lapsSuffix} for a valid replay. Back to TimeAttack once this map ends.", cancellationToken);
@@ -1585,10 +2074,10 @@ internal sealed partial class RandomizerGame
     {
         await SendMessageAsync(login, [
             "$0BF--- 100% TMX Project ---",
-            "$FF0/skip$FFF - skip the current map (votes if multiple players are online)",
+            "$FF0/skip$FFF - skip the current map (with several players online this starts a vote - press $0F0F5$FFF to agree)",
             "$FF0/map$FFF (or $FF0/map -1$FFF, $FF0-2$FFF, ... for a past map) - show the map's TMX link",
             "$FF0/history$FFF - list recent maps and what $FF0-1$FFF, $FF0-2$FFF, ... refer to",
-            "$FF0/rounds$FFF - switch a multilap map to Rounds mode for a valid replay",
+            "$FF0/rounds$FFF - switch a multilap map to Rounds mode for a valid replay (once per map)",
             "$FF0/imp$FFF (or $FF0/imp -1$FFF, $FF0-2$FFF, ... for a past map) - report a map as impossible",
             "$FF0/hard$FFF (or $FF0/hard -1$FFF, $FF0-2$FFF, ... for a past map) - flag a map as hard for review",
             "$FF0/top$FFF - show the top finishers on this server",
@@ -1622,12 +2111,16 @@ internal sealed partial class RandomizerGame
 
     private async Task CommandsAsync(int playerUid, string login, string[] args, CancellationToken cancellationToken)
     {
-        var commands = await client.GetChatCommandListAsync(cancellationToken);
-        var formattedCommands = commands
-            .Select(cmd => $"$FF0{cmd}$FFF")
-            .Order();
+        // Built from our own handler table: it used to ask the game server via GetChatCommandList,
+        // which this TMF build does not have ("Method not defined"), so /commands always failed.
+        var lines = commandHandlers.Keys
+            .Order(StringComparer.Ordinal)
+            .Select(cmd => $"$FF0/{cmd}$FFF")
+            .Chunk(9)
+            .Select((chunk, i) => (i == 0 ? "Commands: " : string.Empty) + string.Join(", ", chunk))
+            .ToList();
 
-        await SendMessageAsync(login, $"Commands: {string.Join(", ", formattedCommands)}", cancellationToken);
+        await SendMessageAsync(login, lines, cancellationToken);
     }
 
     private async Task SourceAsync(int playerUid, string login, string[] args, CancellationToken cancellationToken)
@@ -1715,19 +2208,23 @@ internal sealed partial class RandomizerGame
             return;
         }
 
+        // Check the preset BEFORE touching the session. The session used to be reset first, so a
+        // typo answered "not found" with the session already gone - no auto-advance, no watchdog.
+        var (preset, error) = LoadPresetForThisGame(args[0]);
+
+        if (preset is null)
+        {
+            await SendMessageAsync(login, $"$F00{error}", cancellationToken);
+            return;
+        }
+
         var wasActive = SessionActive;
         if (wasActive)
         {
             ResetSessionStateForPresetSwitch();
         }
 
-        var (success, displayName, error) = TryApplyPreset(args[0]);
-
-        if (!success)
-        {
-            await SendMessageAsync(login, $"$F00{error}", cancellationToken);
-            return;
-        }
+        var displayName = ApplyPreset(args[0], preset);
 
         if (await client.IsMultiplePlayersAsync(cancellationToken))
         {
@@ -1760,36 +2257,60 @@ internal sealed partial class RandomizerGame
     // a TMNF preset must not show up (or be applied) on the TMUF server and vice versa
     private bool IsPresetForThisGame(string presetName)
     {
+        if (!IsValidPresetName(presetName))
+        {
+            return false;
+        }
+
         var preset = TomlLoader.LoadPresetConfig(Path.Combine(AppContext.BaseDirectory, "Presets", presetName + ".toml"));
         return preset is null || preset.SupportsGame(config.Game);
     }
 
-    private (bool Success, string? DisplayName, string? Error) TryApplyPreset(string presetName)
+    // A preset name is a file name in Presets/, nothing more - no folders, no "..".
+    private static bool IsValidPresetName(string presetName) =>
+        presetName.Length is > 0 and <= 64 && presetName.All(c => char.IsAsciiLetterOrDigit(c) || c is '_' or '-');
+
+    private (PresetConfig? Preset, string? Error) LoadPresetForThisGame(string presetName)
     {
+        if (!IsValidPresetName(presetName))
+        {
+            return (null, $"Preset '{presetName}' not found.");
+        }
+
         var presetPath = Path.Combine(AppContext.BaseDirectory, "Presets", presetName + ".toml");
 
         if (!File.Exists(presetPath))
         {
-            return (false, null, $"Preset '{presetName}' not found.");
+            return (null, $"Preset '{presetName}' not found.");
         }
 
         var presetConfig = TomlLoader.LoadPresetConfig(presetPath);
 
         if (presetConfig is null)
         {
-            return (false, null, $"Failed to load preset '{presetName}'.");
+            return (null, $"Failed to load preset '{presetName}'.");
         }
 
         if (!presetConfig.SupportsGame(config.Game))
         {
-            return (false, null, $"Preset '{presetName}' is not for this game.");
+            return (null, $"Preset '{presetName}' is not for this game.");
         }
 
+        if (!presetConfig.IsValid(out var invalidReason))
+        {
+            return (null, $"Preset '{presetName}' is broken: {invalidReason}");
+        }
+
+        return (presetConfig, null);
+    }
+
+    // returns the name to show players
+    private string ApplyPreset(string presetName, PresetConfig presetConfig)
+    {
         presetConfig.Apply(config);
         config.LastPreset = presetConfig;
 
-        var displayName = string.IsNullOrWhiteSpace(presetConfig.DisplayName) ? presetName : presetConfig.DisplayName;
-        return (true, displayName, null);
+        return string.IsNullOrWhiteSpace(presetConfig.DisplayName) ? presetName : presetConfig.DisplayName;
     }
 
     private async Task VotePresetAsync(int playerUid, string login, string[] args, CancellationToken cancellationToken)
@@ -1807,11 +2328,10 @@ internal sealed partial class RandomizerGame
         }
 
         var presetName = args[0];
-        var presetPath = Path.Combine(AppContext.BaseDirectory, "Presets", presetName + ".toml");
 
-        if (!File.Exists(presetPath) || !IsPresetForThisGame(presetName))
+        if (LoadPresetForThisGame(presetName) is { Preset: null, Error: var presetError })
         {
-            await SendMessageAsync(login, $"$F00Preset '{presetName}' not found.", cancellationToken);
+            await SendMessageAsync(login, $"$F00{presetError}", cancellationToken);
             return;
         }
 
@@ -1841,40 +2361,91 @@ internal sealed partial class RandomizerGame
             throw;
         }
 
-        _ = Task.Run(async () =>
+        var voteId = ++voteCounter;
+        StartVoteTimer(voteId, $"preset '{presetName}'", FinalizeVoteAsync);
+    }
+
+    // Identifies one vote, so a timer can never end a later vote that happens to be for the same
+    // preset or map.
+    private int voteCounter;
+    private int activeVoteId;
+
+    // Ends the vote after the window. Runs on the thread pool, so it takes the game lock, and it
+    // ALWAYS clears the vote - it used to catch only cancellation, so a timeout or "Client is not
+    // connected" while counting (e.g. during a reconnect) left the vote open for good and every
+    // later vote answered "already in progress" until a restart.
+    private void StartVoteTimer(int voteId, string description, Func<CancellationToken, Task> finalizeAsync)
+    {
+        activeVoteId = voteId;
+
+        RunInBackground($"ending the vote for {description}", async () =>
         {
-            try
-            {
-                await Task.Delay(PresetVoteWindowMs, cancellationToken);
+            await Task.Delay(PresetVoteWindowMs, appToken);
 
-                if (votePresetName != presetName)
+            var ran = await RunUnderGameLockAsync($"ending the vote for {description}", async token =>
+            {
+                if (activeVoteId != voteId || (votePresetName is null && voteMapTrackId is null))
                 {
-                    return; // already finalized or superseded
+                    return; // already finalized, or a newer vote is running
                 }
 
-                if (await HasVoteMajorityAsync(cancellationToken))
+                var passed = false;
+                try
                 {
-                    await FinalizeVoteAsync(cancellationToken);
+                    passed = await HasVoteMajorityAsync(token);
                 }
-                else
+                catch (Exception ex)
                 {
-                    await SendMessageAsync($"$F00Vote for preset '{presetName}' failed - not enough support.", cancellationToken);
-                    votePresetName = null;
-                    voteYesLogins = null;
-                    await HideManialinkAsync(VotePopupManialinkId, cancellationToken);
+                    Console.WriteLine($"Warning: couldn't count the votes for {description} - {ex.Message}");
                 }
-            }
-            catch (Exception ex) when (ex is OperationCanceledException or TaskCanceledException)
+
+                if (passed)
+                {
+                    await finalizeAsync(token);
+                    return;
+                }
+
+                ClearVote();
+
+                try
+                {
+                    await SendMessageAsync($"$F00Vote for {description} failed - not enough support.", token);
+                    await HideManialinkAsync(VotePopupManialinkId, token);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Warning: couldn't announce the end of the vote for {description} - {ex.Message}");
+                }
+            });
+
+            // never got the lock: end the vote anyway, or every later vote is "already running"
+            if (!ran && activeVoteId == voteId)
             {
-                // server shutting down mid-vote, nothing to do
+                ClearVote();
             }
-        }, cancellationToken);
+        });
+    }
+
+    private void ClearVote()
+    {
+        votePresetName = null;
+        voteMapTrackId = null;
+        voteYesLogins = null;
+        activeVoteId = 0;
     }
 
     private async Task YesAsync(int playerUid, string login, string[] args, CancellationToken cancellationToken)
     {
         if (voteYesLogins is null || (votePresetName is null && voteMapTrackId is null))
         {
+            // The skip vote (/skip with several players) is TrackMania's own vote, which this
+            // command cannot cast - say how to vote on it instead of "no vote is active".
+            if (await IsGameVoteRunningAsync(cancellationToken))
+            {
+                await SendMessageAsync(login, "$FF0That vote is run by TrackMania itself - press $0F0F5$FF0 to agree.", cancellationToken);
+                return;
+            }
+
             await SendMessageAsync(login, "$F00No vote is currently active. Start one with $FF0/votepreset <name>$F00 or $FF0/votemap <id>$F00.", cancellationToken);
             return;
         }
@@ -1906,6 +2477,21 @@ internal sealed partial class RandomizerGame
         await SendMessageAsync(login, "Your vote against has been noted.", cancellationToken);
     }
 
+    // TrackMania's own vote (CallVote, used for /skip with several players) - GetCurrentCallVote
+    // reports an empty CmdName when none is running.
+    private async Task<bool> IsGameVoteRunningAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var vote = await client.TracedCallAsync<Dictionary<string, object>>("GetCurrentCallVote", [], cancellationToken);
+            return vote.TryGetValue("CmdName", out var cmdName) && cmdName is string { Length: > 0 };
+        }
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            return false;
+        }
+    }
+
     private async Task<bool> HasVoteMajorityAsync(CancellationToken cancellationToken)
     {
         var playerCount = await client.GetPlayerCountAsync(cancellationToken);
@@ -1924,9 +2510,17 @@ internal sealed partial class RandomizerGame
         }
 
         var presetName = votePresetName;
-        votePresetName = null;
-        voteYesLogins = null;
+        ClearVote();
         await HideManialinkAsync(VotePopupManialinkId, cancellationToken);
+
+        // checked before the session is touched - see PresetAsync
+        var (preset, error) = LoadPresetForThisGame(presetName);
+
+        if (preset is null)
+        {
+            await SendMessageAsync($"$F00Vote passed but preset failed to apply: {error}", cancellationToken);
+            return;
+        }
 
         // see ResetSessionStateForPresetSwitch for why this isn't StopSessionAsync
         if (SessionActive)
@@ -1934,13 +2528,7 @@ internal sealed partial class RandomizerGame
             ResetSessionStateForPresetSwitch();
         }
 
-        var (success, displayName, error) = TryApplyPreset(presetName);
-
-        if (!success)
-        {
-            await SendMessageAsync($"$F00Vote passed but preset failed to apply: {error}", cancellationToken);
-            return;
-        }
+        var displayName = ApplyPreset(presetName, preset);
 
         await SendMessageAsync($"$0F0Vote passed! Preset $FF0{displayName}$0F0 applied.", cancellationToken);
         await StartSessionAsync(cancellationToken);
@@ -1957,10 +2545,17 @@ internal sealed partial class RandomizerGame
         {
             if (SessionActive)
             {
-                await NextRandomMapAsync(goalReached: false, cancellationToken);
+                if (!await NextRandomMapAsync(goalReached: false, cancellationToken))
+                {
+                    // another switch is running right now; left set, the id would have loaded at
+                    // some random later point instead
+                    forcedNextMapTrackId = null;
+                    await SendMessageAsync("$F00A map change is already in progress - try again in a moment.", cancellationToken);
+                }
             }
             else
             {
+                sessionStoppedByAdmin = false;
                 await StartSessionAsync(cancellationToken);
             }
         }
@@ -2070,34 +2665,8 @@ internal sealed partial class RandomizerGame
             throw;
         }
 
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await Task.Delay(PresetVoteWindowMs, cancellationToken);
-
-                if (voteMapTrackId != trackId)
-                {
-                    return; // already finalized or superseded
-                }
-
-                if (await HasVoteMajorityAsync(cancellationToken))
-                {
-                    await FinalizeMapVoteAsync(cancellationToken);
-                }
-                else
-                {
-                    await SendMessageAsync($"$F00Vote to load map {trackId} failed - not enough support.", cancellationToken);
-                    voteMapTrackId = null;
-                    voteYesLogins = null;
-                    await HideManialinkAsync(VotePopupManialinkId, cancellationToken);
-                }
-            }
-            catch (Exception ex) when (ex is OperationCanceledException or TaskCanceledException)
-            {
-                // server shutting down mid-vote, nothing to do
-            }
-        }, cancellationToken);
+        var voteId = ++voteCounter;
+        StartVoteTimer(voteId, $"map {trackId}", FinalizeMapVoteAsync);
     }
 
     private async Task FinalizeMapVoteAsync(CancellationToken cancellationToken)
@@ -2107,8 +2676,7 @@ internal sealed partial class RandomizerGame
             return;
         }
 
-        voteMapTrackId = null;
-        voteYesLogins = null;
+        ClearVote();
         await HideManialinkAsync(VotePopupManialinkId, cancellationToken);
 
         await SendMessageAsync($"$0F0Vote passed! Loading TMX map {trackId}...", cancellationToken);
@@ -2183,25 +2751,106 @@ internal sealed partial class RandomizerGame
                 _ => "finish line"
             };
 
-            sessionStopwatch?.Stop();
+            // The first qualifying finish on a map claims the switch to the next one. Everyone who
+            // finishes after it - including finishes still queued behind the first one's handler -
+            // gets their message, leaderboard credit and replay, but no second map switch.
+            var advancesTheMap = !SwitchAlreadyClaimed && !isAdvancingToNextMap;
+            var finishGeneration = mapGeneration;
+            var finishClaim = advancesTheMap ? ClaimSwitch() : 0;
 
-            if (await client.IsMultiplePlayersAsync(cancellationToken))
+            try
             {
-                await SendMessageAsync($"Player {GetNicknameOrLogin(login)} has reached the $FF0{goalName}$0F0!", cancellationToken);
+                await AnnounceFinishAsync(login, goalName, cancellationToken);
             }
-            else
+            finally
             {
-                await SendMessageAsync($"$0F0You have reached the $FF0{goalName}$0F0!", cancellationToken);
+                // Whatever happened to the messages above - the finisher may have left the server
+                // already ("Login unknown", "Client is not connected": 135 times on the old host) -
+                // the map must still move on. The switch used to be scheduled after them, so a
+                // player quitting right after finishing left everyone on the finished map.
+                if (advancesTheMap)
+                {
+                    ScheduleAdvanceAfterFinish(finishGeneration, finishClaim);
+                }
             }
-            await SendFrozenTimeMessageAsync(cancellationToken);
-
-            await leaderboard.RecordFinishAsync(login, GetPlainNickname(login), GetRawNickname(login), cancellationToken);
-            await SendTop10PanelAsync(cancellationToken);
-            await SendReplayLinkAsync(login, cancellationToken);
-            await Task.Delay(ReplaySaveGraceMs, cancellationToken);
-
-            await NextRandomMapAsync(goalReached: true, cancellationToken);
         }
+    }
+
+    private async Task AnnounceFinishAsync(string login, string goalName, CancellationToken cancellationToken)
+    {
+        sessionStopwatch?.Stop();
+
+        // The credit first: it is the one part that must not depend on chat messages reaching a
+        // player who may already be gone. A failed save must not cost the rest either.
+        try
+        {
+            await leaderboard.RecordFinishAsync(login, GetPlainNickname(login), GetRawNickname(login), cancellationToken);
+        }
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            Console.WriteLine($"ERROR: couldn't record {login}'s finish on the leaderboard - {ex.Message}");
+        }
+
+        if (await client.IsMultiplePlayersAsync(cancellationToken))
+        {
+            await SendMessageAsync($"Player {GetNicknameOrLogin(login)} has reached the $FF0{goalName}$0F0!", cancellationToken);
+        }
+        else
+        {
+            await SendMessageAsync($"$0F0You have reached the $FF0{goalName}$0F0!", cancellationToken);
+        }
+        await SendFrozenTimeMessageAsync(cancellationToken);
+
+        await SendTop10PanelAsync(cancellationToken);
+        await SendReplayLinkAsync(login, cancellationToken);
+    }
+
+    // Players get ReplaySaveGraceMs to save their replay before the map goes away. That wait used
+    // to happen inside the PlayerFinish handler, which holds the whole callback stream: every
+    // finish froze chat, checkpoints and widgets for everyone for 8 seconds.
+    private void ScheduleAdvanceAfterFinish(int generation, int claim)
+    {
+        RunInBackground("switching to the next map after a finish", async () =>
+        {
+            await Task.Delay(ReplaySaveGraceMs, appToken);
+
+            var ran = await RunUnderGameLockAsync("switching to the next map after a finish", async token =>
+            {
+                // the map changed in the meantime (an admin /loadmap, the server's own rotation),
+                // or something else switched it and holds a newer claim (a session start, /preset)
+                if (mapGeneration != generation || !SessionActive || advanceClaimId != claim)
+                {
+                    return;
+                }
+
+                try
+                {
+                    await NextRandomMapAsync(goalReached: true, token, ownsClaim: true);
+                }
+                catch (Exception ex) when (!token.IsCancellationRequested)
+                {
+                    // Free the map again so the next finish or a /skip can retry, and tell the
+                    // players - they used to sit on the finished map with no word at all.
+                    ReleaseSwitchClaim();
+                    Console.WriteLine($"Warning: switching to the next map after a finish failed - {ex.Message}");
+
+                    try
+                    {
+                        await SendMessageAsync("$F00Couldn't load the next map - TMX may be slow right now. Type $FF0/skip$F00 to try again.", token);
+                    }
+                    catch (Exception)
+                    {
+                        // the log line above is the record
+                    }
+                }
+            });
+
+            // never got the lock: free the map, or it stays claimed with no switch coming
+            if (!ran && advanceClaimId == claim)
+            {
+                ReleaseSwitchClaim();
+            }
+        });
     }
 
     private async Task SendReplayLinkAsync(string login, CancellationToken cancellationToken)
@@ -2218,10 +2867,18 @@ internal sealed partial class RandomizerGame
 
             await SendMessageAsync(login, $"$FF0Your TMX-valid replay: $FFF$l[{url}]{url}$l", cancellationToken);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
         {
-            await SendMessageAsync(login, "$F00Could not fetch your replay from the server, try saving manually with the in-game key.", cancellationToken);
             Console.WriteLine($"Warning: failed to send replay link to {login} - {ex.Message}");
+
+            try
+            {
+                await SendMessageAsync(login, "$F00Could not fetch your replay from the server, try saving manually with the in-game key.", cancellationToken);
+            }
+            catch (Exception)
+            {
+                // most often the player has already left - nobody to tell
+            }
         }
     }
 
@@ -2236,19 +2893,23 @@ internal sealed partial class RandomizerGame
     }
 
     // The dedicated server rejects RPCs while a challenge transition is underway with
-    // "Change in progress". That is transient - the transition settles in well under a
-    // second - so a /skip that lands at the wrong moment should wait and retry instead of
-    // failing outright, which is what made skipping look unreliable.
+    // "Change in progress". That is transient, so a call that lands at the wrong moment waits and
+    // retries instead of failing outright, which is what made skipping look unreliable. The wait
+    // is bounded by time, not attempts: three tries 700ms apart (~2s) was shorter than a map load.
+    private static readonly TimeSpan TransitionRetryWindow = TimeSpan.FromSeconds(10);
+
     private async Task CallWithTransitionRetryAsync(string method, object[] args, CancellationToken cancellationToken)
     {
-        for (var attempt = 1; ; attempt++)
+        var started = Stopwatch.StartNew();
+
+        while (true)
         {
             try
             {
                 await client.CallAsync(method, args, cancellationToken);
                 return;
             }
-            catch (Exception ex) when (attempt < 4
+            catch (Exception ex) when (started.Elapsed < TransitionRetryWindow
                 && ex.Message.Contains("Change in progress", StringComparison.OrdinalIgnoreCase))
             {
                 await Task.Delay(700, cancellationToken);
@@ -2256,18 +2917,36 @@ internal sealed partial class RandomizerGame
         }
     }
 
-    public async Task NextRandomMapAsync(bool goalReached, CancellationToken cancellationToken)
+    // Returns false when it did nothing because a switch is already running or already asked for.
+    public async Task<bool> NextRandomMapAsync(bool goalReached, CancellationToken cancellationToken, bool ownsClaim = false)
     {
         // with multiple players, every finisher fires its own PlayerFinish -> NextRandomMapAsync
         // call; if one is already advancing the map, a second concurrent call must be a no-op,
         // not a second NextChallenge - see isAdvancingToNextMap's declaration for why
         if (isAdvancingToNextMap)
         {
-            return;
+            return false;
         }
 
+        // A switch away from this map was already asked for (see mapGeneration). A forced map
+        // (/loadmap, a passed /votemap) still goes ahead: the admin or the vote asked for that
+        // exact map, so it is fine for it to replace whatever was about to load.
+        if (!ownsClaim && forcedNextMapTrackId is null && SwitchAlreadyClaimed)
+        {
+            return false;
+        }
+
+        var advanceId = Interlocked.Increment(ref advanceCounter);
+        advanceOwner = advanceId;
         advanceStartedAt = DateTimeOffset.UtcNow;
         SetAdvanceStage($"start (goalReached={goalReached}, forced={forcedNextMapTrackId}, alreadyQueued={randomEnqueuedMapFileName is not null})");
+
+        // The whole advance has one budget, so it can never outlive AdvanceStallTimeout and
+        // have a second one start next to it.
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        budget.CancelAfter(AdvanceBudget);
+        var token = budget.Token;
+
         try
         {
             // In case there are multiple players, the session stopwatch cannot be stopped immediately
@@ -2281,11 +2960,36 @@ internal sealed partial class RandomizerGame
             if (randomEnqueuedMapFileName is null || forcedNextMapTrackId is not null)
             {
                 SetAdvanceStage("picking and downloading the next map from TMX");
-                var nextMap = forcedNextMapTrackId is { } forcedTrackId
-                    ? await tmxRules.GetMapGbxByIdAsync(forcedTrackId, cancellationToken)
-                    : await tmxRules.NextMapGbxAsync(cancellationToken);
+                var forcedTrackId = forcedNextMapTrackId;
                 forcedNextMapTrackId = null;
+
+                var generationBeforeFetch = mapGeneration;
+                var sessionBeforeFetch = sessionStopwatch;
+                var nextMap = await WithoutGameLockIfBackgroundAsync(async () =>
+                {
+                    var map = forcedTrackId is { } forcedId
+                        ? await tmxRules.GetMapGbxByIdAsync(forcedId, token)
+                        : await tmxRules.NextMapGbxAsync(token);
+
+                    // A random pick of the map that is running right now would only restart it (the
+                    // recent-maps list is in memory and starts empty after every restart).
+                    for (var repick = 0; forcedTrackId is null && map.TrackId == DisplayedMapTrackId && repick < 3; repick++)
+                    {
+                        map = await tmxRules.NextMapGbxAsync(token);
+                    }
+
+                    return map;
+                });
                 SetAdvanceStage($"downloaded map {nextMap.TrackId} '{nextMap.FileName}' ({nextMap.Data.Length} bytes)");
+
+                // The lock may have been let go during the download: if the map changed by itself
+                // or the session was stopped meanwhile, switching now would skip the fresh map or
+                // undo the /stop.
+                if (mapGeneration != generationBeforeFetch || !ReferenceEquals(sessionStopwatch, sessionBeforeFetch))
+                {
+                    Console.WriteLine($"Map {nextMap.TrackId} was downloaded, but the map or the session changed meanwhile - not switching.");
+                    return false;
+                }
 
                 // Last line of defence. The random pick and /loadmap + /votemap already refuse
                 // skip-listed maps, so this should never fire - but if any route ever hands one
@@ -2294,19 +2998,16 @@ internal sealed partial class RandomizerGame
                 // drops every player.
                 if (skippedMaps.Contains(nextMap.TrackId))
                 {
-                    forcedNextMapTrackId = null;
                     throw new InvalidOperationException($"map {nextMap.TrackId} is on this server's skip list");
                 }
 
                 // InsertChallenge de-dupes by the challenge's UID against the server's WHOLE selection
-                // (playlist), not by the file path we write it under - and that selection only ever
-                // grows, so once this exact TMX map was inserted before (an earlier random rotation, or
-                // a previous /loadmap or /votemap for the same id), it's stuck there for the rest of the
-                // server's uptime and every future InsertChallenge for it fails with "already added",
-                // no matter what's currently loaded. Reuse the existing selection entry instead of
-                // fighting that permanent case.
+                // (playlist), not by the file path we write it under, so a map that is still in the
+                // selection (the warmup map, or one that was queued and never played) cannot be
+                // inserted again. Reuse that entry instead - found by its TMX id, never by a bare
+                // file-name suffix, which matched "Race.Challenge.Gbx" to "A01-Race.Challenge.Gbx".
                 SetAdvanceStage("asking the server for its map list (GetChallengeList)");
-                var mapPath = await client.FindSelectedChallengeFileNameAsync(nextMap.FileName, cancellationToken);
+                var mapPath = await client.FindSelectedChallengeFileNameAsync(nextMap.TrackId, nextMap.FileName, token);
                 SetAdvanceStage(mapPath is null
                     ? "map not in the server's list yet - writing file and inserting"
                     : $"map already in the server's list as '{mapPath}' - reusing it");
@@ -2314,7 +3015,7 @@ internal sealed partial class RandomizerGame
                 if (mapPath is null)
                 {
                     mapPath = InsertedChallengePath(nextMap);
-                    await client.WriteFileAsync(mapPath, nextMap.Data, cancellationToken);
+                    await client.WriteFileAsync(mapPath, nextMap.Data, token);
 
                     // This retry loop is only for the TRANSIENT race: InsertChallenge called again
                     // before the dedicated server has fully consumed the PREVIOUS insert (e.g. calling
@@ -2328,18 +3029,25 @@ internal sealed partial class RandomizerGame
                     {
                         try
                         {
-                            await client.CallAsync("InsertChallenge", [mapPath], cancellationToken);
+                            await CallWithTransitionRetryAsync("InsertChallenge", [mapPath], token);
                             break;
                         }
                         catch (Exception ex) when (ex.Message.Contains("already added", StringComparison.OrdinalIgnoreCase) && attempt < 5)
                         {
-                            await Task.Delay(1000, cancellationToken);
+                            await Task.Delay(1000, token);
                         }
                     }
                 }
+                else
+                {
+                    // The reused entry sits wherever it was in the selection; without this
+                    // NextChallenge loaded whatever happened to come next instead.
+                    await CallWithTransitionRetryAsync("ChooseNextChallenge", [mapPath], token);
+                }
 
                 SetAdvanceStage("SetGameMode");
-                await client.CallAsync("SetGameMode", [1], cancellationToken);
+                await CallWithTransitionRetryAsync("SetGameMode", [1], token);
+                roundsModeActive = false;
 
                 // Both paths above end up here, so a reused selection entry inserted under the
                 // older naming scheme still gets tied to its TMX id for ResolveRunningTrackId.
@@ -2348,14 +3056,36 @@ internal sealed partial class RandomizerGame
                 randomEnqueuedMapFileName = mapPath;
                 pendingMapTrackId = nextMap.TrackId;
             }
-
-            if (await client.IsMultiplePlayersAsync(cancellationToken) && (!goalReached || config.CallVoteOnFinish))
+            else if (roundsModeActive)
             {
-                await CallWithTransitionRetryAsync("CallVote", [XmlRpcClient.GenerateXmlPayload("NextChallenge", [])], cancellationToken);
+                // /rounds was used and the next map was already queued, so the SetGameMode(1)
+                // above never ran - without this the next map would start in Rounds mode too
+                await CallWithTransitionRetryAsync("SetGameMode", [1], token);
+                roundsModeActive = false;
+            }
 
-                // Say it out loud. With two or more players /skip does not skip - it opens a
-                // vote - and players who did not know that read the silence as a broken command.
-                await SendMessageAsync("$FF0A vote to load the next map has started - press $0F0F5$FF0 or type $0F0/yes$FF0 to agree.", cancellationToken);
+            if (await client.IsMultiplePlayersAsync(token) && (!goalReached || config.CallVoteOnFinish))
+            {
+                // TrackMania runs one vote at a time and refuses a second one ("Already waiting
+                // for a vote"), which players got back as "That command failed".
+                if (await IsGameVoteRunningAsync(token))
+                {
+                    await SendMessageAsync("$FF0A vote to change the map is already running - press $0F0F5$FF0 to agree.", token);
+                }
+                else
+                {
+                    await CallWithTransitionRetryAsync("CallVote", [XmlRpcClient.GenerateXmlPayload("NextChallenge", [])], token);
+
+                    // Say it out loud. With two or more players /skip does not skip - it opens a
+                    // vote - and players who did not know that read the silence as a broken command.
+                    await SendMessageAsync("$FF0A vote to load the next map has started - press $0F0F5$FF0 to agree.", token);
+                }
+
+                // A vote may fail, and then this map stays - so it must not stay claimed.
+                if (ownsClaim)
+                {
+                    ReleaseSwitchClaim();
+                }
             }
             else
             {
@@ -2363,7 +3093,7 @@ internal sealed partial class RandomizerGame
                 {
                     sessionStopwatchMillisecondOffset += (int)setupWatch.ElapsedMilliseconds;
                     sessionStopwatch.Stop();
-                    await SendFrozenTimeMessageAsync(cancellationToken);
+                    await SendFrozenTimeMessageAsync(token);
                 }
 
                 // best-effort preview message only - if the challenge got swallowed as an "already
@@ -2372,13 +3102,13 @@ internal sealed partial class RandomizerGame
                 // the actual NextChallenge call below
                 try
                 {
-                    var info = await client.GetChallengeInfoAsync(randomEnqueuedMapFileName, cancellationToken);
+                    var info = await client.GetChallengeInfoAsync(randomEnqueuedMapFileName!, token);
                     var cpSuffix = info.NbCheckpoints is { } cpCount ? $" ({cpCount} CPs)" : string.Empty;
-                    await SendMessageAsync($"Next map is ready: {info.Name}{cpSuffix}", cancellationToken);
+                    await SendMessageAsync($"Next map is ready: {info.Name}{cpSuffix}", token);
                 }
-                catch (Exception)
+                catch (Exception) when (!token.IsCancellationRequested)
                 {
-                    await SendMessageAsync("Next map is ready.", cancellationToken);
+                    await SendMessageAsync("Next map is ready.", token);
                 }
 
                 // InsertChallenge puts the map "after the current challenge" and NextChallenge
@@ -2394,20 +3124,47 @@ internal sealed partial class RandomizerGame
                 // The server then sat on that map indefinitely, because with AutoSkipMode=Finished
                 // nothing advances a map nobody can finish and the stalled-map watchdog only fires
                 // on an empty server. Every restart stranded players on the warmup map.
+                // A TrackMania vote for "next map" still open (opened by an earlier /skip with two
+                // players on) would skip the map we load right now the moment it passes.
+                try
+                {
+                    if (await IsGameVoteRunningAsync(token))
+                    {
+                        await client.CallAsync("CancelVote", [], token);
+                    }
+                }
+                catch (Exception ex) when (!token.IsCancellationRequested)
+                {
+                    Console.WriteLine($"Warning: couldn't cancel the running map vote - {ex.Message}");
+                }
+
                 SetAdvanceStage("NextChallenge");
-                await CallWithTransitionRetryAsync("NextChallenge", [], cancellationToken);
+                await CallWithTransitionRetryAsync("NextChallenge", [], token);
+                ClaimSwitch();
                 SetAdvanceStage("NextChallenge sent");
             }
+
+            return true;
         }
         catch (Exception ex)
         {
             Diagnostics.Trace($"advance FAILED at '{advanceStage}': {ex.GetType().Name}: {ex.Message}");
+
+            if (budget.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                throw new TimeoutException($"switching to the next map took longer than {AdvanceBudget.TotalSeconds:0}s (stuck at '{advanceStage}')", ex);
+            }
+
             throw;
         }
         finally
         {
-            advanceStartedAt = null;
-            advanceStage = "idle";
+            // only the advance that owns the guard may clear it
+            if (advanceOwner == advanceId)
+            {
+                advanceStartedAt = null;
+                advanceStage = "idle";
+            }
         }
     }
 
@@ -2526,9 +3283,14 @@ internal sealed partial class RandomizerGame
         {
             currentMapTrackId = ResolveRunningTrackId(info.FileName);
             currentMapIdentified = true;
-            // so the next BeginRace still knows what to prune, even on the path where BeginRace
-            // never fired for this map in the first place
-            currentMapFileName ??= info.FileName;
+
+            // so the next BeginRace still knows what to prune and what goes into the history,
+            // even on the path where BeginRace never fired for this map in the first place
+            if (currentMapFileName is null)
+            {
+                currentMapFileName = info.FileName;
+                lastRunningTrackId = currentMapTrackId;
+            }
         }
 
         return info;
@@ -2554,15 +3316,8 @@ internal sealed partial class RandomizerGame
 
         if (currentMapTrackId is { } trackId)
         {
-            try
-            {
-                var meta = await tmxRules.GetTrackMetaAsync(trackId, cancellationToken);
-                await client.SendManialinkPageToLoginAsync(login, BuildMapInfoManialink(meta.DifficultyLabel, meta.Awards, info.AuthorTime), cancellationToken: cancellationToken);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Warning: failed to fetch TMX map metadata for {login} - {ex.Message}");
-            }
+            // from the side, see BeginRace - a join must never wait for tm-exchange.com
+            ShowMapInfoWidgetInBackground(trackId, info.AuthorTime, login);
         }
     }
 

@@ -30,6 +30,8 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
 
     public XmlRpcClient Raw => raw ?? throw new InvalidOperationException("Client is not connected.");
 
+    public bool IsConnected => raw is not null;
+
     // A call slower than this is worth a line in the journal on its own; healthy calls answer in
     // milliseconds, so anything near this means the dedicated server (or the socket) is stalling.
     private static readonly TimeSpan SlowRpcThreshold = TimeSpan.FromSeconds(2);
@@ -284,11 +286,13 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
         return (string)playerInfo["NickName"];
     }
 
-    public async Task<IEnumerable<string>> GetChatCommandListAsync(CancellationToken cancellationToken = default)
+    // Kept so a reconnect can register them again on the new connection.
+    private IReadOnlyList<string> chatCommands = [];
+
+    public async Task RegisterChatCommandsAsync(IEnumerable<string> commands, CancellationToken cancellationToken = default)
     {
-        var commandList = await TracedCallAsync<List<object>>("GetChatCommandList", [(int)short.MaxValue, 0], cancellationToken);
-        return commandList.OfType<IReadOnlyDictionary<string, object>>()
-            .Select(x => (string)x["Name"]);
+        chatCommands = commands.ToList();
+        await SystemMulticallAsync(chatCommands.Select(cmd => new XmlRpcCall("AddChatCommand", [cmd])), cancellationToken);
     }
 
     public async Task<bool> IsMultiplePlayersAsync(CancellationToken cancellationToken = default)
@@ -381,12 +385,25 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
     // been inserted once, it stays there for the rest of the server's uptime. Used to detect that a
     // map is already present so callers can reuse the existing entry instead of retrying InsertChallenge
     // forever.
-    public async Task<string?> FindSelectedChallengeFileNameAsync(string fileNameSuffix, CancellationToken cancellationToken = default)
+    //
+    // Matched by the TMX id marker every inserted map carries in its name ("_tmx<id>_"), or by the
+    // exact bare file name (maps written before the marker existed). It used to match any name
+    // that merely ENDED with the TMX file name, so "Race.Challenge.Gbx" found "A01-Race.Challenge.Gbx"
+    // - a different map, which then got this id written onto it.
+    public async Task<string?> FindSelectedChallengeFileNameAsync(int trackId, string fileName, CancellationToken cancellationToken = default)
     {
+        var marker = $"_tmx{trackId.ToString(CultureInfo.InvariantCulture)}_";
         var list = await TracedCallAsync<List<object>>("GetChallengeList", [1000, 0], cancellationToken);
+
         return list.OfType<Dictionary<string, object>>()
             .Select(c => c.TryGetValue("FileName", out var f) ? f as string : null)
-            .FirstOrDefault(f => f is not null && f.EndsWith(fileNameSuffix, StringComparison.OrdinalIgnoreCase));
+            .OfType<string>()
+            .FirstOrDefault(f =>
+            {
+                var bareName = Path.GetFileName(f.Replace('\\', '/'));
+                return bareName.Contains(marker, StringComparison.OrdinalIgnoreCase)
+                    || bareName.Equals(fileName, StringComparison.OrdinalIgnoreCase);
+            });
     }
 
     // Every handler ever registered, so a reconnect can re-attach them to the new connection.
@@ -480,7 +497,8 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
         {
             try
             {
-                await previous.DisposeAsync();
+                // bounded: the old connection may be waiting for a handler that is itself stuck
+                await previous.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
             }
             catch (Exception ex)
             {
@@ -488,13 +506,53 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
             }
         }
 
-        await ConnectAsync(cancellationToken);
-        await AuthenticateAsync(cancellationToken);
-        await EnableCallbacksAsync(cancellationToken);
-
-        foreach (var (method, handler) in callbackHandlers)
+        try
         {
-            Attach(method, handler);
+            await ConnectAsync(cancellationToken);
+
+            // Handlers first, callbacks second: the other way round, every callback that arrived
+            // between EnableCallbacks and the re-attach had no handler and was dropped.
+            foreach (var (method, handler) in callbackHandlers)
+            {
+                Attach(method, handler);
+            }
+
+            await AuthenticateAsync(cancellationToken);
+            await EnableCallbacksAsync(cancellationToken);
+        }
+        catch
+        {
+            // A half-built connection (connected, but not authenticated or without callbacks)
+            // would look connected and stay deaf. Drop it so the caller sees "not connected"
+            // and simply tries again.
+            if (raw is { } broken)
+            {
+                raw = null;
+                try
+                {
+                    await broken.DisposeAsync();
+                }
+                catch (Exception)
+                {
+                    // already failing - the original error is the one that matters
+                }
+            }
+
+            throw;
+        }
+
+        // Whether TMF ties chat commands to the connection that added them is not documented, so
+        // register them again - a duplicate is harmless, a missing one makes every command dead.
+        if (chatCommands.Count > 0)
+        {
+            try
+            {
+                await SystemMulticallAsync(chatCommands.Select(cmd => new XmlRpcCall("AddChatCommand", [cmd])), cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Warning: re-registering chat commands after the reconnect failed - {ex.Message}");
+            }
         }
 
         LastCallbackAt = DateTimeOffset.UtcNow;

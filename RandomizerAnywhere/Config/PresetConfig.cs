@@ -23,6 +23,20 @@ internal sealed class PresetConfig
     public bool SupportsGame(GameTitle game) =>
         Games.Length == 0 || Games.Any(g => string.Equals(g, game.ToString(), StringComparison.OrdinalIgnoreCase));
 
+    // Checked before a preset is switched to: Apply would otherwise throw half-way through on a
+    // typo in AutoSkipMode, after the session had already been reset.
+    public bool IsValid(out string? reason)
+    {
+        if (!Enum.TryParse<AutoSkipMode>(AutoSkipMode, ignoreCase: true, out _))
+        {
+            reason = $"unknown AutoSkipMode '{AutoSkipMode}'";
+            return false;
+        }
+
+        reason = null;
+        return true;
+    }
+
     public void Apply(AppConfig config)
     {
         config.TimeLimit = new TimeInt32(TimeLimit);
