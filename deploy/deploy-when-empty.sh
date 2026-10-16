@@ -1,9 +1,12 @@
 #!/bin/bash
 # Deploys a new build to the live server(s) WITHOUT ever kicking anybody.
 #
-#     DEPLOY_HOST=root@<server> bash deploy-when-empty.sh <folder with the published build>
+#     DEPLOY_HOST=<user>@<server> bash deploy-when-empty.sh <folder with the published build>
 #
 # The build folder is the output of: dotnet publish -c Release -o <folder>
+#
+# <user> can be root, or any user with passwordless sudo (e.g. `ubuntu` on an Oracle/cloud image,
+# where root login is disabled) - the server-side steps then run through `sudo -n`.
 #
 # For every server instance that exists on the machine (TMNF, and TMUF once it is set up) it:
 #   - uploads RandomizerAnywhere.dll/.pdb to /tmp first (nothing is changed yet)
@@ -18,7 +21,7 @@
 #     nohup bash deploy-when-empty.sh <folder> > deploy-when-empty.log 2>&1 &
 #     tail -f deploy-when-empty.log
 
-HOST="${DEPLOY_HOST:-}"           # e.g. root@1.2.3.4 - deliberately not in the repo
+HOST="${DEPLOY_HOST:-}"           # e.g. ubuntu@1.2.3.4 - deliberately not in the repo
 POLL_SECONDS=30
 EMPTY_POLLS_NEEDED=4              # 4 x 30s = empty for 2 minutes in a row
 GIVE_UP_AFTER_SECONDS=$((24*3600))
@@ -29,7 +32,7 @@ if [ -z "$P" ] || [ ! -f "$P/RandomizerAnywhere.dll" ]; then
   exit 1
 fi
 if [ -z "$HOST" ]; then
-  echo "set DEPLOY_HOST first, e.g.:  DEPLOY_HOST=root@1.2.3.4 bash deploy-when-empty.sh <folder>"
+  echo "set DEPLOY_HOST first, e.g.:  DEPLOY_HOST=ubuntu@1.2.3.4 bash deploy-when-empty.sh <folder>"
   exit 1
 fi
 
@@ -41,6 +44,15 @@ INSTANCES=(
 
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=10 $HOST"
 log() { echo "[$(date '+%F %T')] $*"; }
+
+# Swapping files in /opt and restarting services needs root. Logged in as root that is a given;
+# as anybody else, check up front that passwordless sudo works - finding out after a 2-hour wait
+# for an empty server, mid-deploy, would be the worst moment.
+REMOTE_SUDO=""
+if [ "${HOST%%@*}" != root ]; then
+  REMOTE_SUDO="sudo -n"
+  $SSH "sudo -n true" 2>/dev/null || { log "$HOST has no passwordless sudo - aborting, server untouched."; exit 1; }
+fi
 
 # which instances exist on the server?
 pending=()
@@ -72,7 +84,7 @@ players() {
 deploy_one() {
   local name=$1
   local backup="/opt/randomizer-anywhere/backup-$(date +%Y%m%d-%H%M%S)-$name"
-  $SSH bash -s -- "${DIR[$name]}" "${SVC[$name]}" "${PORT[$name]}" "$backup" <<'REMOTE'
+  $SSH $REMOTE_SUDO bash -s -- "${DIR[$name]}" "${SVC[$name]}" "${PORT[$name]}" "$backup" <<'REMOTE'
 set -u
 dir=$1; svc=$2; port=$3; backup=$4
 cd "$dir" || { echo FAILED; exit 0; }
@@ -86,11 +98,22 @@ mkdir -p "$backup"
 cp RandomizerAnywhere.dll RandomizerAnywhere.pdb "$backup"/
 install -m 644 /tmp/RandomizerAnywhere.dll /tmp/RandomizerAnywhere.pdb .
 if [ $was_active = 0 ]; then echo "DEPLOYED_NOT_RUNNING $backup"; exit 0; fi
+# The game watchdog would see the status page go quiet during the restart and could restart the
+# service a second time mid-boot; this starts its 5-minute cooldown.
+mkdir -p /run/tmx-game-watchdog && date +%s > /run/tmx-game-watchdog/restarted
+t0=$(date +%s)
 systemctl restart "$svc"
+# Healthy = a status.json written AFTER the restart by a controller that reports itself healthy.
+# Just finding "PlayerCount" is not enough: status.json is a file on disk, so the old process's
+# last copy is served for the first seconds and made a broken build look fine.
 ok=0
-for i in $(seq 1 20); do
+for i in $(seq 1 30); do
   sleep 3
-  if [ "$(systemctl is-active "$svc")" = active ] && curl -s --max-time 5 "http://127.0.0.1:$port/status.json" | grep -q PlayerCount; then ok=1; break; fi
+  s=$(curl -s --max-time 5 "http://127.0.0.1:$port/status.json" || true)
+  upd=$(printf '%s' "$s" | grep -o '"UpdatedAt":"[^"]*"' | cut -d'"' -f4)
+  ts=$(date -d "$upd" +%s 2>/dev/null || echo 0)
+  if [ "$(systemctl is-active "$svc")" = active ] && [ "$ts" -gt "$t0" ] \
+     && printf '%s' "$s" | grep -q '"ControllerHealthy":true'; then ok=1; break; fi
 done
 if [ $ok = 1 ]; then echo "DEPLOYED $backup"; else
   cp "$backup"/RandomizerAnywhere.dll "$backup"/RandomizerAnywhere.pdb .
