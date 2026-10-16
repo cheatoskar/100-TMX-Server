@@ -2020,8 +2020,6 @@ internal sealed partial class RandomizerGame
     // count, which produces a replay TMX won't accept for a multilap track. Reverts to TimeAttack
     // automatically the moment the RMC moves on to its next map - see NextRandomMapAsync's
     // SetGameMode(1) call, which already runs unconditionally on every map fetch
-    private static readonly TimeSpan RoundsMinMapAge = TimeSpan.FromSeconds(10);
-
     private async Task RoundsAsync(int playerUid, string login, string[] args, CancellationToken cancellationToken)
     {
         if (!SessionActive)
@@ -2031,9 +2029,9 @@ internal sealed partial class RandomizerGame
         }
 
         // /rounds restarts the map for everyone, so it must not land in the middle of a map switch
-        // (a ChallengeRestart there cancels the switch and reloads the old map), must not be
-        // repeatable to reset everybody's runs, and must not fire from a leftover prompt click
-        // in the first moments of a fresh map.
+        // (a ChallengeRestart there cancels the switch and reloads the old map) and must not be
+        // repeatable to reset everybody's runs. Right at the start of a map it is fine - that is
+        // when players switch a multilap map to Rounds anyway.
         if (isAdvancingToNextMap || SwitchAlreadyClaimed)
         {
             await SendMessageAsync(login, "$F00The next map is already on its way.", cancellationToken);
@@ -2043,12 +2041,6 @@ internal sealed partial class RandomizerGame
         if (roundsModeActive)
         {
             await SendMessageAsync(login, "$FF0This map is already in Rounds mode.", cancellationToken);
-            return;
-        }
-
-        if (currentMapStartedAt is not { } mapStartedAt || DateTimeOffset.UtcNow - mapStartedAt < RoundsMinMapAge)
-        {
-            await SendMessageAsync(login, "$F00The map has only just started - try /rounds again in a few seconds.", cancellationToken);
             return;
         }
 
