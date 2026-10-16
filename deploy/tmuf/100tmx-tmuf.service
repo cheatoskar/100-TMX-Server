@@ -12,6 +12,9 @@ ExecStart=/usr/share/dotnet/dotnet /opt/randomizer-anywhere-tmuf/publish/Randomi
 OOMScoreAdjust=-300
 Restart=always
 RestartSec=5
+# a broken config (exit 78) is not fixed by restarting; no core dumps (see game-service-hardening.conf)
+RestartPreventExitStatus=78
+LimitCORE=0
 Environment=DOTNET_ROOT=/usr/share/dotnet
 # below the TMNF server (1000) but well above the website, so a busy site can never starve it
 CPUWeight=500
