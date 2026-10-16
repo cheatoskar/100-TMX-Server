@@ -27,6 +27,11 @@ ReplayServerPort = 8090
 # IP/domain once this runs on Hetzner, otherwise players get an unreachable link.
 PublicHost = ""
 
+# The dedicated server's total upload budget in kbit/s (written into dedicated_cfg.txt). Every
+# joining player downloads the random map through this; TMF's own default is 512 (~64 KB/s for
+# everyone together). 0 = leave dedicated_cfg.txt as it is.
+ConnectionUploadRate = 10240
+
 # LAN-only mode (local network discovery, no masterserver registration). true for local
 # testing, MUST be false for a real internet-facing Hetzner deployment.
 Lan = false

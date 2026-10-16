@@ -63,9 +63,13 @@ internal sealed class SkippedMaps
                 }
             }
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
         {
-            Console.WriteLine($"Warning: failed to read skipped-maps.json - {ex.Message}");
+            // Kept, not overwritten: the write below would otherwise replace the admins' list
+            // with just the built-in ids, and the maps it blocked ("drop every player") return.
+            var quarantined = AtomicFile.QuarantineCorrupt(filePath);
+            Console.WriteLine($"ERROR: failed to read skipped-maps.json - {ex.Message}. "
+                + (quarantined is null ? "Starting with the built-in list only." : $"The file was kept as {Path.GetFileName(quarantined)}; fix it and put it back."));
         }
 
         // merge in the built-in ids; if any were missing, write the file so it shows the full list
@@ -91,7 +95,7 @@ internal sealed class SkippedMaps
         {
             try
             {
-                await File.WriteAllTextAsync(filePath, JsonSerializer.Serialize(snapshot), cancellationToken);
+                await AtomicFile.WriteAllTextAsync(filePath, JsonSerializer.Serialize(snapshot));
             }
             catch (Exception ex)
             {
@@ -117,7 +121,7 @@ internal sealed class SkippedMaps
             snapshot = [.. trackIds.Order()];
         }
 
-        await File.WriteAllTextAsync(filePath, JsonSerializer.Serialize(snapshot), cancellationToken);
+        await AtomicFile.WriteAllTextAsync(filePath, JsonSerializer.Serialize(snapshot));
         return true;
     }
 }

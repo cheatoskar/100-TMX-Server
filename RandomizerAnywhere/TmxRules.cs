@@ -30,6 +30,10 @@ internal sealed class TmxRules
     private readonly SkippedMaps skippedMaps;
 
     private readonly GameTitle game;
+
+    // One instance for the whole process (see Program), touched from the callback stream, the
+    // watchdog and background advances - so every access to these two goes through `gate`.
+    private readonly object gate = new();
     private readonly Dictionary<int, DateTimeOffset> recentlyServed = [];
 
     // maps reported via /imp - excluded for the rest of this process's uptime, not written to
@@ -37,7 +41,85 @@ internal sealed class TmxRules
     // this is just "don't show it again until someone actually reviews the report"
     private readonly HashSet<int> sessionExcludedTrackIds = [];
 
-    public void ExcludeForSession(int trackId) => sessionExcludedTrackIds.Add(trackId);
+    public void ExcludeForSession(int trackId)
+    {
+        lock (gate)
+        {
+            sessionExcludedTrackIds.Add(trackId);
+        }
+    }
+
+    private bool IsSessionExcluded(int trackId)
+    {
+        lock (gate)
+        {
+            return sessionExcludedTrackIds.Contains(trackId);
+        }
+    }
+
+    private void MarkServed(int trackId)
+    {
+        lock (gate)
+        {
+            recentlyServed[trackId] = DateTimeOffset.UtcNow;
+        }
+    }
+
+    private bool WasServedRecently(int trackId)
+    {
+        lock (gate)
+        {
+            var cutoff = DateTimeOffset.UtcNow - RecentWindow;
+            foreach (var id in recentlyServed.Where(kv => kv.Value < cutoff).Select(kv => kv.Key).ToList())
+            {
+                recentlyServed.Remove(id);
+            }
+
+            return recentlyServed.ContainsKey(trackId);
+        }
+    }
+
+    // TMF maps are small (a few KB to ~1 MB); anything far bigger is not a map we want to hand
+    // to the game server, and must not be buffered whole on a 1 GB machine.
+    private const int MaxMapBytes = 8 * 1024 * 1024;
+
+    // Reads a map download and makes sure it IS a map. The random pick never checked the status
+    // code, so after the retries a TMX/Cloudflare error page could be saved as a .Gbx and handed
+    // to InsertChallenge.
+    private static async Task<byte[]> ReadMapBytesAsync(HttpResponseMessage response, int trackId, CancellationToken cancellationToken)
+    {
+        response.EnsureSuccessStatusCode();
+
+        if (response.Content.Headers.ContentLength is > MaxMapBytes)
+        {
+            throw new InvalidOperationException($"TMX track {trackId} is {response.Content.Headers.ContentLength} bytes - too big to be a map.");
+        }
+
+        // read at most one byte past the limit - a response without Content-Length is never
+        // buffered whole
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var buffer = new MemoryStream();
+        var chunk = new byte[81920];
+        int read;
+        while ((read = await stream.ReadAsync(chunk.AsMemory(0, (int)Math.Min(chunk.Length, MaxMapBytes + 1 - buffer.Length)), cancellationToken)) > 0)
+        {
+            buffer.Write(chunk, 0, read);
+
+            if (buffer.Length > MaxMapBytes)
+            {
+                throw new InvalidOperationException($"TMX track {trackId} is more than {MaxMapBytes} bytes - too big to be a map.");
+            }
+        }
+
+        var bytes = buffer.ToArray();
+
+        if (bytes.Length < 3 || bytes[0] != (byte)'G' || bytes[1] != (byte)'B' || bytes[2] != (byte)'X')
+        {
+            throw new InvalidOperationException($"TMX sent something that is not a map for track {trackId} ({bytes.Length} bytes, {response.Content.Headers.ContentType?.MediaType ?? "no content type"}).");
+        }
+
+        return bytes;
+    }
 
     public TmxRules(HttpClient http, AppConfig config, ImpossibleMaps impossibleMaps, SkippedMaps skippedMaps)
     {
@@ -172,6 +254,9 @@ internal sealed class TmxRules
     }
 
     private sealed record TmxApiTrackDetailsResponse(List<TmxApiTrackDetailsResult>? Results);
+    // on the impossible or skip list - such a map is never started on purpose
+    public bool IsExcludedFromRotation(int trackId) => impossibleMaps.Contains(trackId) || skippedMaps.Contains(trackId);
+
     private sealed record TmxApiTrackDetailsResult(string? TrackName, TmxApiUploader? Uploader, int Difficulty, int Awards, int AuthorTime, List<int>? Tags);
     private sealed record TmxApiUploader(string? Name);
 
@@ -182,13 +267,12 @@ internal sealed class TmxRules
     public async Task<InMemoryFile> GetMapGbxByIdAsync(int trackId, CancellationToken cancellationToken = default)
     {
         using var response = await http.GetAsync(GetTrackGbxUrl(trackId.ToString(CultureInfo.InvariantCulture)), cancellationToken);
-        response.EnsureSuccessStatusCode();
 
-        var gbxBytes = await response.Content.ReadAsByteArrayAsync(cancellationToken);
+        var gbxBytes = await ReadMapBytesAsync(response, trackId, cancellationToken);
         var fileName = response.Content.Headers.ContentDisposition?.FileNameStar
             ?? response.Content.Headers.ContentDisposition?.FileName ?? (response.RequestMessage?.RequestUri?.Segments.Last() + ".Gbx");
 
-        recentlyServed[trackId] = DateTimeOffset.UtcNow;
+        MarkServed(trackId);
         return new InMemoryFile(GetValidFileName(fileName), gbxBytes, trackId);
     }
 
@@ -212,14 +296,26 @@ internal sealed class TmxRules
 
     public async Task<InMemoryFile> NextMapGbxAsync(CancellationToken cancellationToken = default)
     {
-        var (trackResponse, trackId) = await NextMapGbxResponseAsync(cancellationToken);
-        using (trackResponse)
+        // a random pick whose file can't be downloaded (deleted, an error page) is just a bad
+        // pick - take another one rather than failing the whole map switch
+        for (var attempt = 1; ; attempt++)
         {
-            var gbxBytes = await trackResponse.Content.ReadAsByteArrayAsync(cancellationToken);
-            var fileName = trackResponse.Content.Headers.ContentDisposition?.FileNameStar
-                ?? trackResponse.Content.Headers.ContentDisposition?.FileName ?? (trackResponse.RequestMessage?.RequestUri?.Segments.Last() + ".Gbx");
+            var (trackResponse, trackId) = await NextMapGbxResponseAsync(cancellationToken);
+            using (trackResponse)
+            {
+                try
+                {
+                    var gbxBytes = await ReadMapBytesAsync(trackResponse, trackId, cancellationToken);
+                    var fileName = trackResponse.Content.Headers.ContentDisposition?.FileNameStar
+                        ?? trackResponse.Content.Headers.ContentDisposition?.FileName ?? (trackResponse.RequestMessage?.RequestUri?.Segments.Last() + ".Gbx");
 
-            return new InMemoryFile(GetValidFileName(fileName), gbxBytes, trackId);
+                    return new InMemoryFile(GetValidFileName(fileName), gbxBytes, trackId);
+                }
+                catch (Exception ex) when (attempt < 3 && ex is HttpRequestException or InvalidOperationException && !cancellationToken.IsCancellationRequested)
+                {
+                    Console.WriteLine($"Warning: TMX track {trackId} couldn't be downloaded ({ex.Message}) - picking another.");
+                }
+            }
         }
     }
 
@@ -240,7 +336,11 @@ internal sealed class TmxRules
             using var request = new HttpRequestMessage(HttpMethod.Head, tmxRandomUrl);
             using var response = await http.SendAsync(request, cancellationToken);
 
-            var trackRelativePath = response.Headers.Location?.OriginalString ?? throw new Exception("Failed to get track relative path.");
+            // TMX answers a random pick with a redirect to the track; anything else (an error
+            // page, a 5xx during an outage) says nothing about which map, so name the status
+            // instead of a bare "failed to get track relative path"
+            var trackRelativePath = response.Headers.Location?.OriginalString
+                ?? throw new InvalidOperationException($"TMX's random pick answered HTTP {(int)response.StatusCode} {response.ReasonPhrase} without a track.");
             var trackIdString = trackRelativePath.Substring(trackRelativePath.LastIndexOf('/') + 1);
 
             if (!int.TryParse(trackIdString, out var trackId))
@@ -248,7 +348,7 @@ internal sealed class TmxRules
                 continue;
             }
 
-            if (!config.SourceFromImpossibleList && (impossibleMaps.Contains(trackId) || sessionExcludedTrackIds.Contains(trackId)))
+            if (!config.SourceFromImpossibleList && (impossibleMaps.Contains(trackId) || IsSessionExcluded(trackId)))
             {
                 continue;
             }
@@ -261,16 +361,14 @@ internal sealed class TmxRules
                 continue;
             }
 
-            PruneRecentlyServed();
-
-            if (recentlyServed.ContainsKey(trackId) && attempt <= MaxRecencyCheckedAttempts)
+            if (WasServedRecently(trackId) && attempt <= MaxRecencyCheckedAttempts)
             {
                 continue;
             }
 
             Console.WriteLine("Next track ID: " + trackId);
             Diagnostics.Trace($"tmx: picked {trackId} after {attempt} attempt(s), {searchWatch.ElapsedMilliseconds}ms");
-            recentlyServed[trackId] = DateTimeOffset.UtcNow;
+            MarkServed(trackId);
 
             var downloadWatch = Stopwatch.StartNew();
             var gbxResponse = await http.GetAsync(GetTrackGbxUrl(trackIdString), cancellationToken);
@@ -279,17 +377,6 @@ internal sealed class TmxRules
         }
 
         throw new InvalidOperationException($"Could not find a servable map after {MaxTotalAttempts} attempts (all candidates were excluded).");
-    }
-
-    private void PruneRecentlyServed()
-    {
-        var cutoff = DateTimeOffset.UtcNow - RecentWindow;
-        var expired = recentlyServed.Where(kv => kv.Value < cutoff).Select(kv => kv.Key).ToList();
-
-        foreach (var id in expired)
-        {
-            recentlyServed.Remove(id);
-        }
     }
 
     private static string GetValidFileName(string fileName)

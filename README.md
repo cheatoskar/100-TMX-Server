@@ -138,6 +138,10 @@ The final configuration state is then written into session data for leaderboard 
 
 ## Configuration (`config.toml`)
 
+A `config.toml` that does not parse stops the controller with exit code 78 and a message saying
+why, instead of silently running on defaults (which used to mean an empty `AdminLogins`, i.e.
+every player is an admin).
+
 Beyond the game/server basics, `config.toml` (see `config.default.toml` for the full annotated template) controls this fork's own features:
 
 | Field | Description |
@@ -150,6 +154,9 @@ Beyond the game/server basics, `config.toml` (see `config.default.toml` for the 
 | `DiscordWebhookUrl` / `DiscordWebhookUrlHard` | Discord webhook URLs for `/imp` and `/hard` reports. Leave `DiscordWebhookUrlHard` empty to send both to the same channel as `DiscordWebhookUrl`. Leave both empty to disable Discord alerts entirely. |
 | `ServerComment` | Shown in the game's server browser. |
 | `WelcomeMessage` | Multi-line chat message sent to everyone on connect. |
+| `ConnectionUploadRate` | The dedicated server's total upload budget in kbit/s, written into `dedicated_cfg.txt` at every start. Every joining player downloads the random map through it. `0` (default) leaves the file alone - TMF's template ships `512`, about 64 KB/s for everybody together. |
+| `DisableVerboseRpc` | `true` stops starting the dedicated server with `/verbose_rpc`. Leave it off: the ConsoleLog's per-call lines are the only record of whether a call reached the server. |
+| `KeepConsoleLogs` | How many of the dedicated server's `ConsoleLog.<pid>.txt` files (one per start) to keep. Default `30`. |
 | `SourceFromImpossibleList` (preset-only) | When `true` on a preset, that preset cycles only through maps already flagged impossible, instead of querying TMX - used by the bundled `impossible_review_tmnf` preset. |
 
 ## In-game chat commands

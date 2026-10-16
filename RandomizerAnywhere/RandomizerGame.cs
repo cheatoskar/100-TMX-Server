@@ -1475,8 +1475,10 @@ internal sealed partial class RandomizerGame
 
         SetStatusStage("writing status.json to disk");
         Directory.CreateDirectory(Path.GetDirectoryName(statusFilePath)!);
+        // Atomic: the website and the deploy script poll this file every few seconds and used to
+        // catch it empty or half-written now and then.
         var json = JsonSerializer.Serialize(status);
-        await File.WriteAllTextAsync(statusFilePath, json, cancellationToken);
+        await AtomicFile.WriteAllTextAsync(statusFilePath, json);
         SetStatusStage("idle");
     }
 

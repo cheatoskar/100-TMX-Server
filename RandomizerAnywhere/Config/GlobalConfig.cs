@@ -34,6 +34,19 @@ internal sealed class GlobalConfig
     public string DiscordWebhookUrl { get; set; } = string.Empty;
     public string DiscordWebhookUrlHard { get; set; } = string.Empty;
 
+    // The dedicated server's whole upload budget in kbit/s, written into dedicated_cfg.txt.
+    // 0 = leave the file as it is (TMF's template ships 512, i.e. ~64 KB/s for everyone, which
+    // is also what every joining player downloads the random map through).
+    public int ConnectionUploadRate { get; set; }
+
+    // /verbose_rpc logs every XML-RPC call in the dedicated server's ConsoleLog - the only record
+    // of whether a call the controller sent actually reached the server. On by default.
+    public bool DisableVerboseRpc { get; set; }
+
+    // How many of the dedicated server's ConsoleLog.<pid>.txt files to keep (one per start,
+    // 15-30 MB each with /verbose_rpc). 0 = the default of 30.
+    public int KeepConsoleLogs { get; set; }
+
     public Dictionary<string, string> DownloadUrls { get; set; } = [];
     public Dictionary<string, object> TmxQuery { get; set; } = [];
 }
