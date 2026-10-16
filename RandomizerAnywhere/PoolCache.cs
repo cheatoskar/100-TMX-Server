@@ -24,7 +24,10 @@ internal sealed class PoolCache
     private readonly object gate = new();
     private readonly Dictionary<string, CachedPool> pools = [];
 
-    public sealed record CachedPool(string Query, DateTimeOffset UpdatedAt, bool Complete, int[] TrackIds);
+    // Query: the copy's key (exchange + query). Partial: some files couldn't be downloaded.
+    public sealed record CachedPool(string Query, DateTimeOffset UpdatedAt, bool Complete, int[] TrackIds, bool Partial = false);
+
+    private static readonly TimeSpan PartialRetryAfter = TimeSpan.FromHours(2);
 
     public PoolCache()
         : this(Path.Combine(AppContext.BaseDirectory, "MapCache"))
@@ -51,7 +54,7 @@ internal sealed class PoolCache
     {
         var pool = GetPool(query);
 
-        if (pool is null || now - pool.UpdatedAt >= MaxAge)
+        if (pool is null || now - pool.UpdatedAt >= MaxAge || (pool.Partial && now - pool.UpdatedAt >= PartialRetryAfter))
         {
             return true;
         }
