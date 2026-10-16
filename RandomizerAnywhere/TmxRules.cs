@@ -29,6 +29,19 @@ internal sealed class TmxRules
     private readonly AppConfig config;
     private readonly ImpossibleMaps impossibleMaps;
     private readonly SkippedMaps skippedMaps;
+    private readonly MapPool mapPool;
+
+    // The full list of maps the current query matches, when it is small enough to load
+    // (see MapPool). Refreshed regularly: new uploads join, and with the default preset's
+    // "no record yet" filter, maps that get a record drop out.
+    private sealed record LoadedPool(string Query, int[] TrackIds, bool Complete, DateTimeOffset LoadedAt);
+    private LoadedPool? loadedPool;
+    private DateTimeOffset poolRetryAfter = DateTimeOffset.MinValue;
+
+    private const int PoolPageSize = 1000;
+    private const int MaxPoolPages = 3;
+    private static readonly TimeSpan PoolRefreshInterval = TimeSpan.FromMinutes(20);
+    private static readonly TimeSpan PoolLoadBudget = TimeSpan.FromSeconds(15);
 
     private readonly GameTitle game;
 
@@ -122,12 +135,13 @@ internal sealed class TmxRules
         return bytes;
     }
 
-    public TmxRules(HttpClient http, AppConfig config, ImpossibleMaps impossibleMaps, SkippedMaps skippedMaps)
+    public TmxRules(HttpClient http, AppConfig config, ImpossibleMaps impossibleMaps, SkippedMaps skippedMaps, MapPool mapPool)
     {
         this.http = http;
         this.config = config;
         this.impossibleMaps = impossibleMaps;
         this.skippedMaps = skippedMaps;
+        this.mapPool = mapPool;
 
         game = config.TmxGame ?? config.Game;
     }
@@ -267,13 +281,14 @@ internal sealed class TmxRules
     // not a random-pool pick that those exclusions are meant to filter
     public async Task<InMemoryFile> GetMapGbxByIdAsync(int trackId, CancellationToken cancellationToken = default)
     {
-        using var response = await http.GetAsync(GetTrackGbxUrl(trackId.ToString(CultureInfo.InvariantCulture)), cancellationToken);
+        using var response = await http.GetAsync(GetTrackGbxUrl(trackId.ToString(CultureInfo.InvariantCulture)), HttpCompletionOption.ResponseHeadersRead, cancellationToken);
 
         var gbxBytes = await ReadMapBytesAsync(response, trackId, cancellationToken);
         var fileName = response.Content.Headers.ContentDisposition?.FileNameStar
             ?? response.Content.Headers.ContentDisposition?.FileName ?? (response.RequestMessage?.RequestUri?.Segments.Last() + ".Gbx");
 
         MarkServed(trackId);
+        mapPool.MarkPlayed(trackId);
         return new InMemoryFile(GetValidFileName(fileName), gbxBytes, trackId);
     }
 
@@ -339,19 +354,149 @@ internal sealed class TmxRules
                     var fileName = trackResponse.Content.Headers.ContentDisposition?.FileNameStar
                         ?? trackResponse.Content.Headers.ContentDisposition?.FileName ?? (trackResponse.RequestMessage?.RequestUri?.Segments.Last() + ".Gbx");
 
+                    // only now: a pick lost to a TMX outage must not use up a map of the round
+                    mapPool.MarkPlayed(trackId);
                     return new InMemoryFile(GetValidFileName(fileName), gbxBytes, trackId);
                 }
-                catch (Exception ex) when (attempt < 3 && ex is HttpRequestException or InvalidOperationException && !cancellationToken.IsCancellationRequested)
+                catch (Exception ex) when (ex is HttpRequestException or InvalidOperationException && !cancellationToken.IsCancellationRequested)
                 {
+                    // TMX answered but the map is gone or isn't a map: done with it for this round.
+                    // No answer at all (StatusCode null) is TMX being down - the map stays in the bag.
+                    if (ex is InvalidOperationException || ex is HttpRequestException { StatusCode: not null })
+                    {
+                        mapPool.MarkPlayed(trackId);
+                    }
+
+                    if (attempt >= 3)
+                    {
+                        throw;
+                    }
+
                     Console.WriteLine($"Warning: TMX track {trackId} couldn't be downloaded ({ex.Message}) - picking another.");
                 }
             }
         }
     }
 
+    // The whole pool for this query, or null when it is too big to list (or TMX can't be asked
+    // right now) - the caller then falls back to /trackrandom.
+    private async Task<int[]?> GetCompletePoolAsync(string query, CancellationToken cancellationToken)
+    {
+        if (config.SourceFromImpossibleList)
+        {
+            return null;
+        }
+
+        var current = loadedPool;
+        var now = DateTimeOffset.UtcNow;
+
+        if (current is not null && current.Query == query && now - current.LoadedAt < PoolRefreshInterval)
+        {
+            return current.Complete ? current.TrackIds : null;
+        }
+
+        if (now < poolRetryAfter)
+        {
+            return current is { Complete: true } && current.Query == query ? current.TrackIds : null;
+        }
+
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        budget.CancelAfter(PoolLoadBudget);
+
+        try
+        {
+            var ids = new List<int>();
+            int? after = null;
+            var complete = false;
+
+            for (var page = 0; page < MaxPoolPages; page++)
+            {
+                var url = $"https://{GetSiteUrl()}/api/tracks?{query}&fields=TrackId&count={PoolPageSize}"
+                    + (after is { } a ? $"&after={a.ToString(CultureInfo.InvariantCulture)}" : string.Empty);
+
+                using var response = await http.GetAsync(url, budget.Token);
+                response.EnsureSuccessStatusCode();
+
+                var payload = await response.Content.ReadFromJsonAsync<TmxApiTrackIdPage>(budget.Token)
+                    ?? throw new InvalidOperationException("TMX returned an empty page.");
+
+                var results = payload.Results ?? [];
+                ids.AddRange(results.Select(r => r.TrackId));
+
+                if (!payload.More)
+                {
+                    complete = true;
+                    break;
+                }
+
+                if (results.Count == 0)
+                {
+                    // "more" but nothing on the page: don't trust this list to be the whole pool
+                    break;
+                }
+
+                after = results[^1].TrackId;
+            }
+
+            loadedPool = new LoadedPool(query, [.. ids.Distinct()], complete, DateTimeOffset.UtcNow);
+
+            if (current?.Query != query || current.Complete != complete)
+            {
+                Console.WriteLine(complete
+                    ? $"Map pool: {loadedPool.TrackIds.Length} map(s) match this preset - playing each once before any repeats."
+                    : $"Map pool: more than {MaxPoolPages * PoolPageSize} maps match this preset - picking at random from TMX.");
+            }
+
+            return complete ? loadedPool.TrackIds : null;
+        }
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            // don't ask again on every single pick while TMX struggles
+            poolRetryAfter = DateTimeOffset.UtcNow + TimeSpan.FromMinutes(2);
+            Console.WriteLine($"Warning: couldn't load the map pool from TMX - {ex.Message}");
+            return current is { Complete: true } && current.Query == query ? current.TrackIds : null;
+        }
+    }
+
+    private sealed record TmxApiTrackIdPage(bool More, List<TmxApiTrackIdResult>? Results);
+    private sealed record TmxApiTrackIdResult(int TrackId);
+
+    private bool IsEligibleForPool(int trackId) =>
+        !impossibleMaps.Contains(trackId) && !IsSessionExcluded(trackId) && !skippedMaps.Contains(trackId);
+
     private async Task<(HttpResponseMessage Response, int TrackId)> NextMapGbxResponseAsync(CancellationToken cancellationToken)
     {
         var searchWatch = Stopwatch.StartNew();
+        var query = config.TmxQueryOverride ?? BuildQuery();
+
+        if (await GetCompletePoolAsync(query, cancellationToken) is { } pool)
+        {
+            var pooledId = mapPool.Pick(pool, IsEligibleForPool, out var poolState);
+
+            if (pooledId is null)
+            {
+                // Every map of the pool is excluded. Maps reported during this run (/imp, /skip
+                // exclusions) are only excluded for the session - better to play one of those
+                // again than to stop. /trackrandom draws from the same pool, so asking it would
+                // only burn 30 seconds before failing.
+                pooledId = mapPool.Pick(pool, id => !impossibleMaps.Contains(id) && !skippedMaps.Contains(id), out poolState);
+                poolState += ", session exclusions ignored - nothing else left";
+            }
+
+            if (pooledId is not { } pickedId)
+            {
+                throw new InvalidOperationException($"Every one of the {pool.Length} map(s) of this preset is on the impossible or skip list - nothing left to play.");
+            }
+
+            Console.WriteLine("Next track ID: " + pickedId);
+            Diagnostics.Trace($"tmx: picked {pickedId} from the pool ({poolState}), {searchWatch.ElapsedMilliseconds}ms");
+            MarkServed(pickedId);
+
+            var poolDownloadWatch = Stopwatch.StartNew();
+            var pooledResponse = await http.GetAsync(GetTrackGbxUrl(pickedId.ToString(CultureInfo.InvariantCulture)), HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            Diagnostics.Trace($"tmx: downloaded {pickedId} HTTP {(int)pooledResponse.StatusCode} in {poolDownloadWatch.ElapsedMilliseconds}ms");
+            return (pooledResponse, pickedId);
+        }
 
         for (var attempt = 1; attempt <= MaxTotalAttempts; attempt++)
         {
@@ -361,7 +506,7 @@ internal sealed class TmxRules
                     $"Gave up looking for a servable map after {searchWatch.Elapsed.TotalSeconds:0}s ({attempt - 1} attempts) - TMX is too slow or unreachable right now.");
             }
 
-            var tmxRandomUrl = $"{GetRandomTrackUrl()}?{config.TmxQueryOverride ?? BuildQuery()}";
+            var tmxRandomUrl = $"{GetRandomTrackUrl()}?{query}";
 
             using var request = new HttpRequestMessage(HttpMethod.Head, tmxRandomUrl);
             using var response = await http.SendAsync(request, cancellationToken);
@@ -401,7 +546,7 @@ internal sealed class TmxRules
             MarkServed(trackId);
 
             var downloadWatch = Stopwatch.StartNew();
-            var gbxResponse = await http.GetAsync(GetTrackGbxUrl(trackIdString), cancellationToken);
+            var gbxResponse = await http.GetAsync(GetTrackGbxUrl(trackIdString), HttpCompletionOption.ResponseHeadersRead, cancellationToken);
             Diagnostics.Trace($"tmx: downloaded {trackId} HTTP {(int)gbxResponse.StatusCode} in {downloadWatch.ElapsedMilliseconds}ms");
             return (gbxResponse, trackId);
         }

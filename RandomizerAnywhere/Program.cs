@@ -159,6 +159,7 @@ finally
 [Singleton(typeof(SkippedMaps))]
 [Singleton(typeof(DiscordNotifier))]
 [Singleton(typeof(Leaderboard))]
+[Singleton(typeof(MapPool))]
 internal partial class AppServiceProvider
 {
     // Every TMX call on this client runs on the XML-RPC callback dispatch loop, which handles

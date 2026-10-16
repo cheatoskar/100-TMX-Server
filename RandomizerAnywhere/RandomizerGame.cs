@@ -581,6 +581,11 @@ internal sealed partial class RandomizerGame
 
                 if (mapChanged)
                 {
+                    // Measured from when this MAP started, not this race: the idle probe restarts
+                    // the map every 20 minutes and would otherwise reset the watchdog forever.
+                    stalledWatchStartedAt = DateTimeOffset.UtcNow;
+                    playerConnectsOnCurrentMap = 0;
+
                     // /rounds only ever applies to the map it was used on
                     roundsModeActive = false;
 
@@ -714,6 +719,8 @@ internal sealed partial class RandomizerGame
 
         OnGameCallback("TrackMania.PlayerConnect", async (methodParams, cancellationToken) =>
         {
+            playerConnectsOnCurrentMap++;
+
             try
             {
                 var login = (string)methodParams[0];
@@ -1628,6 +1635,18 @@ internal sealed partial class RandomizerGame
     // night and churn through the pool for no reason.
     private static readonly TimeSpan StalledMapTimeout = TimeSpan.FromMinutes(15);
 
+    // ...but only when somebody actually came by. On a server nobody joined, every map looked
+    // "stalled" after 15 minutes: ~90 map switches a day for an empty room, each one a TMX download
+    // and a map used up from a small pool. Without any join the map just stays, and moves on
+    // slowly so the status page doesn't show the same map all night.
+    private static readonly TimeSpan IdleRotationTimeout = TimeSpan.FromHours(3);
+
+    // PlayerConnect callbacks since the current map started
+    private int playerConnectsOnCurrentMap;
+
+    // when the current map (not race - see BeginRace) started; null while a skip is in flight
+    private DateTimeOffset? stalledWatchStartedAt;
+
     // The last map the watchdog already skipped, so a map that fails to advance
     // cannot be reported over and over.
     private int? lastStalledMapTrackId;
@@ -1639,7 +1658,9 @@ internal sealed partial class RandomizerGame
             return;
         }
 
-        if (currentMapStartedAt is not { } startedAt || DateTimeOffset.UtcNow - startedAt < StalledMapTimeout)
+        var timeout = playerConnectsOnCurrentMap > 0 ? StalledMapTimeout : IdleRotationTimeout;
+
+        if (stalledWatchStartedAt is not { } startedAt || DateTimeOffset.UtcNow - startedAt < timeout)
         {
             return;
         }
@@ -1666,11 +1687,11 @@ internal sealed partial class RandomizerGame
 
         // Clear first: the advance below takes a moment, and the watchdog must not fire
         // a second time for the same map while it is in flight.
-        currentMapStartedAt = null;
+        stalledWatchStartedAt = null;
         lastStalledMapTrackId = trackId;
 
-        Console.WriteLine($"Stalled-map watchdog: no players and no checkpoints for {StalledMapTimeout.TotalMinutes:F0} minutes, skipping map {trackId}.");
-        await SendMessageAsync($"$F80No players and no checkpoints for {StalledMapTimeout.TotalMinutes:F0} minutes - skipping this map.", cancellationToken);
+        Console.WriteLine($"Stalled-map watchdog: no players and no checkpoints for {timeout.TotalMinutes:F0} minutes, skipping map {trackId} ({playerConnectsOnCurrentMap} join(s) during it).");
+        await SendMessageAsync($"$F80No players and no checkpoints for {timeout.TotalMinutes:F0} minutes - skipping this map.", cancellationToken);
 
         // Deliberately no Discord post: this fires on an empty server, potentially
         // several times a night, and nobody needs a notification for a map that had
