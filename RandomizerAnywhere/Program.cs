@@ -50,6 +50,7 @@ try
 
     var skippedMaps = provider.GetRequiredService<SkippedMaps>();
     await skippedMaps.LoadAsync(cts.Token);
+    _ = skippedMaps.RunReloadLoopAsync(TimeSpan.FromSeconds(10), cts.Token);
 
     var leaderboard = provider.GetRequiredService<Leaderboard>();
     await leaderboard.LoadAsync(cts.Token);

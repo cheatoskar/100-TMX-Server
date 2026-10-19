@@ -963,6 +963,7 @@ internal sealed partial class RandomizerGame
     {
         appToken = cancellationToken;
         RegisterCallbacks();
+        skippedMaps.MapsAdded += OnSkipListMapsAdded;
 
         // The dedicated server's own anti-cheat bans players for "Time incoherence", and on a
         // randomizer serving RPG, stunt and trial maps straight off TMX that fires on perfectly
@@ -1963,6 +1964,35 @@ internal sealed partial class RandomizerGame
         {
             await NextRandomMapAsync(goalReached: false, cancellationToken);
         }
+    }
+
+    // skipped-maps.json was edited by hand and now lists the map that is running - usually because
+    // it was just found to crash every client. Move on like /blockmap does, from the background:
+    // this is raised on the skip list's reload loop, not on a callback.
+    private void OnSkipListMapsAdded(IReadOnlyCollection<int> trackIds)
+    {
+        if (currentMapTrackId is not { } id || !trackIds.Contains(id) || !SessionActive)
+        {
+            return;
+        }
+
+        Console.WriteLine($"Skip list: the running map {id} was added to skipped-maps.json - moving on.");
+        var generation = mapGeneration;
+
+        RunInBackground($"skipping past newly skip-listed map {id}", async () =>
+        {
+            await RunUnderGameLockAsync($"skipping past newly skip-listed map {id}", async token =>
+            {
+                // something else already moved the server on in the meantime
+                if (mapGeneration != generation)
+                {
+                    return;
+                }
+
+                await SendMessageAsync($"$FF0Map {id} is now on this server's skip list - skipping it.", token);
+                await NextRandomMapAsync(goalReached: false, token);
+            });
+        });
     }
 
     // both servers can share one Discord webhook, so say which one a report came from; the original
