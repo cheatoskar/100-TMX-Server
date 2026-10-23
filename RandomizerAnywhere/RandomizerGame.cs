@@ -2689,10 +2689,33 @@ internal sealed partial class RandomizerGame
         await StartSessionAsync(cancellationToken);
     }
 
-    // shared by /loadmap and a passed /votemap vote: queues the specific track id for the next
-    // map fetch, then either swaps it in right away (session already running, same path /skip
-    // uses) or starts a fresh session with it as the first map
+    // shared by /loadmap and a passed /votemap vote. The TMX download (and its record check) runs
+    // inside the advance, and from a chat command that held the whole callback stream: on
+    // 2026-10-21 a slow TMX made a passed /votemap freeze checkpoints, finishes and chat for 30s.
+    // From a callback the load therefore moves to the background, where the advance lets go of the
+    // game lock while it downloads (see WithoutGameLockIfBackgroundAsync). The vote timer already
+    // runs in the background and loads straight away.
     private async Task LoadForcedMapAsync(int trackId, CancellationToken cancellationToken)
+    {
+        if (holdsGameLockInBackground.Value)
+        {
+            await LoadForcedMapNowAsync(trackId, cancellationToken);
+            return;
+        }
+
+        RunInBackground($"loading TMX map {trackId}", async () =>
+        {
+            if (!await RunUnderGameLockAsync($"loading TMX map {trackId}", token => LoadForcedMapNowAsync(trackId, token)))
+            {
+                await SendMessageAsync($"$F00Couldn't load TMX map {trackId} - the server was busy. Try again in a moment.", appToken);
+            }
+        });
+    }
+
+    // queues the specific track id for the next map fetch, then either swaps it in right away
+    // (session already running, same path /skip uses) or starts a fresh session with it as the
+    // first map
+    private async Task LoadForcedMapNowAsync(int trackId, CancellationToken cancellationToken)
     {
         forcedNextMapTrackId = trackId;
 
@@ -3105,6 +3128,58 @@ internal sealed partial class RandomizerGame
         }
     }
 
+    // Writes the map file and inserts it after the current challenge. Returns false when the game
+    // server refuses the file as "Track not complete": a map that was never validated (no author
+    // time in its header, although TMX lists one). That never changes for the file, so the map
+    // goes on the skip list for good. 13725873 was picked at random on 2026-10-21 and voted twice
+    // on 2026-10-22, and each time the player got a bare "Track not complete".
+    private async Task<bool> TryInsertChallengeAsync(InMemoryFile map, string mapPath, CancellationToken token)
+    {
+        await client.WriteFileAsync(mapPath, map.Data, token);
+
+        try
+        {
+            // This retry loop is only for the TRANSIENT race: InsertChallenge called again
+            // before the dedicated server has fully consumed the PREVIOUS insert (e.g. calling
+            // /loadmap right after a /skip). Retrying after a short wait lets that prior
+            // transition settle instead of pressing on with NextChallenge anyway, which would
+            // just advance to whatever was already pending - silently loading the WRONG map
+            // instead of the one just requested. The PERMANENT "already added" case (map
+            // already in the selection) is handled by the caller reusing the existing entry, so
+            // it never reaches this loop.
+            for (var attempt = 1; attempt <= 5; attempt++)
+            {
+                try
+                {
+                    await CallWithTransitionRetryAsync("InsertChallenge", [mapPath], token);
+                    break;
+                }
+                catch (Exception ex) when (ex.Message.Contains("already added", StringComparison.OrdinalIgnoreCase) && attempt < 5)
+                {
+                    await Task.Delay(1000, token);
+                }
+            }
+
+            return true;
+        }
+        catch (Exception ex) when (ex.Message.Contains("Track not complete", StringComparison.OrdinalIgnoreCase))
+        {
+            tmxRules.ExcludeForSession(map.TrackId);
+
+            try
+            {
+                await skippedMaps.AddAsync(map.TrackId, token);
+                Console.WriteLine($"Skip list: map {map.TrackId} refused by the game server (Track not complete - never validated), added to the skip list ({skippedMaps.Count} on the list).");
+            }
+            catch (Exception saveEx) when (!token.IsCancellationRequested)
+            {
+                Console.WriteLine($"Warning: map {map.TrackId} refused by the game server (Track not complete), but saving it to the skip list failed - {saveEx.Message}");
+            }
+
+            return false;
+        }
+    }
+
     // Returns false when it did nothing because a switch is already running or already asked for.
     public async Task<bool> NextRandomMapAsync(bool goalReached, CancellationToken cancellationToken, bool ownsClaim = false)
     {
@@ -3147,96 +3222,98 @@ internal sealed partial class RandomizerGame
             // is exactly why /votemap "sometimes didn't load the right map".
             if (randomEnqueuedMapFileName is null || forcedNextMapTrackId is not null)
             {
-                SetAdvanceStage("picking and downloading the next map from TMX");
                 var forcedTrackId = forcedNextMapTrackId;
                 forcedNextMapTrackId = null;
                 forcedMapQueuedTrackId = forcedTrackId;
 
                 var generationBeforeFetch = mapGeneration;
                 var sessionBeforeFetch = sessionStopwatch;
-                var nextMap = await WithoutGameLockIfBackgroundAsync(async () =>
+                InMemoryFile nextMap;
+                string mapPath;
+
+                // A random pick the game server refuses (see TryInsertChallengeAsync) is just a bad
+                // pick - take another one, the same way TmxRules does for a file that won't download.
+                for (var pick = 1; ; pick++)
                 {
-                    var map = forcedTrackId is { } forcedId
-                        ? await tmxRules.GetMapGbxByIdAsync(forcedId, token)
-                        : await tmxRules.NextMapGbxAsync(token);
-
-                    // unknown (TMX didn't answer) counts as "has a record": no credit
-                    forcedMapQueuedHasNoRecord = forcedTrackId is { } checkedId
-                        && await tmxRules.HasRecordAsync(checkedId, token) == false;
-
-                    // A random pick of the map that is running right now would only restart it (the
-                    // recent-maps list is in memory and starts empty after every restart).
-                    for (var repick = 0; forcedTrackId is null && map.TrackId == DisplayedMapTrackId && repick < 3; repick++)
+                    SetAdvanceStage("picking and downloading the next map from TMX");
+                    nextMap = await WithoutGameLockIfBackgroundAsync(async () =>
                     {
-                        map = await tmxRules.NextMapGbxAsync(token);
+                        var map = forcedTrackId is { } forcedId
+                            ? await tmxRules.GetMapGbxByIdAsync(forcedId, token)
+                            : await tmxRules.NextMapGbxAsync(token);
+
+                        // unknown (TMX didn't answer) counts as "has a record": no credit
+                        forcedMapQueuedHasNoRecord = forcedTrackId is { } checkedId
+                            && await tmxRules.HasRecordAsync(checkedId, token) == false;
+
+                        // A random pick of the map that is running right now would only restart it (the
+                        // recent-maps list is in memory and starts empty after every restart).
+                        for (var repick = 0; forcedTrackId is null && map.TrackId == DisplayedMapTrackId && repick < 3; repick++)
+                        {
+                            map = await tmxRules.NextMapGbxAsync(token);
+                        }
+
+                        return map;
+                    });
+                    SetAdvanceStage($"downloaded map {nextMap.TrackId} '{nextMap.FileName}' ({nextMap.Data.Length} bytes)");
+
+                    // The lock may have been let go during the download: if the map changed by itself
+                    // or the session was stopped meanwhile, switching now would skip the fresh map or
+                    // undo the /stop.
+                    if (mapGeneration != generationBeforeFetch || !ReferenceEquals(sessionStopwatch, sessionBeforeFetch))
+                    {
+                        Console.WriteLine($"Map {nextMap.TrackId} was downloaded, but the map or the session changed meanwhile - not switching.");
+                        forcedMapQueuedTrackId = null;
+                        return false;
                     }
 
-                    return map;
-                });
-                SetAdvanceStage($"downloaded map {nextMap.TrackId} '{nextMap.FileName}' ({nextMap.Data.Length} bytes)");
+                    // Last line of defence. The random pick and /loadmap + /votemap already refuse
+                    // skip-listed maps, so this should never fire - but if any route ever hands one
+                    // over, it must die HERE, before the file is written or inserted. Once the game
+                    // server has the map it can be loaded, and loading a map the game can't open
+                    // drops every player.
+                    if (skippedMaps.Contains(nextMap.TrackId))
+                    {
+                        throw new InvalidOperationException($"map {nextMap.TrackId} is on this server's skip list");
+                    }
 
-                // The lock may have been let go during the download: if the map changed by itself
-                // or the session was stopped meanwhile, switching now would skip the fresh map or
-                // undo the /stop.
-                if (mapGeneration != generationBeforeFetch || !ReferenceEquals(sessionStopwatch, sessionBeforeFetch))
-                {
-                    Console.WriteLine($"Map {nextMap.TrackId} was downloaded, but the map or the session changed meanwhile - not switching.");
-                    forcedMapQueuedTrackId = null;
-                    return false;
-                }
+                    // InsertChallenge de-dupes by the challenge's UID against the server's WHOLE selection
+                    // (playlist), not by the file path we write it under, so a map that is still in the
+                    // selection (the warmup map, or one that was queued and never played) cannot be
+                    // inserted again. Reuse that entry instead - found by its TMX id, never by a bare
+                    // file-name suffix, which matched "Race.Challenge.Gbx" to "A01-Race.Challenge.Gbx".
+                    SetAdvanceStage("asking the server for its map list (GetChallengeList)");
+                    var existingPath = await client.FindSelectedChallengeFileNameAsync(nextMap.TrackId, nextMap.FileName, token);
+                    SetAdvanceStage(existingPath is null
+                        ? "map not in the server's list yet - writing file and inserting"
+                        : $"map already in the server's list as '{existingPath}' - reusing it");
 
-                // Last line of defence. The random pick and /loadmap + /votemap already refuse
-                // skip-listed maps, so this should never fire - but if any route ever hands one
-                // over, it must die HERE, before the file is written or inserted. Once the game
-                // server has the map it can be loaded, and loading a map the game can't open
-                // drops every player.
-                if (skippedMaps.Contains(nextMap.TrackId))
-                {
-                    throw new InvalidOperationException($"map {nextMap.TrackId} is on this server's skip list");
-                }
+                    if (existingPath is not null)
+                    {
+                        // The reused entry sits wherever it was in the selection; without this
+                        // NextChallenge loaded whatever happened to come next instead.
+                        await CallWithTransitionRetryAsync("ChooseNextChallenge", [existingPath], token);
+                        mapPath = existingPath;
+                        break;
+                    }
 
-                // InsertChallenge de-dupes by the challenge's UID against the server's WHOLE selection
-                // (playlist), not by the file path we write it under, so a map that is still in the
-                // selection (the warmup map, or one that was queued and never played) cannot be
-                // inserted again. Reuse that entry instead - found by its TMX id, never by a bare
-                // file-name suffix, which matched "Race.Challenge.Gbx" to "A01-Race.Challenge.Gbx".
-                SetAdvanceStage("asking the server for its map list (GetChallengeList)");
-                var mapPath = await client.FindSelectedChallengeFileNameAsync(nextMap.TrackId, nextMap.FileName, token);
-                SetAdvanceStage(mapPath is null
-                    ? "map not in the server's list yet - writing file and inserting"
-                    : $"map already in the server's list as '{mapPath}' - reusing it");
-
-                if (mapPath is null)
-                {
                     mapPath = InsertedChallengePath(nextMap);
-                    await client.WriteFileAsync(mapPath, nextMap.Data, token);
 
-                    // This retry loop is only for the TRANSIENT race: InsertChallenge called again
-                    // before the dedicated server has fully consumed the PREVIOUS insert (e.g. calling
-                    // /loadmap right after a /skip). Retrying after a short wait lets that prior
-                    // transition settle instead of pressing on with NextChallenge anyway, which would
-                    // just advance to whatever was already pending - silently loading the WRONG map
-                    // instead of the one just requested. The PERMANENT "already added" case (map
-                    // already in the selection) is handled above by reusing the existing entry, so it
-                    // never reaches this loop.
-                    for (var attempt = 1; attempt <= 5; attempt++)
+                    if (await TryInsertChallengeAsync(nextMap, mapPath, token))
                     {
-                        try
-                        {
-                            await CallWithTransitionRetryAsync("InsertChallenge", [mapPath], token);
-                            break;
-                        }
-                        catch (Exception ex) when (ex.Message.Contains("already added", StringComparison.OrdinalIgnoreCase) && attempt < 5)
-                        {
-                            await Task.Delay(1000, token);
-                        }
+                        break;
                     }
-                }
-                else
-                {
-                    // The reused entry sits wherever it was in the selection; without this
-                    // NextChallenge loaded whatever happened to come next instead.
-                    await CallWithTransitionRetryAsync("ChooseNextChallenge", [mapPath], token);
+
+                    if (forcedTrackId is not null)
+                    {
+                        forcedMapQueuedTrackId = null;
+                        throw new InvalidOperationException("the map was never validated (it has no author time), so the game server can't load it - it's on this server's skip list now");
+                    }
+
+                    if (pick >= 3)
+                    {
+                        throw new InvalidOperationException("the game server refused 3 maps in a row as not validated - try again");
+                    }
                 }
 
                 SetAdvanceStage("SetGameMode");
