@@ -160,7 +160,7 @@ Beyond the game/server basics, `config.toml` (see `config.default.toml` for the 
 | `ConnectionUploadRate` | The dedicated server's total upload budget in kbit/s, written into `dedicated_cfg.txt` at every start. Every joining player downloads the random map through it. `0` (default) leaves the file alone - TMF's template ships `512`, about 64 KB/s for everybody together. |
 | `DisableVerboseRpc` | `true` stops starting the dedicated server with `/verbose_rpc`. Leave it off: the ConsoleLog's per-call lines are the only record of whether a call reached the server. |
 | `KeepConsoleLogs` | How many of the dedicated server's `ConsoleLog.<pid>.txt` files (one per start) to keep. Default `30`. |
-| `LeaderboardFile` | Path of the leaderboard file. Empty (default) = `leaderboard.json` next to the program. Servers on one machine that point at the same file share one leaderboard: every finish is counted under a lock on the freshly read file, and each server re-reads the file when the other one changed it. The TMUF server uses the TMNF server's file. |
+| `LeaderboardFile` | Path of the leaderboard file. Empty (default) = `leaderboard.json` next to the program. Servers on one machine that point at the same file share one leaderboard: every finish is counted under a lock on the freshly read file, and each server re-reads the file when the other one changed it. Off by default; the TMUF server keeps its own leaderboard. |
 | `SourceFromImpossibleList` (preset-only) | When `true` on a preset, that preset cycles only through maps already flagged impossible, instead of querying TMX - used by the bundled `impossible_review_tmnf` preset. |
 
 ## In-game chat commands

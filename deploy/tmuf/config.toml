@@ -49,9 +49,9 @@ ServerLogin = ""
 ServerPassword = ""
 ServerValidationKey = ""
 
-# one leaderboard for both servers: the TMNF server's file (finishes are counted under a file lock,
-# so both servers can write it). Needs the TMNF server on a build that has LeaderboardFile, too.
-LeaderboardFile = "/opt/randomizer-anywhere/publish/leaderboard.json"
+# The TMUF server keeps its own leaderboard (decided 2026-11-07). To count both servers into one,
+# point this at the TMNF server's file - finishes are counted under a file lock, so both can write it:
+# LeaderboardFile = "/opt/randomizer-anywhere/publish/leaderboard.json"
 
 [DownloadUrls]
 TMF = "http://files2.trackmaniaforever.com/TrackmaniaServer_2011-02-21.zip"
