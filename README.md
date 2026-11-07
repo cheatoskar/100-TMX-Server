@@ -89,6 +89,8 @@ The following presets are bundled:
 | `multilap_tmnf` | Multilap | Multilap-tagged maps (`/rounds` still needed per-map for a valid replay) |
 | `impossible_review_tmnf` | Impossible Review | Admin-only: cycles only through maps flagged via `/imp`, for manual review - no auto-skip |
 
+The TMUF server (`Game = "TMUF"`) only offers the `*_tmuf` presets: the same set (without `impossible_review`), plus one 100% TMX preset per environment - `100tmx_tmuf_snow`, `_desert`, `_rally`, `_island`, `_coast`, `_bay` and `_stadium` (TMX `environment` filter, 0-based: 0=Snow ... 6=Stadium). `100tmx_tmuf` itself draws from all environments.
+
 To create a new preset, add a `<name>.toml` file to the `Presets` folder (see `Presets/100tmx_tmnf.toml` for an example). TMX genre filters use the `tag` query parameter (the `Tags` array on a track, e.g. `tag = "6,1"` for LOL or Stunt) - not `primarytype`, which 404s on `/trackrandom` for any nonzero value despite being a documented field. See the comments in any bundled preset for the full list of known-good tag/difficulty values.
 
 ## Command line usage
@@ -172,6 +174,7 @@ Beyond the game/server basics, `config.toml` (see `config.default.toml` for the 
 | `/rounds` | Switches the current map to Rounds mode if it's a genuine multilap challenge, so a full finish produces a TMX-valid replay. Reverts to TimeAttack automatically once the map ends. Once per map, and not while the next map is already loading. |
 | `/top` | Shows the top finishers on this server. |
 | `/rank` | Shows your own rank and finish count. |
+| `/afk` | Puts you into spectator mode and frees your player slot; `/afk` again puts you back into the race (if a slot is free). |
 | `/map` | Shows the current map's TMX link. `/map -1`, `/map -2`, ... shows a past map (see `/history`). |
 | `/history` | Lists the last few maps and what `-1`, `-2`, ... refer to for `/map`, `/imp`, `/hard`. |
 | `/timelimit`, `/tl <seconds>` | Shows or sets the session time limit (only while no session is active). |
