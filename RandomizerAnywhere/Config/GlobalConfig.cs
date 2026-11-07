@@ -31,6 +31,10 @@ internal sealed class GlobalConfig
     public string ServerLogin { get; set; } = string.Empty;
     public string ServerPassword { get; set; } = string.Empty;
     public string ServerValidationKey { get; set; } = string.Empty;
+
+    // Path of the leaderboard file. Empty = leaderboard.json next to the program. Two servers that
+    // point at the same file share one leaderboard (writes are locked across processes).
+    public string LeaderboardFile { get; set; } = string.Empty;
     public string DiscordWebhookUrl { get; set; } = string.Empty;
     public string DiscordWebhookUrlHard { get; set; } = string.Empty;
 

@@ -33,6 +33,10 @@ internal sealed class AppConfig
     public required string ServerPassword { get; init; }
     public required string ServerValidationKey { get; init; }
 
+    // leaderboard.json to use; empty = the one next to the program. The TMUF server points this at
+    // the TMNF server's file, so both servers count into one leaderboard (see Leaderboard).
+    public string LeaderboardFile { get; init; } = string.Empty;
+
     // The login players add to their favourites (tmtp://#addfavourite=<login>). The first server's
     // login predates the config key, so it stays the fallback.
     public string FavoriteLogin => string.IsNullOrWhiteSpace(ServerLogin) ? "100_tmx-project" : ServerLogin;

@@ -262,6 +262,7 @@ internal partial class AppServiceProvider
             ServerLogin = Configurator.GetString(globalConfig.ServerLogin, cmdValue: null, "RANDANY_SERVER_LOGIN"),
             ServerPassword = Configurator.GetString(globalConfig.ServerPassword, cmdValue: null, "RANDANY_SERVER_PASSWORD"),
             ServerValidationKey = Configurator.GetString(globalConfig.ServerValidationKey, cmdValue: null, "RANDANY_SERVER_VALIDATION_KEY"),
+            LeaderboardFile = Configurator.GetString(globalConfig.LeaderboardFile, cmdValue: null, "RANDANY_LEADERBOARD_FILE"),
             DiscordWebhookUrl = Configurator.GetString(globalConfig.DiscordWebhookUrl, cmdValue: null, "RANDANY_DISCORD_WEBHOOK_URL"),
             DiscordWebhookUrlHard = Configurator.GetString(globalConfig.DiscordWebhookUrlHard, cmdValue: null, "RANDANY_DISCORD_WEBHOOK_URL_HARD"),
             ConnectionUploadRate = Math.Max(globalConfig.ConnectionUploadRate, 0),
