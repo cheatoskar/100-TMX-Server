@@ -2521,7 +2521,8 @@ internal sealed partial class RandomizerGame
     {
         if (args.Length == 0)
         {
-            await SendMessageAsync(login, "Usage: $FF0/votepreset <name>$FFF, then others type $FF0/yes$FFF to support.", cancellationToken);
+            // players type /votepreset expecting the clickable list, not a usage line
+            await PresetsAsync(playerUid, login, args, cancellationToken);
             return;
         }
 
