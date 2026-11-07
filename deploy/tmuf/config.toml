@@ -49,6 +49,10 @@ ServerLogin = ""
 ServerPassword = ""
 ServerValidationKey = ""
 
+# one leaderboard for both servers: the TMNF server's file (finishes are counted under a file lock,
+# so both servers can write it). Needs the TMNF server on a build that has LeaderboardFile, too.
+LeaderboardFile = "/opt/randomizer-anywhere/publish/leaderboard.json"
+
 [DownloadUrls]
 TMF = "http://files2.trackmaniaforever.com/TrackmaniaServer_2011-02-21.zip"
 TM = "http://slig.free.fr/TM/dedicated/TmDedicatedServer_2006-05-30.zip"

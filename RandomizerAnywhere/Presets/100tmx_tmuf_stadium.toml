@@ -1,0 +1,12 @@
+DisplayName = "100% TMX Project (TMUF Stadium)"
+Games = ["TMUF"]
+
+TmxGame = "TMUF"
+AutoSkipMode = "Finished"
+
+[TmxQuery]
+inhasrecord = 0
+inunlimiter = 0
+# tmuf.exchange environment filter, 0-based: 0=Snow 1=Desert 2=Rally 3=Island 4=Coast 5=Bay 6=Stadium
+# (verified live 2026-11-07 - the API's own "Environment" field in results is 1-based, the filter is not)
+environment = 6

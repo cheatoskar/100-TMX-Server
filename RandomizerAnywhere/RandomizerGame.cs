@@ -448,7 +448,7 @@ internal sealed partial class RandomizerGame
     [
         "start", "stop", "end", "skip", "imp", "blockmap", "hard", "top", "rank", "map", "history",
         "rounds", "info", "help", "testhud", "votepreset", "yes", "no", "commands", "source",
-        "timelimit", "tl", "preset", "presets", "loadmap", "votemap",
+        "timelimit", "tl", "preset", "presets", "loadmap", "votemap", "afk",
     ];
 
     public RandomizerGame(RemoteClient client, TmxRules tmxRules, AppConfig config, DiscordNotifier discordNotifier, Leaderboard leaderboard, SkippedMaps skippedMaps)
@@ -488,7 +488,8 @@ internal sealed partial class RandomizerGame
             ["preset"] = PresetAsync,
             ["presets"] = PresetsAsync,
             ["loadmap"] = LoadMapAsync,
-            ["votemap"] = VoteMapAsync
+            ["votemap"] = VoteMapAsync,
+            ["afk"] = AfkAsync
         };
 
         if (!commandHandlers.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase).SetEquals(ChatCommandNames))
@@ -850,8 +851,10 @@ internal sealed partial class RandomizerGame
     private const int ActionRoundsAccept = 3;
     private const int ActionClosePresetList = 4;
     private const int ActionCloseHistory = 5;
-    private const int ActionPresetBase = 10;
-    private const int ActionHistoryBase = 20;
+    // presets 100..199, history 200+: with 10 slots apart, the 11th preset (the TMUF server has
+    // 14) clicked as history entry 0
+    private const int ActionPresetBase = 100;
+    private const int ActionHistoryBase = 200;
 
     private const string RoundsPromptManialinkId = "rounds_prompt";
     private const string VotePopupManialinkId = "vote_popup";
@@ -2237,6 +2240,7 @@ internal sealed partial class RandomizerGame
             "$FF0/hard$FFF (or $FF0/hard -1$FFF, $FF0-2$FFF, ... for a past map) - flag a map as hard for review",
             "$FF0/top$FFF - show the top finishers on this server",
             "$FF0/rank$FFF - show your own rank and finish count",
+            "$FF0/afk$FFF - go spectating and free your slot, $FF0/afk$FFF again to race",
             "$FF0/votepreset <name>$FFF - propose switching preset, others confirm with $0F0/yes$FFF ($FF0/presets$FFF for names)",
             "$FF0/votemap <TMX id>$FFF - propose loading a specific TMX map by id, shows name/author/difficulty/AT/tags, others confirm with $0F0/yes$FFF (doesn't count for the leaderboard)",
             "$FF0/commands$FFF - list every raw command name",
@@ -2276,6 +2280,51 @@ internal sealed partial class RandomizerGame
             .ToList();
 
         await SendMessageAsync(login, lines, cancellationToken);
+    }
+
+    // /afk toggles: a player goes to spectator and frees the player slot, the next /afk puts them
+    // back into the race. Players typed /afk out of habit from other servers (73 times in the
+    // GameLog by 2026-11) and got no answer at all.
+    private async Task AfkAsync(int playerUid, string login, string[] args, CancellationToken cancellationToken)
+    {
+        var info = await client.TracedCallAsync<Dictionary<string, object>>("GetDetailedPlayerInfo", [login], cancellationToken);
+        var isSpectator = info.TryGetValue("IsSpectator", out var spec) && spec is bool b && b;
+
+        if (!isSpectator)
+        {
+            await client.CallAsync("ForceSpectator", [login, 1], cancellationToken);
+            // back to "user selectable": the player stays a spectator, but the game's own
+            // spectator/play toggle works again, and so does /afk
+            await client.CallAsync("ForceSpectator", [login, 0], cancellationToken);
+
+            try
+            {
+                // a spectator keeps the player slot he came from; free it for someone else
+                await client.CallAsync("SpectatorReleasePlayerSlot", [login], cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Warning: /afk could not release the player slot of {login} - {ex.Message}");
+            }
+
+            await SendMessageAsync($"$FF0{GetNicknameOrLogin(login)} is AFK (spectating). Type $0F0/afk$FF0 again to race.", cancellationToken);
+            return;
+        }
+
+        try
+        {
+            await client.CallAsync("ForceSpectator", [login, 2], cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            // the usual reason: every player slot is taken
+            Console.WriteLine($"Warning: /afk could not switch {login} back to racing - {ex.Message}");
+            await SendMessageAsync(login, "$F00No free player slot right now - try again in a moment.", cancellationToken);
+            return;
+        }
+
+        await client.CallAsync("ForceSpectator", [login, 0], cancellationToken);
+        await SendMessageAsync($"$FF0{GetNicknameOrLogin(login)} is back from AFK.", cancellationToken);
     }
 
     private async Task SourceAsync(int playerUid, string login, string[] args, CancellationToken cancellationToken)
@@ -2472,7 +2521,8 @@ internal sealed partial class RandomizerGame
     {
         if (args.Length == 0)
         {
-            await SendMessageAsync(login, "Usage: $FF0/votepreset <name>$FFF, then others type $FF0/yes$FFF to support.", cancellationToken);
+            // players type /votepreset expecting the clickable list, not a usage line
+            await PresetsAsync(playerUid, login, args, cancellationToken);
             return;
         }
 

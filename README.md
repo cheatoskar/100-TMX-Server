@@ -89,6 +89,8 @@ The following presets are bundled:
 | `multilap_tmnf` | Multilap | Multilap-tagged maps (`/rounds` still needed per-map for a valid replay) |
 | `impossible_review_tmnf` | Impossible Review | Admin-only: cycles only through maps flagged via `/imp`, for manual review - no auto-skip |
 
+The TMUF server (`Game = "TMUF"`) only offers the `*_tmuf` presets: the same set (without `impossible_review`), plus one 100% TMX preset per environment - `100tmx_tmuf_snow`, `_desert`, `_rally`, `_island`, `_coast`, `_bay` and `_stadium` (TMX `environment` filter, 0-based: 0=Snow ... 6=Stadium). `100tmx_tmuf` itself draws from all environments.
+
 To create a new preset, add a `<name>.toml` file to the `Presets` folder (see `Presets/100tmx_tmnf.toml` for an example). TMX genre filters use the `tag` query parameter (the `Tags` array on a track, e.g. `tag = "6,1"` for LOL or Stunt) - not `primarytype`, which 404s on `/trackrandom` for any nonzero value despite being a documented field. See the comments in any bundled preset for the full list of known-good tag/difficulty values.
 
 ## Command line usage
@@ -158,6 +160,7 @@ Beyond the game/server basics, `config.toml` (see `config.default.toml` for the 
 | `ConnectionUploadRate` | The dedicated server's total upload budget in kbit/s, written into `dedicated_cfg.txt` at every start. Every joining player downloads the random map through it. `0` (default) leaves the file alone - TMF's template ships `512`, about 64 KB/s for everybody together. |
 | `DisableVerboseRpc` | `true` stops starting the dedicated server with `/verbose_rpc`. Leave it off: the ConsoleLog's per-call lines are the only record of whether a call reached the server. |
 | `KeepConsoleLogs` | How many of the dedicated server's `ConsoleLog.<pid>.txt` files (one per start) to keep. Default `30`. |
+| `LeaderboardFile` | Path of the leaderboard file. Empty (default) = `leaderboard.json` next to the program. Servers on one machine that point at the same file share one leaderboard: every finish is counted under a lock on the freshly read file, and each server re-reads the file when the other one changed it. The TMUF server uses the TMNF server's file. |
 | `SourceFromImpossibleList` (preset-only) | When `true` on a preset, that preset cycles only through maps already flagged impossible, instead of querying TMX - used by the bundled `impossible_review_tmnf` preset. |
 
 ## In-game chat commands
@@ -172,12 +175,13 @@ Beyond the game/server basics, `config.toml` (see `config.default.toml` for the 
 | `/rounds` | Switches the current map to Rounds mode if it's a genuine multilap challenge, so a full finish produces a TMX-valid replay. Reverts to TimeAttack automatically once the map ends. Once per map, and not while the next map is already loading. |
 | `/top` | Shows the top finishers on this server. |
 | `/rank` | Shows your own rank and finish count. |
+| `/afk` | Puts you into spectator mode and frees your player slot; `/afk` again puts you back into the race (if a slot is free). |
 | `/map` | Shows the current map's TMX link. `/map -1`, `/map -2`, ... shows a past map (see `/history`). |
 | `/history` | Lists the last few maps and what `-1`, `-2`, ... refer to for `/map`, `/imp`, `/hard`. |
 | `/timelimit`, `/tl <seconds>` | Shows or sets the session time limit (only while no session is active). |
 | `/preset <name>` | Applies a bundled preset by name directly (admin only if `AdminLogins` is set; only while no session is active). |
 | `/presets` | Lists all available presets, and opens a clickable widget to vote for one. |
-| `/votepreset <name>` | Starts a vote to switch preset; other players support it with `/yes` (or the Yes/No widget) within the vote window. |
+| `/votepreset <name>` | Starts a vote to switch preset; other players support it with `/yes` (or the Yes/No widget) within the vote window. Without a name it opens the clickable preset list, like `/presets`. |
 | `/loadmap <TMX id>` | Loads a specific TMX map by id directly, no vote (admin only if `AdminLogins` is set). |
 | `/blockmap [-1..-10]` | Adds the current (or a past) map to this server's own skip list (`skipped-maps.json`) and skips it now. For maps that can't be played here, e.g. built with blocks the game doesn't have. Permanent, local to the server, never sent to Discord or the shared sheet (admin only if `AdminLogins` is set). |
 | `/votemap <TMX id>` | Starts a vote to load a specific TMX map by id - shows its name, author, difficulty, awards, author time, and style tags in chat and a clickable widget; other players support it with `/yes` within the vote window. Finishes on a map loaded this way (or with `/loadmap`) don't count for the leaderboard. |
