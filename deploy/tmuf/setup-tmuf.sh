@@ -31,6 +31,7 @@ rsync -a \
   --exclude '/Servers/' --exclude '/WebStatus/' --exclude '/config.toml' \
   --exclude '/leaderboard.json' --exclude '/skipped-maps.json' --exclude '/impossible-maps.json' \
   --exclude '/CANNOT_SEE_SERVER.txt' --exclude '/played-maps.json' --exclude '/MapCache/' \
+  --exclude '/*.bak' --exclude '/*.bak-*' --exclude '/*.tmp' \
   "$SRC/" "$DST/"
 cp "$SRC/WebStatus/discord.png" "$SRC/WebStatus/favorite.png" "$DST/WebStatus/"
 
@@ -55,8 +56,11 @@ cat <<EOF
 Done. The TMUF server is prepared but NOT running.
 
 Last steps:
-  1. Open the Hetzner firewall for the TMUF server (only if you use one):
-       TCP + UDP 2351,  TCP + UDP 3451,  TCP 8091
+  1. Open the firewall for the TMUF server: TCP + UDP 2351,  TCP + UDP 3451,  TCP 8091
+     - Oracle Cloud: ingress rules in the instance's VCN security list
+     - on the box itself (Oracle images REJECT everything else in INPUT):
+       iptables -I INPUT <line of the REJECT rule> -p udp --dport 2351 -j ACCEPT  (etc.),
+       then netfilter-persistent save
   2. Fill in the TMUF server account:
        nano $DST/config.toml        (ServerLogin, ServerPassword, ServerValidationKey)
   3. Start it:
