@@ -19,6 +19,8 @@ TimeLimit = 0
 Preset = ""
 
 ServerName = "100% TMX Project (ESWC)"
+# In the server list, with format codes. The 2006 server keeps only 25 characters, codes included.
+ServerDisplayName = '$s$0BF100% TMX $F80ESWC'
 ServerComment = "100% TMX RMC (ESWC) - random maps, first to finish wins. Type /info in chat."
 GameSettings = "MatchSettings/Randomizer.txt"
 

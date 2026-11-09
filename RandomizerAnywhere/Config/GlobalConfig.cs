@@ -14,6 +14,11 @@ internal sealed class GlobalConfig
     public string Preset { get; set; } = string.Empty;
 
     public string ServerName { get; set; } = string.Empty;
+
+    // The name shown in the game's server list, with TM format codes ($0BF, $s, ...). Optional:
+    // empty = ServerName. ServerName itself stays plain text - it is also the replay folder (the
+    // download links point into it) and what status.json / the website show.
+    public string ServerDisplayName { get; set; } = string.Empty;
     public string ServerComment { get; set; } = string.Empty;
     public string WelcomeMessage { get; set; } = string.Empty;
 
