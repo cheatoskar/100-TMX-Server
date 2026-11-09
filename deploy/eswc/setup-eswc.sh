@@ -8,8 +8,8 @@
 #   1. creates the system user tmxeswc (no login, no shell) - unlike TMNF/TMUF, this server does
 #      NOT run as root: it is 2006 network code without updates, facing the internet
 #   2. copies the application build (not the TMNF data) into /opt/randomizer-anywhere-eswc/publish
-#   3. writes that folder's config.toml from config.toml next to this script, copying AdminLogins,
-#      PublicHost and the Discord webhooks over from the TMNF config, and generates the password
+#   3. writes that folder's config.toml from config.toml next to this script, copying PublicHost
+#      and the Discord webhooks (NOT AdminLogins - see config.toml) from the TMNF config, and generates the password
 #      of the master server account (the master server creates the account on the first start)
 #   4. installs the systemd unit 100tmx-eswc (not enabled, not started)
 #   5. opens the firewall on the box itself (iptables) for 2352/3452 (TCP+UDP) and 8092 (TCP)
@@ -46,7 +46,7 @@ cp "$SRC/WebStatus/discord.png" "$SRC/WebStatus/favorite.png" "$DST/WebStatus/" 
 
 echo "3/5 writing config.toml..."
 cp "$HERE/config.toml" "$DST/config.toml"
-for key in AdminLogins PublicHost DiscordWebhookUrl DiscordWebhookUrlHard; do
+for key in PublicHost DiscordWebhookUrl DiscordWebhookUrlHard; do
   line="$(grep -E "^$key *=" "$SRC/config.toml" | head -1 || true)"
   if [ -n "$line" ]; then
     # replace the placeholder line; '|' as sed delimiter, escape & and \ in the copied value
@@ -97,9 +97,10 @@ Last steps:
   1. Oracle Cloud console: add ingress rules to the instance's VCN security list
        TCP + UDP 2352,  TCP + UDP 3452,  TCP 8092   (source 0.0.0.0/0)
      XML-RPC 5002 stays closed - it is only for the controller on this box.
-  2. Start it:
+  2. Put the admins' ESWC logins into AdminLogins (nano $DST/config.toml) - until then nobody is admin.
+  3. Start it:
        systemctl enable --now 100tmx-eswc
-  3. Watch it come up (first start downloads the 2006 server, ~8 MB, and checks its SHA-256):
+  4. Watch it come up (first start downloads the 2006 server, ~8 MB, and checks its SHA-256):
        journalctl -u 100tmx-eswc -f
      and the game server's own log for the master server login:
        ls -t $DST/Servers/TM/TmDedicatedServer/Logs/ | head -1

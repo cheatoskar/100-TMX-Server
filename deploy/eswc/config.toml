@@ -1,8 +1,8 @@
 # Config for the TrackMania Nations ESWC server (third instance, next to TMNF and TMUF).
 # Runs the 2006 TM dedicated server, so players join with the OLD game (TmNationsESWC), not TMNF.
 # setup-eswc.sh installs this as /opt/randomizer-anywhere-eswc/publish/config.toml, copies
-# AdminLogins, PublicHost and the Discord webhooks over from the TMNF server's config and generates
-# ServerPassword. Nothing has to be filled in by hand.
+# PublicHost and the Discord webhooks over from the TMNF server's config and generates
+# ServerPassword. Only AdminLogins has to be filled in by hand (see there).
 #
 # What the old server cannot do (see AppConfig.IsLegacyServer): no widgets or clickable menus (all
 # info goes to the chat), no /afk, no checkpoint counter. Finishes are polled from the ranking
@@ -24,9 +24,11 @@ GameSettings = "MatchSettings/Randomizer.txt"
 
 AutoStart = true
 
-# copied from the TMNF server's config by setup-eswc.sh. TMN ESWC logins are separate accounts
-# from TMF ones - add the admins' ESWC logins here once they are known.
-AdminLogins = ""
+# NOT copied from the TMNF server: ESWC accounts live on a different (old) master server, so a
+# TMF admin's login name can belong to anybody there - copying the list would hand admin rights to
+# whoever registers that name. Empty would make EVERYONE admin. "-" matches nobody: no admins
+# until the real ESWC logins are put here (comma-separated), then restart the service.
+AdminLogins = "-"
 
 # the status page / replay download port (TMNF 8090, TMUF 8091)
 ReplayServerPort = 8092
