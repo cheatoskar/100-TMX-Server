@@ -77,6 +77,41 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
         }
     }
 
+    // For a call made every second (the old TM server's finish poll): same timeout, but a successful
+    // call is not recorded. Otherwise the 400-line flight recorder would hold nothing but this poll
+    // and lose the history a stall report needs. Slow or failed calls are still recorded.
+    public async Task<T> PollCallAsync<T>(string method, object[] parameters, CancellationToken cancellationToken = default)
+    {
+        var startedAt = Stopwatch.GetTimestamp();
+
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(RpcTimeout);
+
+            try
+            {
+                var result = await Raw.CallAsync<T>(method, parameters, timeout.Token);
+
+                if (Stopwatch.GetElapsedTime(startedAt) >= SlowRpcThreshold)
+                {
+                    LogRpcFinished(method, startedAt, error: null);
+                }
+
+                return result;
+            }
+            catch (OperationCanceledException) when (timeout.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                throw new TimeoutException($"{method} got no reply within {RpcTimeout.TotalSeconds:0}s");
+            }
+        }
+        catch (Exception ex)
+        {
+            LogRpcFinished(method, startedAt, ex);
+            throw;
+        }
+    }
+
     public async Task<object?> TracedCallAsync(string method, object[] parameters, CancellationToken cancellationToken = default)
     {
         var startedAt = Stopwatch.GetTimestamp();
@@ -344,18 +379,42 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
         return ToChallengeSummary(mapInfo);
     }
 
+    // Whether the connected dedicated server knows this XML-RPC method (system.listMethods at connect).
+    // The 2006 TM server (ESWC) lacks manialinks, ghost replays, ForceSpectator and more.
+    public bool Supports(string method) => SupportedMethods.Contains(method);
+
+    // Manialinks (widgets, menus, popups) only exist from TMF on. On the old TM server every widget
+    // call is a silent no-op, so the game logic around them needs no special case; everything a
+    // player must know also goes to the chat.
+    public bool SupportsManialinks => Supports("SendDisplayManialinkPage");
+
     public async Task SendManialinkPageAsync(string manialink, int timeoutSeconds = 0, bool hideOnClick = false, CancellationToken cancellationToken = default)
     {
+        if (!SupportsManialinks)
+        {
+            return;
+        }
+
         await TracedCallAsync("SendDisplayManialinkPage", [manialink, timeoutSeconds, hideOnClick], cancellationToken);
     }
 
     public async Task SendManialinkPageToLoginAsync(string login, string manialink, int timeoutSeconds = 0, bool hideOnClick = false, CancellationToken cancellationToken = default)
     {
+        if (!SupportsManialinks)
+        {
+            return;
+        }
+
         await TracedCallAsync("SendDisplayManialinkPageToLogin", [login, manialink, timeoutSeconds, hideOnClick], cancellationToken);
     }
 
     public async Task HideAllManialinksAsync(CancellationToken cancellationToken = default)
     {
+        if (!SupportsManialinks)
+        {
+            return;
+        }
+
         await TracedCallAsync("SendHideManialinkPage", [], cancellationToken);
     }
 

@@ -146,6 +146,20 @@ internal sealed partial class ServerSetup
                     await DownloadWithProgressAsync(response.Content, fileStream, bodyBudget.Token);
                 }
 
+                if (config.DownloadSha256.TryGetValue(game, out var expectedHash))
+                {
+                    string actualHash;
+                    await using (var check = File.OpenRead(tempZipPath))
+                    {
+                        actualHash = Convert.ToHexStringLower(await System.Security.Cryptography.SHA256.HashDataAsync(check, cancellationToken));
+                    }
+
+                    if (actualHash != expectedHash)
+                    {
+                        throw new ConfigException($"the {game} server download from {downloadUrl} has SHA-256 {actualHash}, but [DownloadSha256] expects {expectedHash}. Not installed - the file changed on its host.");
+                    }
+                }
+
                 await ZipFile.ExtractToDirectoryAsync(tempZipPath, serverDir, overwriteFiles: true, cancellationToken);
             }
             finally
@@ -187,11 +201,18 @@ internal sealed partial class ServerSetup
             contents = ServerP2PPortRegex().Replace(contents, _ => $"<server_p2p_port>{config.ServerP2PPort}</server_p2p_port>");
         }
 
-        if (game == DedicatedServerType.TMF)
+        // Both server generations take the account from <masterserver_account>; the old TM server
+        // has <nation> where TMF has <validation_key>. For TM Nations the master server creates the
+        // account on the first online start, given login, password and a valid nation.
         {
             contents = MasterServerAccountRegex().Replace(contents, block =>
             {
                 var text = block.Value;
+
+                if (game == DedicatedServerType.TM && !string.IsNullOrWhiteSpace(config.ServerNation))
+                {
+                    text = NationTagRegex().Replace(text, _ => $"<nation>{System.Security.SecurityElement.Escape(config.ServerNation)}</nation>");
+                }
 
                 if (!string.IsNullOrWhiteSpace(config.ServerLogin))
                 {
@@ -218,6 +239,28 @@ internal sealed partial class ServerSetup
         if (game == DedicatedServerType.TMF && config.ConnectionUploadRate > 0)
         {
             contents = UploadRateRegex().Replace(contents, _ => $"<connection_uploadrate>{config.ConnectionUploadRate}</connection_uploadrate>");
+        }
+
+        if (game == DedicatedServerType.TM)
+        {
+            // The ladder's anti-cheat bans for "time incoherence" on legitimate RPG/trial finishes
+            // (seen on TMF 2026-09-03, where ladder_mode is inactive since). Same here from the start.
+            contents = LadderModeRegex().Replace(contents, "<ladder_mode>inactive</ladder_mode>");
+
+            // the 2006 server only knows connection_type presets, no upload rate in kbit/s
+            contents = ConnectionTypeRegex().Replace(contents, "<connection_type>DSL_16384_4096</connection_type>");
+
+            // never reachable from outside: the controller logs in with the default SuperAdmin password
+            contents = XmlRpcAllowRemoteRegex().Replace(contents, "<xmlrpc_allowremote>False</xmlrpc_allowremote>");
+
+            // The 2006 server ignores /servername on the command line and refuses to start a game
+            // without a name ("Server not started: no ServerName specified"), so it goes in the file.
+            // Only inside <server_options>: the authorization levels have <name> tags too.
+            contents = ServerOptionsRegex().Replace(contents, block =>
+            {
+                var text = ServerOptionNameRegex().Replace(block.Value, _ => $"<name>{System.Security.SecurityElement.Escape(config.ServerName)}</name>", 1);
+                return ServerOptionCommentRegex().Replace(text, _ => $"<comment>{System.Security.SecurityElement.Escape(config.ServerComment)}</comment>", 1);
+            });
         }
 
         // atomic: a truncated dedicated_cfg.txt is never repaired (the zip cache says "unchanged")
@@ -485,6 +528,19 @@ internal sealed partial class ServerSetup
 
             serverProcess.StartInfo.ArgumentList.Add($"/game={gameId}");
             serverProcess.StartInfo.ArgumentList.Add("/dedicated_cfg=dedicated.cfg");
+
+            // Unlike TMF, the 2006 server stays on the LAN unless told to go online.
+            if (!config.Lan)
+            {
+                serverProcess.StartInfo.ArgumentList.Add("/internet");
+            }
+
+            // On Linux it forks into the background by default: the process we started would exit
+            // at once, and with it our PID, the CPU numbers and the stop on shutdown.
+            if (!OperatingSystem.IsWindows())
+            {
+                serverProcess.StartInfo.ArgumentList.Add("/nodaemon");
+            }
         }
         else
         {
@@ -621,6 +677,27 @@ internal sealed partial class ServerSetup
 
     [GeneratedRegex(@"<validation_key>.*?<\/validation_key>", RegexOptions.IgnoreCase | RegexOptions.Singleline)]
     private static partial Regex ValidationKeyTagRegex();
+
+    [GeneratedRegex(@"<nation>.*?<\/nation>", RegexOptions.IgnoreCase | RegexOptions.Singleline)]
+    private static partial Regex NationTagRegex();
+
+    [GeneratedRegex(@"<server_options>.*?<\/server_options>", RegexOptions.IgnoreCase | RegexOptions.Singleline)]
+    private static partial Regex ServerOptionsRegex();
+
+    [GeneratedRegex(@"<name>.*?<\/name>", RegexOptions.IgnoreCase | RegexOptions.Singleline)]
+    private static partial Regex ServerOptionNameRegex();
+
+    [GeneratedRegex(@"<comment>.*?<\/comment>", RegexOptions.IgnoreCase | RegexOptions.Singleline)]
+    private static partial Regex ServerOptionCommentRegex();
+
+    [GeneratedRegex(@"<ladder_mode>.*?<\/ladder_mode>", RegexOptions.IgnoreCase)]
+    private static partial Regex LadderModeRegex();
+
+    [GeneratedRegex(@"<connection_type>.*?<\/connection_type>", RegexOptions.IgnoreCase)]
+    private static partial Regex ConnectionTypeRegex();
+
+    [GeneratedRegex(@"<xmlrpc_allowremote>.*?<\/xmlrpc_allowremote>", RegexOptions.IgnoreCase)]
+    private static partial Regex XmlRpcAllowRemoteRegex();
 
     [GeneratedRegex(@"<packmask>(.*?)<\/packmask>", RegexOptions.IgnoreCase)]
     private static partial Regex PackmaskRegex();

@@ -1,0 +1,33 @@
+[Unit]
+Description=100%% TMX Project (ESWC) - RandomizerAnywhere, TM Nations ESWC dedicated server (2006)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/randomizer-anywhere-eswc/publish
+# Refuse to start without the account values, so an early "enable --now" cannot hammer the master
+# server with an empty login in a restart loop.
+ExecStartPre=/bin/sh -c 'grep -Eq "^ServerLogin *= *\\".+\\"" config.toml && grep -Eq "^ServerPassword *= *\\".+\\"" config.toml'
+ExecStart=/usr/share/dotnet/dotnet /opt/randomizer-anywhere-eswc/publish/RandomizerAnywhere.dll --dedicated
+OOMScoreAdjust=-200
+Restart=always
+RestartSec=5
+# a broken config (exit 78) is not fixed by restarting; no core dumps (see game-service-hardening.conf)
+RestartPreventExitStatus=78
+LimitCORE=0
+Environment=DOTNET_ROOT=/usr/share/dotnet
+# below TMNF (1000) and TMUF (500): the newest and smallest server yields first when the box is busy
+CPUWeight=300
+IOWeight=300
+MemoryLow=134217728
+# The 2006 game server is network code without a single update in 20 years, facing the internet.
+# Keep what it can reach on this box small: no new privileges, a read-only system, its own /tmp.
+NoNewPrivileges=yes
+ProtectSystem=full
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target
