@@ -1,0 +1,76 @@
+# Config for the TrackMania Nations ESWC server (third instance, next to TMNF and TMUF).
+# Runs the 2006 TM dedicated server, so players join with the OLD game (TmNationsESWC), not TMNF.
+# setup-eswc.sh installs this as /opt/randomizer-anywhere-eswc/publish/config.toml, copies
+# AdminLogins, PublicHost and the Discord webhooks over from the TMNF server's config and generates
+# ServerPassword. Nothing has to be filled in by hand.
+#
+# What the old server cannot do (see AppConfig.IsLegacyServer): no widgets or clickable menus (all
+# info goes to the chat), no /afk, no checkpoint counter. Finishes are polled from the ranking
+# once a second because it sends no PlayerFinish callback. Replays come from GetValidationReplay.
+
+Game = "TMN"
+TmxGame = "TMN"
+BindIP = ""
+XmlRpcPort = 5002
+AutoSkipMode = "Finished"
+TimeLimit = 0
+
+# no preset: the TMNF/TMUF presets are for those games; TMN draws from nations.tm-exchange.com
+Preset = ""
+
+ServerName = "100% TMX Project (ESWC)"
+ServerComment = "100% TMX RMC (ESWC) - random maps, first to finish wins. Type /info in chat."
+GameSettings = "MatchSettings/Randomizer.txt"
+
+AutoStart = true
+
+# copied from the TMNF server's config by setup-eswc.sh. TMN ESWC logins are separate accounts
+# from TMF ones - add the admins' ESWC logins here once they are known.
+AdminLogins = ""
+
+# the status page / replay download port (TMNF 8090, TMUF 8091)
+ReplayServerPort = 8092
+
+# copied from the TMNF server's config by setup-eswc.sh
+PublicHost = ""
+
+Lan = false
+
+# copied from the TMNF server's config by setup-eswc.sh. Reports from this server are tagged "[TMN]".
+DiscordWebhookUrl = ""
+DiscordWebhookUrlHard = ""
+
+# The finish poll asks the server twice a second-ish; with /verbose_rpc on, the old server would
+# write every one of those requests into its ConsoleLog (~10 MB a day).
+DisableVerboseRpc = true
+
+WelcomeMessage = '''
+Built on $FF0Randomizer Anywhere$FF0 (modified) - type $FF0/source$FF0 for the code.
+$FF0Welcome to $s$0BF100% TMX $FF8Project $F80ESWC$FF0!
+Type $FF0/info$FF0 to see what this server can do.
+'''
+
+# --- this server's own ports (TMNF 2350/3450/5000, TMUF 2351/3451/5001) ---
+ServerPort = 2352
+ServerP2PPort = 3452
+
+# --- the master server account ---
+# For TM Nations the master server CREATES this account on the first online start (login,
+# password and a valid nation). setup-eswc.sh generates the password; keep this file, it is the
+# only copy - the account can't be recovered without it.
+ServerLogin = "100tmx_eswc"
+ServerPassword = ""
+ServerNation = "GER"
+
+[DownloadUrls]
+TMF = "http://files2.trackmaniaforever.com/TrackmaniaServer_2011-02-21.zip"
+TM = "http://slig.free.fr/TM/dedicated/TmDedicatedServer_2006-05-30.zip"
+
+# The zip comes over plain HTTP from a private host and is then run - only this exact file is
+# accepted (identical to the Internet Archive copy from 2017, checked 2026-11-09).
+[DownloadSha256]
+TM = "28d79550fdd18623c47d3a428af5ce8e150402b8c4c5fa0b45d3efa4e6bf783d"
+
+[TmxQuery]
+inhasrecord = 0
+inunlimiter = 0

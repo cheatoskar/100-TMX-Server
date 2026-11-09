@@ -135,6 +135,14 @@ catch (Exception) when (cts.IsCancellationRequested)
     // anything else became an unhandled exception and a core dump on a plain stop.
     return 0;
 }
+catch (ConfigException ex)
+{
+    // e.g. a downloaded server zip whose checksum does not match [DownloadSha256]: downloading the
+    // same file again every 5 seconds won't change it
+    Console.WriteLine($"ERROR: {ex.Message}");
+    Console.WriteLine("Fix the configuration and start again - restarting won't help until then.");
+    return ExitConfigError;
+}
 catch (Exception ex)
 {
     // One readable line instead of an unhandled-exception abort and a core dump; systemd
@@ -240,6 +248,10 @@ internal partial class AppServiceProvider
                 .ToDictionary(
                     x => Enum.Parse<DedicatedServerType>(x.Key, ignoreCase: true),
                     x => x.Value),
+            DownloadSha256 = globalConfig.DownloadSha256
+                .ToDictionary(
+                    x => Enum.Parse<DedicatedServerType>(x.Key, ignoreCase: true),
+                    x => x.Value.Trim().ToLowerInvariant()),
             TmxQuery = globalConfig.TmxQuery,
             TmxQueryOverride = cmdConfig.TmxQuery,
             DedicatedServerMode = Configurator.GetBool(cfgValue: null, cmdConfig.DedicatedServerMode, "RANDANY_DEDICATED"),
@@ -262,6 +274,7 @@ internal partial class AppServiceProvider
             ServerLogin = Configurator.GetString(globalConfig.ServerLogin, cmdValue: null, "RANDANY_SERVER_LOGIN"),
             ServerPassword = Configurator.GetString(globalConfig.ServerPassword, cmdValue: null, "RANDANY_SERVER_PASSWORD"),
             ServerValidationKey = Configurator.GetString(globalConfig.ServerValidationKey, cmdValue: null, "RANDANY_SERVER_VALIDATION_KEY"),
+            ServerNation = Configurator.GetString(globalConfig.ServerNation, cmdValue: null, "RANDANY_SERVER_NATION"),
             LeaderboardFile = Configurator.GetString(globalConfig.LeaderboardFile, cmdValue: null, "RANDANY_LEADERBOARD_FILE"),
             DiscordWebhookUrl = Configurator.GetString(globalConfig.DiscordWebhookUrl, cmdValue: null, "RANDANY_DISCORD_WEBHOOK_URL"),
             DiscordWebhookUrlHard = Configurator.GetString(globalConfig.DiscordWebhookUrlHard, cmdValue: null, "RANDANY_DISCORD_WEBHOOK_URL_HARD"),

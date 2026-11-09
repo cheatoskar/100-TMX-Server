@@ -48,7 +48,11 @@ internal sealed class RandomizerSetup
 
         await client.TracedCallAsync("SetTimeAttackLimit", [0], cancellationToken);
         await client.TracedCallAsync("SetChatTime", [0], cancellationToken);
-        await client.TracedCallAsync("AutoSaveValidationReplays", [true], cancellationToken);
+        // TMF only; the old TM server hands out a player's best run with GetValidationReplay instead
+        if (client.Supports("AutoSaveValidationReplays"))
+        {
+            await client.TracedCallAsync("AutoSaveValidationReplays", [true], cancellationToken);
+        }
 
         if (!config.DedicatedServerMode)
         {

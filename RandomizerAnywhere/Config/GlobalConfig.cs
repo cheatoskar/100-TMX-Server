@@ -32,6 +32,10 @@ internal sealed class GlobalConfig
     public string ServerPassword { get; set; } = string.Empty;
     public string ServerValidationKey { get; set; } = string.Empty;
 
+    // Old TM server (ESWC/Sunrise/Original) only: the nation its master server account is
+    // registered under. For Nations the account is created on the first online start.
+    public string ServerNation { get; set; } = string.Empty;
+
     // Path of the leaderboard file. Empty = leaderboard.json next to the program. Two servers that
     // point at the same file share one leaderboard (writes are locked across processes).
     public string LeaderboardFile { get; set; } = string.Empty;
@@ -52,5 +56,9 @@ internal sealed class GlobalConfig
     public int KeepConsoleLogs { get; set; }
 
     public Dictionary<string, string> DownloadUrls { get; set; } = [];
+
+    // Optional SHA-256 of the server zip per server type. The 2006 TM server comes over plain HTTP
+    // from a private host and is then executed; with a hash set, a changed file is refused.
+    public Dictionary<string, string> DownloadSha256 { get; set; } = [];
     public Dictionary<string, object> TmxQuery { get; set; } = [];
 }

@@ -8,7 +8,7 @@
 # <user> can be root, or any user with passwordless sudo (e.g. `ubuntu` on an Oracle/cloud image,
 # where root login is disabled) - the server-side steps then run through `sudo -n`.
 #
-# For every server instance that exists on the machine (TMNF, and TMUF once it is set up) it:
+# For every server instance that exists on the machine (TMNF, TMUF and ESWC once set up) it:
 #   - uploads the WHOLE build (program files, presets, web assets - not just the .dll) to a
 #     staging folder first; nothing live is changed yet
 #   - waits until THAT instance has had no players for 2 minutes in a row
@@ -62,6 +62,7 @@ EXCLUDES=(
 INSTANCES=(
   "tmnf|/opt/randomizer-anywhere/publish|100tmx|8090"
   "tmuf|/opt/randomizer-anywhere-tmuf/publish|100tmx-tmuf|8091"
+  "eswc|/opt/randomizer-anywhere-eswc/publish|100tmx-eswc|8092"
 )
 
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 $HOST"

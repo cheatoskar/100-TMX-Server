@@ -10,6 +10,7 @@ internal sealed class AppConfig
     public required IPAddress? BindIP { get; init; }
     public required ushort XmlRpcPort { get; init; }
     public required Dictionary<DedicatedServerType, string> DownloadUrls { get; init; }
+    public Dictionary<DedicatedServerType, string> DownloadSha256 { get; init; } = [];
     public required IReadOnlyDictionary<string, object> TmxQuery { get; set; }
     public required string? TmxQueryOverride { get; set; }
     public required bool DedicatedServerMode { get; init; }
@@ -32,6 +33,12 @@ internal sealed class AppConfig
     public required string ServerLogin { get; init; }
     public required string ServerPassword { get; init; }
     public required string ServerValidationKey { get; init; }
+    public string ServerNation { get; init; } = string.Empty;
+
+    // The 2006 TM dedicated server (ESWC, Sunrise, Original) rather than TMF. It has no manialinks,
+    // no server-saved ghost replays and only a handful of callbacks - no PlayerFinish, PlayerCheckpoint
+    // or StatusChanged - so finishes are polled from the ranking instead (see RandomizerGame).
+    public bool IsLegacyServer => Game is GameTitle.TMN or GameTitle.TMS or GameTitle.TMO;
 
     // leaderboard.json to use; empty = the one next to the program. The TMUF server points this at
     // the TMNF server's file, so both servers count into one leaderboard (see Leaderboard).

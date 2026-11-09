@@ -403,8 +403,10 @@ internal sealed partial class RandomizerGame
         get
         {
             // Someone set or improved a time - the server says so - but no callback has arrived
-            // since. Nothing legitimate does that.
-            if (lastRacingProgressAt is { } racingAt && racingAt - client.LastCallbackAt > CallbackRacingGracePeriod)
+            // since. Nothing legitimate does that - except on the old TM server, which has no
+            // finish or checkpoint callback at all; there only the map-name witness below applies.
+            if (!config.IsLegacyServer
+                && lastRacingProgressAt is { } racingAt && racingAt - client.LastCallbackAt > CallbackRacingGracePeriod)
             {
                 return false;
             }
@@ -795,20 +797,7 @@ internal sealed partial class RandomizerGame
         {
             try
             {
-                var statusCode = (TrackManiaStatusCode)(int)methodParams[0];
-
-                if (SessionActive)
-                {
-                    switch (statusCode)
-                    {
-                        case TrackManiaStatusCode.Play:
-                            sessionStopwatch?.Start();
-                            break;
-                        case TrackManiaStatusCode.Finish:
-                            await FinishMapAsync(cancellationToken);
-                            break;
-                    }
-                }
+                await OnStatusChangedAsync((TrackManiaStatusCode)(int)methodParams[0], cancellationToken);
             }
             catch (Exception ex)
             {
@@ -911,6 +900,140 @@ internal sealed partial class RandomizerGame
         }
     }
 
+    // From the StatusChanged callback on TMF, from the status poll on the old TM server.
+    private async Task OnStatusChangedAsync(TrackManiaStatusCode statusCode, CancellationToken cancellationToken)
+    {
+        if (!SessionActive)
+        {
+            return;
+        }
+
+        switch (statusCode)
+        {
+            case TrackManiaStatusCode.Play:
+                sessionStopwatch?.Start();
+                break;
+            case TrackManiaStatusCode.Finish:
+                await FinishMapAsync(cancellationToken);
+                break;
+        }
+    }
+
+    // ---- old TM server (ESWC): finishes and status changes by polling ----
+    //
+    // The 2006 server sends BeginRace, EndRace, PlayerConnect/Disconnect and PlayerChat, but no
+    // PlayerFinish, PlayerCheckpoint or StatusChanged. The ranking it keeps for the running race
+    // has every player's best time, though, and a best time only ever changes when the player
+    // finishes faster (or goes back to 0 when the race restarts). So a best time that is positive
+    // and different from the last poll IS a finish, and it goes through the same OnPlayerFinish as
+    // a TMF callback. A finish slower than the player's own best goes unseen - harmless, the first
+    // qualifying finish of the map is what counts. The server status is polled the same way.
+    private static readonly TimeSpan LegacyPollInterval = TimeSpan.FromSeconds(1);
+
+    private async Task LegacyPollLoopAsync(CancellationToken cancellationToken)
+    {
+        var bestTimes = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var polledGeneration = -1;
+        TrackManiaStatusCode? lastStatus = null;
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            await Task.Delay(LegacyPollInterval, cancellationToken);
+
+            if (reconnectInProgress || !client.IsConnected)
+            {
+                continue;
+            }
+
+            try
+            {
+                var generation = mapGeneration;
+                var finishes = new List<(int PlayerId, string Login, int Time)>();
+
+                // Nobody online, nobody finishing - the ranking waits (the status loop updates the
+                // count every 10s; nobody joins and finishes a map faster than that).
+                var ranking = lastOnlinePlayerCount > 0 || generation != polledGeneration
+                    ? await client.PollCallAsync<List<object>>("GetCurrentRanking", [200, 0], cancellationToken)
+                    : [];
+
+                // A new map: the first poll only takes note. It may still read the previous map's
+                // ranking (the reset lands a moment after BeginRace), and those times are no finishes.
+                // Nobody finishes a map within a second of it starting, so nothing real is lost.
+                var baselineOnly = generation != polledGeneration;
+
+                if (baselineOnly)
+                {
+                    bestTimes.Clear();
+                    polledGeneration = generation;
+                }
+
+                foreach (var entry in ranking.OfType<Dictionary<string, object>>())
+                {
+                    if (!entry.TryGetValue("Login", out var loginValue) || loginValue is not string { Length: > 0 } login
+                        || !entry.TryGetValue("BestTime", out var bestValue) || bestValue is not int best)
+                    {
+                        continue;
+                    }
+
+                    // Logins are never removed during a map: a player who leaves and comes back
+                    // keeps his best time, and that must not count as a second finish.
+                    var known = bestTimes.TryGetValue(login, out var previous);
+                    bestTimes[login] = best;
+
+                    if (!baselineOnly && best > 0 && (!known || best != previous))
+                    {
+                        var playerId = entry.TryGetValue("PlayerId", out var idValue) && idValue is int id ? id : 0;
+                        finishes.Add((playerId, login, best));
+                    }
+                }
+
+                var status = await client.PollCallAsync<Dictionary<string, object>>("GetStatus", [], cancellationToken);
+                var statusCode = status.TryGetValue("Code", out var codeValue) && codeValue is int code ? (TrackManiaStatusCode)code : (TrackManiaStatusCode?)null;
+                var statusChanged = statusCode is not null && statusCode != lastStatus;
+                lastStatus = statusCode ?? lastStatus;
+
+                if (finishes.Count == 0 && !statusChanged)
+                {
+                    continue;
+                }
+
+                // the same lock a callback handler takes, so this can't run into a map switch
+                await RunUnderGameLockAsync("old-server finish/status poll", async token =>
+                {
+                    // the map changed while we waited for the lock - these finishes were on the old one
+                    if (mapGeneration != generation)
+                    {
+                        return;
+                    }
+
+                    foreach (var (playerId, login, time) in finishes)
+                    {
+                        Console.WriteLine($"Old-server poll: {login} finished in {time} ms.");
+
+                        try
+                        {
+                            await OnPlayerFinish(playerId, login, time, token);
+                        }
+                        catch (Exception ex) when (!token.IsCancellationRequested)
+                        {
+                            Console.WriteLine($"Warning: finish handling for {login} failed - {ex.Message}");
+                        }
+                    }
+
+                    if (statusChanged && statusCode is { } changedTo)
+                    {
+                        await OnStatusChangedAsync(changedTo, token);
+                    }
+                });
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                // a map change in progress, a reconnect - the next poll tries again
+                Diagnostics.Trace($"legacy poll failed: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+    }
+
     private async Task FinishMapAsync(CancellationToken cancellationToken)
     {
         // TODO: there should be some second tolerance
@@ -1003,6 +1126,12 @@ internal sealed partial class RandomizerGame
 
         _ = StatusWriteLoopAsync(cancellationToken);
         _ = StalledMapWatchLoopAsync(cancellationToken);
+
+        if (config.IsLegacyServer)
+        {
+            Console.WriteLine("Old TM server: finishes and status are polled every second (it has no PlayerFinish/StatusChanged callbacks); no widgets, menus or /afk.");
+            _ = LegacyPollLoopAsync(cancellationToken);
+        }
 
         if (config.AutoStart)
         {
@@ -2220,7 +2349,10 @@ internal sealed partial class RandomizerGame
         }
 
         await client.CallAsync("SetGameMode", [0], cancellationToken); // 0 = Rounds
-        await client.CallAsync("SetRoundForcedLaps", [0], cancellationToken); // 0 = use the map's own lap count
+        if (client.Supports("SetRoundForcedLaps")) // TMF only; the old TM server always uses the map's laps
+        {
+            await client.CallAsync("SetRoundForcedLaps", [0], cancellationToken); // 0 = use the map's own lap count
+        }
         roundsModeActive = true;
         await CallWithTransitionRetryAsync("ChallengeRestart", [], cancellationToken);
 
@@ -2287,6 +2419,12 @@ internal sealed partial class RandomizerGame
     // GameLog by 2026-11) and got no answer at all.
     private async Task AfkAsync(int playerUid, string login, string[] args, CancellationToken cancellationToken)
     {
+        if (!client.Supports("ForceSpectator"))
+        {
+            await SendMessageAsync(login, "$F80/afk isn't available on this server (the old game server can't move players to spectator) - use the game's own spectator button.", cancellationToken);
+            return;
+        }
+
         var info = await client.TracedCallAsync<Dictionary<string, object>>("GetDetailedPlayerInfo", [login], cancellationToken);
         var isSpectator = info.TryGetValue("IsSpectator", out var spec) && spec is bool b && b;
 
@@ -2686,6 +2824,12 @@ internal sealed partial class RandomizerGame
     // reports an empty CmdName when none is running.
     private async Task<bool> IsGameVoteRunningAsync(CancellationToken cancellationToken)
     {
+        // the old TM server can't be asked (it has CallVote, but no GetCurrentCallVote)
+        if (!client.Supports("GetCurrentCallVote"))
+        {
+            return false;
+        }
+
         try
         {
             var vote = await client.TracedCallAsync<Dictionary<string, object>>("GetCurrentCallVote", [], cancellationToken);
@@ -3121,7 +3265,20 @@ internal sealed partial class RandomizerGame
             var fileName = $"{SanitizeFileNamePart(login)}_{DateTimeOffset.UtcNow:yyyyMMdd-HHmmss}.Replay.Gbx";
             var relativeFileName = $"{config.ServerName}/{fileName}";
 
-            await client.CallAsync("SaveBestGhostsReplay", [login, relativeFileName], cancellationToken);
+            if (client.Supports("SaveBestGhostsReplay"))
+            {
+                await client.CallAsync("SaveBestGhostsReplay", [login, relativeFileName], cancellationToken);
+            }
+            else
+            {
+                // The old TM server can't save a replay itself, but hands out the validation replay of
+                // the player's best run; written to the same folder the replay page serves from.
+                var replay = await client.TracedCallAsync<byte[]>("GetValidationReplay", [login], cancellationToken);
+                var tracksDirectory = await client.TracedCallAsync<string>("GetTracksDirectory", [], cancellationToken);
+                var replayPath = Path.Combine(tracksDirectory, "Replays", config.ServerName, fileName);
+                Directory.CreateDirectory(Path.GetDirectoryName(replayPath)!);
+                await File.WriteAllBytesAsync(replayPath, replay, cancellationToken);
+            }
 
             var host = string.IsNullOrWhiteSpace(config.PublicHost) ? "localhost" : config.PublicHost;
             var url = $"http://{host}:{config.ReplayServerPort}/replays/{Uri.EscapeDataString(fileName)}";
