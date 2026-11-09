@@ -1849,13 +1849,23 @@ internal sealed partial class RandomizerGame
 
         var multiplePlayers = await client.IsMultiplePlayersAsync(cancellationToken);
 
-        if (!multiplePlayers)
+        // A listed admin skips straight away instead of opening a vote. Only an explicit entry
+        // counts: with an empty AdminLogins everyone may use the admin commands, and a vote-free
+        // /skip for everyone would make the vote pointless.
+        var adminSkip = multiplePlayers && config.AdminLogins.Contains(login);
+
+        if (adminSkip)
+        {
+            await SendMessageAsync($"$FF0Admin {GetNicknameOrLogin(login)}$FF0 skipped the map.", cancellationToken);
+        }
+        else if (!multiplePlayers)
         {
             await SendMessageAsync("Skipping the current challenge...", cancellationToken);
         }
 
-        // With 2+ players this opens a vote, and NextRandomMapAsync announces that itself.
-        await NextRandomMapAsync(goalReached: false, cancellationToken);
+        // With 2+ players this opens a vote (unless an admin skips), and NextRandomMapAsync
+        // announces that itself.
+        await NextRandomMapAsync(goalReached: false, cancellationToken, skipVote: adminSkip);
     }
 
     // args[0] == "-N" (N >= 1) refers to the Nth map before the current one (e.g. "/imp -1" for
@@ -2364,7 +2374,7 @@ internal sealed partial class RandomizerGame
     {
         await SendMessageAsync(login, [
             "$0BF--- 100% TMX Project ---",
-            "$FF0/skip$FFF - skip the current map (with several players online this starts a vote - press $0F0F5$FFF to agree)",
+            "$FF0/skip$FFF - skip the current map (with several players online this starts a vote - press $0F0F5$FFF to agree; an admin's /skip skips right away)",
             "$FF0/map$FFF (or $FF0/map -1$FFF, $FF0-2$FFF, ... for a past map) - show the map's TMX link",
             "$FF0/history$FFF - list recent maps and what $FF0-1$FFF, $FF0-2$FFF, ... refer to",
             "$FF0/rounds$FFF - switch a multilap map to Rounds mode for a valid replay (once per map)",
@@ -3106,6 +3116,30 @@ internal sealed partial class RandomizerGame
         await client.SendManialinkPageToLoginAsync(login, BuildPresetListManialink(rawPresetNames), cancellationToken: cancellationToken);
     }
 
+    // (login, time) of the finishes already handled on the map of handledFinishesGeneration.
+    private readonly HashSet<(string Login, int Time)> handledFinishes = [];
+    private int handledFinishesGeneration = -1;
+    private readonly object handledFinishesGate = new();
+
+    /// <summary>
+    /// False if this player's run with this time on the current map was already handled. A
+    /// genuinely new run with to-the-millisecond the same time is dropped too - harmless, since
+    /// the first one already got the credit, message and replay.
+    /// </summary>
+    private bool TryClaimFinish(string login, int time)
+    {
+        lock (handledFinishesGate)
+        {
+            if (handledFinishesGeneration != mapGeneration)
+            {
+                handledFinishes.Clear();
+                handledFinishesGeneration = mapGeneration;
+            }
+
+            return handledFinishes.Add((login.ToLowerInvariant(), time));
+        }
+    }
+
     public async Task OnPlayerFinish(int playerUid, string login, int score, CancellationToken cancellationToken)
     {
         if (!SessionActive)
@@ -3119,6 +3153,15 @@ internal sealed partial class RandomizerGame
         await EnsureCurrentMapStateAsync(cancellationToken);
 
         if (currentMap is null)
+        {
+            return;
+        }
+
+        // The old TM server does send TrackMania.PlayerFinish after all, and its finish poll sees
+        // the same run a moment later - every ESWC finish was announced, counted on the
+        // leaderboard and given a replay link twice (2026-11-09). One run is one finish, whichever
+        // path reports it first.
+        if (score > 0 && !TryClaimFinish(login, score))
         {
             return;
         }
@@ -3418,7 +3461,9 @@ internal sealed partial class RandomizerGame
     }
 
     // Returns false when it did nothing because a switch is already running or already asked for.
-    public async Task<bool> NextRandomMapAsync(bool goalReached, CancellationToken cancellationToken, bool ownsClaim = false)
+    // skipVote: switch right away even with several players (an admin's /skip) instead of
+    // opening TrackMania's vote.
+    public async Task<bool> NextRandomMapAsync(bool goalReached, CancellationToken cancellationToken, bool ownsClaim = false, bool skipVote = false)
     {
         // with multiple players, every finisher fires its own PlayerFinish -> NextRandomMapAsync
         // call; if one is already advancing the map, a second concurrent call must be a no-op,
@@ -3572,7 +3617,7 @@ internal sealed partial class RandomizerGame
                 roundsModeActive = false;
             }
 
-            if (await client.IsMultiplePlayersAsync(token) && (!goalReached || config.CallVoteOnFinish))
+            if (!skipVote && await client.IsMultiplePlayersAsync(token) && (!goalReached || config.CallVoteOnFinish))
             {
                 // TrackMania runs one vote at a time and refuses a second one ("Already waiting
                 // for a vote"), which players got back as "That command failed".
