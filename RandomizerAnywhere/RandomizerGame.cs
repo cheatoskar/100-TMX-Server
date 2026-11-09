@@ -3310,13 +3310,13 @@ internal sealed partial class RandomizerGame
 
             if (!client.Supports("SaveBestGhostsReplay"))
             {
-                // The old TM server can't save a replay. What GetValidationReplay hands out is only the
-                // run's validation data - a file with no header (no map, time or validable flag) that
-                // TMX can't read. And on 2026-11-09 every replay the players saved themselves on this
-                // server came out validable=0, while their saves from other ESWC servers were
-                // validable=1; the call fetches the run's data from the player's game right before it
-                // saves, so it is not made at all any more. The player's own save is the replay.
-                await SendMessageAsync(login, "$FF0For TMX: save this run in game - $FFFEsc > Save previous replay$FF0 (this server can't send you a replay file).", cancellationToken);
+                // The old TM server can't save a replay; GetValidationReplay only hands out headerless
+                // validation data TMX can't read. And a replay saved in game after an online race holds
+                // every participant as a ghost (on a dedicated server even the server account), so the
+                // game marks it validable=0 (reverse-engineered 2026-11-09: validable = exactly one
+                // ghost + inputs). The eswc-autosave mod (v1.1.0+) writes a "... TMX.Replay.Gbx" copy
+                // with only the player's own ghost, which TMX accepts - point players there.
+                await SendMessageAsync(login, "$FF0For TMX: the eswc-autosave mod (v1.1.0+) saves a $FFF... TMX.Replay.Gbx$FF0 after each finish - github.com/cheatoskar/eswc-autosave", cancellationToken);
                 return;
             }
 
