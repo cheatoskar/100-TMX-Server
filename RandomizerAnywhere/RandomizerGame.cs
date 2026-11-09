@@ -3308,20 +3308,19 @@ internal sealed partial class RandomizerGame
             var fileName = $"{SanitizeFileNamePart(login)}_{DateTimeOffset.UtcNow:yyyyMMdd-HHmmss}.Replay.Gbx";
             var relativeFileName = $"{config.ServerName}/{fileName}";
 
-            if (client.Supports("SaveBestGhostsReplay"))
+            if (!client.Supports("SaveBestGhostsReplay"))
             {
-                await client.CallAsync("SaveBestGhostsReplay", [login, relativeFileName], cancellationToken);
+                // The old TM server can't save a replay. What GetValidationReplay hands out is only the
+                // run's validation data - a file with no header (no map, time or validable flag) that
+                // TMX can't read. And on 2026-11-09 every replay the players saved themselves on this
+                // server came out validable=0, while their saves from other ESWC servers were
+                // validable=1; the call fetches the run's data from the player's game right before it
+                // saves, so it is not made at all any more. The player's own save is the replay.
+                await SendMessageAsync(login, "$FF0For TMX: save this run in game - $FFFEsc > Save previous replay$FF0 (this server can't send you a replay file).", cancellationToken);
+                return;
             }
-            else
-            {
-                // The old TM server can't save a replay itself, but hands out the validation replay of
-                // the player's best run; written to the same folder the replay page serves from.
-                var replay = await client.TracedCallAsync<byte[]>("GetValidationReplay", [login], cancellationToken);
-                var tracksDirectory = await client.TracedCallAsync<string>("GetTracksDirectory", [], cancellationToken);
-                var replayPath = Path.Combine(tracksDirectory, "Replays", config.ServerName, fileName);
-                Directory.CreateDirectory(Path.GetDirectoryName(replayPath)!);
-                await File.WriteAllBytesAsync(replayPath, replay, cancellationToken);
-            }
+
+            await client.CallAsync("SaveBestGhostsReplay", [login, relativeFileName], cancellationToken);
 
             var host = string.IsNullOrWhiteSpace(config.PublicHost) ? "localhost" : config.PublicHost;
             var url = $"http://{host}:{config.ReplayServerPort}/replays/{Uri.EscapeDataString(fileName)}";
