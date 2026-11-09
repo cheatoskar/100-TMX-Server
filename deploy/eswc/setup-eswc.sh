@@ -25,7 +25,11 @@ USER_NAME=tmxeswc
 
 [ "$(id -u)" = 0 ] || { echo "run as root (sudo bash setup-eswc.sh)"; exit 1; }
 [ -f "$SRC/RandomizerAnywhere.dll" ] || { echo "TMNF build not found in $SRC"; exit 1; }
-[ -f "$DST/config.toml" ] && { echo "$DST/config.toml already exists - already set up. Nothing changed."; exit 1; }
+# A finished setup has a password in config.toml. Without one, an earlier run stopped half-way
+# (2026-11-09: the password step) - then it is safe to just run everything again.
+if [ -f "$DST/config.toml" ] && grep -Eq '^ServerPassword *= *".+"' "$DST/config.toml"; then
+  echo "$DST/config.toml already exists with a password - already set up. Nothing changed."; exit 1
+fi
 
 # the build must already contain the ESWC support (old-server mode, ServerNation, DownloadSha256)
 grep -q "DownloadSha256" "$SRC/RandomizerAnywhere.dll" 2>/dev/null || \
@@ -54,8 +58,10 @@ for key in PublicHost DiscordWebhookUrl DiscordWebhookUrlHard; do
     sed -i -E "s|^$key *=.*|$esc|" "$DST/config.toml"
   fi
 done
-# letters and digits only: no quoting trouble in TOML or in the server's XML config
-password="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 20)"
+# hex only: no quoting trouble in TOML or in the server's XML config. (Not "tr < /dev/urandom |
+# head": head closing the pipe kills tr, and with pipefail the whole script stopped right here.)
+password="$(openssl rand -hex 12)"
+[ ${#password} -eq 24 ] || { echo "could not generate a password"; exit 1; }
 sed -i -E "s|^ServerPassword *=.*|ServerPassword = \"$password\"|" "$DST/config.toml"
 unset password
 
@@ -76,7 +82,7 @@ open_port() {
   iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null && return 0
   # before Oracle's final REJECT rule, so it actually applies
   local reject_line
-  reject_line=$(iptables -L INPUT --line-numbers -n | awk '$2=="REJECT" {print $1; exit}')
+  reject_line=$(iptables -L INPUT --line-numbers -n | awk '$2=="REJECT" && !found {print $1; found=1}')
   if [ -n "$reject_line" ]; then
     iptables -I INPUT "$reject_line" -p "$proto" --dport "$port" -j ACCEPT
   else
@@ -87,7 +93,11 @@ open_port() {
 open_port tcp 2352; open_port udp 2352
 open_port tcp 3452; open_port udp 3452
 open_port tcp 8092
-command -v netfilter-persistent >/dev/null && netfilter-persistent save >/dev/null && echo "   saved (netfilter-persistent)"
+if command -v netfilter-persistent >/dev/null; then
+  netfilter-persistent save >/dev/null && echo "   saved (netfilter-persistent)"
+else
+  echo "   WARNING: netfilter-persistent not installed - these rules are lost on reboot"
+fi
 
 cat <<EOF
 
