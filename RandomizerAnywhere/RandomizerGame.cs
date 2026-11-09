@@ -3316,6 +3316,36 @@ internal sealed partial class RandomizerGame
     // is bounded by time, not attempts: three tries 700ms apart (~2s) was shorter than a map load.
     private static readonly TimeSpan TransitionRetryWindow = TimeSpan.FromSeconds(10);
 
+    // The old TM server answers NextChallenge with "OK" while it is still synchronizing a map that
+    // just started, and then simply stays on that map (seen locally 2026-11-09: sent 1s into
+    // "Synchronization", the queued map never came). TMF reports "Change in progress" instead,
+    // which the retry below handles. So on the old server, wait for "Running - Play" first.
+    private static readonly TimeSpan LegacyPlayStateWait = TimeSpan.FromSeconds(15);
+
+    private async Task WaitForPlayStateIfLegacyAsync(CancellationToken cancellationToken)
+    {
+        if (!config.IsLegacyServer)
+        {
+            return;
+        }
+
+        var started = Stopwatch.StartNew();
+
+        while (started.Elapsed < LegacyPlayStateWait)
+        {
+            var status = await client.TracedCallAsync<Dictionary<string, object>>("GetStatus", [], cancellationToken);
+
+            if (status.TryGetValue("Code", out var code) && code is int value && value == (int)TrackManiaStatusCode.Play)
+            {
+                return;
+            }
+
+            await Task.Delay(500, cancellationToken);
+        }
+
+        Console.WriteLine($"Warning: the old server was not in play state after {LegacyPlayStateWait.TotalSeconds:0}s - switching anyway.");
+    }
+
     private async Task CallWithTransitionRetryAsync(string method, object[] args, CancellationToken cancellationToken)
     {
         var started = Stopwatch.StartNew();
@@ -3617,6 +3647,7 @@ internal sealed partial class RandomizerGame
                 }
 
                 SetAdvanceStage("NextChallenge");
+                await WaitForPlayStateIfLegacyAsync(token);
                 await CallWithTransitionRetryAsync("NextChallenge", [], token);
                 ClaimSwitch();
                 SetAdvanceStage("NextChallenge sent");
