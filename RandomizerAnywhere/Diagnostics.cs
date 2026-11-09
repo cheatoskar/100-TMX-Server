@@ -24,8 +24,18 @@ internal static class Diagnostics
     private static readonly object dumpGate = new();
     private static DateTimeOffset lastDumpAt = DateTimeOffset.MinValue;
 
-    private static TimeSpan lastServerCpu;
-    private static DateTimeOffset lastServerCpuAt = DateTimeOffset.MinValue;
+    // CPU time of each dedicated server at the previous snapshot, per PID. A single pair of fields
+    // used to be shared by every server found by name, so with two instances on the box each one
+    // computed its delta against the OTHER server's counter (cpu=-79%, cpu=557199074%).
+    private static readonly ConcurrentDictionary<int, (TimeSpan Cpu, DateTimeOffset At)> lastServerCpu = new();
+    private static (long Steal, long Total) lastProcStat;
+    private static readonly object procStatGate = new();
+
+    // The dedicated server this controller started itself (0 = none, e.g. attached to a server
+    // started by hand). Only that one is measured; other instances on the box are not ours.
+    private static int dedicatedPid;
+
+    public static void SetDedicatedServerProcess(int pid) => Volatile.Write(ref dedicatedPid, pid);
 
     public static void Trace(string message)
     {
@@ -107,7 +117,25 @@ internal static class Diagnostics
 
         try
         {
-            var servers = Process.GetProcessesByName("TrackmaniaServer");
+            var pid = Volatile.Read(ref dedicatedPid);
+            Process[] servers;
+
+            if (pid > 0)
+            {
+                try
+                {
+                    servers = [Process.GetProcessById(pid)];
+                }
+                catch (ArgumentException)
+                {
+                    servers = []; // our server has exited
+                }
+            }
+            else
+            {
+                // not started by us: fall back to the name (TMF "TrackmaniaServer", old TM "TrackManiaServer")
+                servers = [.. Process.GetProcessesByName("TrackmaniaServer"), .. Process.GetProcessesByName("TrackManiaServer")];
+            }
 
             if (servers.Length == 0)
             {
@@ -115,20 +143,24 @@ internal static class Diagnostics
             }
             else
             {
-                foreach (var server in servers)
+                foreach (var server in servers.DistinctBy(s => s.Id))
                 {
                     var cpu = server.TotalProcessorTime;
                     var now = DateTimeOffset.UtcNow;
-                    var cpuPercent = lastServerCpuAt == DateTimeOffset.MinValue || now <= lastServerCpuAt
-                        ? double.NaN
-                        : (cpu - lastServerCpu).TotalSeconds / (now - lastServerCpuAt).TotalSeconds * 100;
+                    // percent of ONE core, averaged since the previous snapshot of this same process
+                    var cpuPercent = lastServerCpu.TryGetValue(server.Id, out var last) && now > last.At && cpu >= last.Cpu
+                        ? (cpu - last.Cpu).TotalSeconds / (now - last.At).TotalSeconds * 100
+                        : double.NaN;
 
-                    lastServerCpu = cpu;
-                    lastServerCpuAt = now;
+                    lastServerCpu[server.Id] = (cpu, now);
 
                     sb.Append($"dedicated: pid={server.Id} up={(DateTime.Now - server.StartTime):d\\.hh\\:mm\\:ss} ")
                       .Append($"mem={server.WorkingSet64 / 1048576}MB threads={server.Threads.Count} ")
-                      .Append($"cpu={(double.IsNaN(cpuPercent) ? "?" : cpuPercent.ToString("0"))}% ");
+                      .Append($"cpu={(double.IsNaN(cpuPercent) ? "?" : cpuPercent.ToString("0.0"))}% ");
+                }
+
+                foreach (var server in servers)
+                {
                     server.Dispose();
                 }
             }
@@ -143,6 +175,28 @@ internal static class Diagnostics
             if (File.Exists("/proc/loadavg"))
             {
                 sb.Append($"load={File.ReadAllText("/proc/loadavg").Split(' ').Take(3).Aggregate((a, b) => a + " " + b)} ");
+            }
+
+            // "steal": share of the box's CPU time the hypervisor gave to other guests although we
+            // wanted to run - the cloud provider throttling us. Since the previous snapshot.
+            if (File.Exists("/proc/stat"))
+            {
+                var fields = File.ReadLines("/proc/stat").First().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                // cpu user nice system idle iowait irq softirq steal [guest guest_nice - already in user/nice]
+                var values = fields.Skip(1).Take(8).Select(long.Parse).ToArray();
+                var current = (Steal: values[7], Total: values.Sum());
+                (long Steal, long Total) previous;
+
+                lock (procStatGate) // health line and an incident dump can snapshot at the same time
+                {
+                    previous = lastProcStat;
+                    lastProcStat = current;
+                }
+
+                if (previous.Total > 0 && current.Total > previous.Total)
+                {
+                    sb.Append($"steal={(current.Steal - previous.Steal) * 100.0 / (current.Total - previous.Total):0.0}% ");
+                }
             }
         }
         catch (Exception)
