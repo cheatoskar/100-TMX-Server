@@ -20,6 +20,10 @@ internal sealed class AppConfig
     public required bool CallVoteOnFinish { get; set; }
     public required string[] WelcomeMessage { get; set; }
     public required string ServerName { get; set; }
+
+    // in-game name with format codes; falls back to the plain ServerName (see GlobalConfig)
+    public string ServerDisplayName { get; init; } = string.Empty;
+    public string InGameServerName => string.IsNullOrWhiteSpace(ServerDisplayName) ? ServerName : ServerDisplayName;
     public required string ServerComment { get; init; }
     public required string GameSettings { get; init; }
     public bool SourceFromImpossibleList { get; set; }

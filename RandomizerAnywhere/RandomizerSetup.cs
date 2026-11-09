@@ -42,7 +42,14 @@ internal sealed class RandomizerSetup
         Console.WriteLine();
 
         await client.AuthenticateAsync(cancellationToken);
-        await client.SetServerNameAsync(config.ServerName, cancellationToken);
+        await client.SetServerNameAsync(config.InGameServerName, cancellationToken);
+
+        // The 2006 TM server cuts the name after 25 characters, format codes included
+        // ("$s$0BF100% TMX $FF8Project $F80ESWC" became "...$FF8Projec"), and says nothing.
+        if (config.IsLegacyServer && config.InGameServerName.Length > 25)
+        {
+            Console.WriteLine($"Warning: the old TM server keeps only the first 25 characters of the server name (format codes count) - '{config.InGameServerName}' is {config.InGameServerName.Length}.");
+        }
 
         await client.EnableCallbacksAsync(cancellationToken);
 

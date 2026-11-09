@@ -258,7 +258,7 @@ internal sealed partial class ServerSetup
             // Only inside <server_options>: the authorization levels have <name> tags too.
             contents = ServerOptionsRegex().Replace(contents, block =>
             {
-                var text = ServerOptionNameRegex().Replace(block.Value, _ => $"<name>{System.Security.SecurityElement.Escape(config.ServerName)}</name>", 1);
+                var text = ServerOptionNameRegex().Replace(block.Value, _ => $"<name>{System.Security.SecurityElement.Escape(config.InGameServerName)}</name>", 1);
                 return ServerOptionCommentRegex().Replace(text, _ => $"<comment>{System.Security.SecurityElement.Escape(config.ServerComment)}</comment>", 1);
             });
         }
@@ -505,7 +505,7 @@ internal sealed partial class ServerSetup
         };
 
         serverProcess.StartInfo.ArgumentList.Add($"/game_settings={config.GameSettings}");
-        serverProcess.StartInfo.ArgumentList.Add($"/servername={config.ServerName}");
+        serverProcess.StartInfo.ArgumentList.Add($"/servername={config.InGameServerName}");
         if (config.VerboseRpc)
         {
             serverProcess.StartInfo.ArgumentList.Add("/verbose_rpc");

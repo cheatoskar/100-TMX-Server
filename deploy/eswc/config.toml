@@ -15,10 +15,12 @@ XmlRpcPort = 5002
 AutoSkipMode = "Finished"
 TimeLimit = 0
 
-# no preset: the TMNF/TMUF presets are for those games; TMN draws from nations.tm-exchange.com
-Preset = ""
+# TMN presets (Presets/*_tmn.toml) draw from nations.tm-exchange.com
+Preset = "100tmx_tmn"
 
 ServerName = "100% TMX Project (ESWC)"
+# In the server list, with format codes. The 2006 server keeps only 25 characters, codes included.
+ServerDisplayName = '100$c80%$g TMX $w$c80ESWC'
 ServerComment = "100% TMX RMC (ESWC) - random maps, first to finish wins. Type /info in chat."
 GameSettings = "MatchSettings/Randomizer.txt"
 

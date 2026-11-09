@@ -260,6 +260,7 @@ internal partial class AppServiceProvider
             CallVoteOnFinish = Configurator.GetBool(globalConfig.CallVoteOnFinish, cmdValue: null, "RANDANY_CALLVOTE_ON_FINISH"),
             WelcomeMessage = globalConfig.WelcomeMessage.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries),
             ServerName = Configurator.GetString(globalConfig.ServerName, cmdConfig.ServerName, "RANDANY_SERVER_NAME"),
+            ServerDisplayName = Configurator.GetString(globalConfig.ServerDisplayName, cmdValue: null, "RANDANY_SERVER_DISPLAY_NAME"),
             ServerComment = Configurator.GetString(globalConfig.ServerComment, cmdValue: null, "RANDANY_SERVER_COMMENT"),
             GameSettings = Configurator.GetString(globalConfig.GameSettings, cmdValue: null, "RANDANY_GAMESETTINGS"),
             AutoStart = Configurator.GetBool(globalConfig.AutoStart, cmdValue: null, "RANDANY_AUTO_START"),
