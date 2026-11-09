@@ -3696,8 +3696,17 @@ internal sealed partial class RandomizerGame
 
     private async Task SendMessageAsync(string? login, string message, CancellationToken cancellationToken)
     {
+        message = ForThisServer(message);
         await client.CallAsync(GetServerMessageType(login), login is null ? [message] : [message, login], cancellationToken);
     }
+
+    // The 2006 TM server's chat has no $l links: "$l[url]text$l" showed up literally, brackets and
+    // all, and nothing was clickable. There the link text alone is sent (it is the URL everywhere).
+    private string ForThisServer(string message) =>
+        config.IsLegacyServer ? ChatLinkRegex().Replace(message, "${text}").Replace("$l", string.Empty, StringComparison.OrdinalIgnoreCase) : message;
+
+    [GeneratedRegex(@"\$l\[(?<url>[^\]]*)\](?<text>.*?)\$l", RegexOptions.IgnoreCase)]
+    private static partial Regex ChatLinkRegex();
 
     private async Task SendMessageAsync(string message, CancellationToken cancellationToken)
     {
@@ -3709,6 +3718,7 @@ internal sealed partial class RandomizerGame
         var serverMessageType = GetServerMessageType(login);
 
         await client.SystemMulticallAsync(messageLines
+            .Select(ForThisServer)
             .Select(msg => new XmlRpcCall(serverMessageType, login is null ? [msg] : [msg, login])), cancellationToken);
     }
 

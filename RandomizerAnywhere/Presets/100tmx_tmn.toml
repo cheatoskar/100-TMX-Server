@@ -1,0 +1,11 @@
+# TrackMania Nations ESWC (nations.tm-exchange.com). Tag ids are the same as on tmnf.exchange
+# (checked 2026-11-09); RPG/Trial (0 maps) and Multilap (8) have no TMN preset - too few maps.
+DisplayName = "100% TMX Project (ESWC)"
+Games = ["TMN"]
+
+TmxGame = "TMN"
+AutoSkipMode = "Finished"
+
+[TmxQuery]
+inhasrecord = 0
+inunlimiter = 0
