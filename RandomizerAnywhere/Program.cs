@@ -192,7 +192,7 @@ internal partial class AppServiceProvider
 
     // Says who is asking, so TMX can tell this server apart (and reach its owner) instead of
     // seeing an anonymous .NET client.
-    private const string UserAgent = "RandomizerAnywhere-100TMX (+https://github.com/cheatoskar/randomizer-anywhere-100--tmx)";
+    private const string UserAgent = "RandomizerAnywhere-100TMX (+https://github.com/cheatoskar/100-TMX-Server)";
 
     public static HttpClient CreateHttpClient()
     {

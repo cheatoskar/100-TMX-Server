@@ -18,7 +18,7 @@ internal sealed partial class RandomizerGame
     private const int PresetVoteWindowMs = 30000;
 
     // AGPLv3 §13: this is a modified version, so users interacting with it over the network
-    private const string SourceRepoUrl = "http://github.com/cheatoskar/randomizer-anywhere-100--tmx";
+    private const string SourceRepoUrl = "https://github.com/cheatoskar/100-TMX-Server";
 
     private readonly RemoteClient client;
     private readonly TmxRules tmxRules;

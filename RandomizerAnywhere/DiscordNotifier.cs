@@ -121,7 +121,7 @@ internal sealed class DiscordNotifier
     private static HttpClient CreateHttpClient()
     {
         var client = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
-        client.DefaultRequestHeaders.UserAgent.ParseAdd("RandomizerAnywhere-100TMX (+https://github.com/cheatoskar/randomizer-anywhere-100--tmx)");
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("RandomizerAnywhere-100TMX (+https://github.com/cheatoskar/100-TMX-Server)");
         return client;
     }
 
