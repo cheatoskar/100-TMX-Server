@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "theme": { "accent": "lime" },
+  "blocks": [
+    {
+      "type": "hero",
+      "title": "100% TMX Server",
+      "tagline": "Random map servers of the 100% TMX project for TrackMania Nations, United and ESWC.",
+      "badges": ["TMNF, TMUF, ESWC", "Dedicated server tool", "AGPL-3.0"]
+    },
+    {
+      "type": "features",
+      "items": [
+        { "icon": "map", "title": "Random maps", "text": "Players get random maps that nobody has finished on TMX yet." },
+        { "icon": "upload", "title": "Replays for TMX", "text": "After each finish a replay link that TMX accepts, because TMX only takes server-saved replays." },
+        { "icon": "flag", "title": "Reports and presets", "text": "Impossible and hard map reports, genre presets and votes for maps and presets." },
+        { "icon": "clock", "title": "Runs 24/7", "text": "Offline map pool, watchdogs, and several servers on one machine." }
+      ]
+    },
+    {
+      "type": "text",
+      "title": "Where it comes from",
+      "markdown": "A fork of Randomizer Anywhere by BigBang1112, which starts a dedicated server and runs a Random Map Challenge controlled by chat commands. This fork runs the three public servers of the 100% TMX project.\n\nIt is a .NET console app. No builds are distributed; the live servers run from source builds. For ESWC, a chat hint points players to the ESWC Autosave mod instead of a replay link."
+    },
+    {
+      "type": "compat",
+      "rows": [
+        { "game": "tmnf", "status": "works" },
+        { "game": "tmuf", "status": "works" },
+        { "game": "eswc", "status": "works" }
+      ]
+    },
+    {
+      "type": "cta",
+      "buttons": [
+        { "kind": "link", "label": "Original project", "url": "https://github.com/BigBang1112/randomizer-anywhere", "style": "ghost" }
+      ]
+    }
+  ]
+}
