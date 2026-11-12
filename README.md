@@ -1,3 +1,5 @@
+<img src="docs/logo/logo.svg" width="96" align="right" alt="100% TMX Server logo">
+
 # Randomizer Anywhere - 100% TMX fork
 
 This is a fork of [BigBang1112/randomizer-anywhere](https://github.com/BigBang1112/randomizer-anywhere), which downloads and starts a TrackMania dedicated server and runs a Random Map Challenge on it, controlled by in-game chat commands (for the original features, see his repo). This fork runs the three public servers of the [100% TMX Project](https://discord.gg/HRShWnzpK3) 24/7: TrackMania Nations Forever (TMNF), TrackMania United Forever (TMUF) and TrackMania Nations ESWC (the 2006 game, "TMN" in the config). Players get random maps that nobody has finished on [TMX](https://tmnf.exchange/) yet, and every finish with a valid replay helps to get the whole site finished.
