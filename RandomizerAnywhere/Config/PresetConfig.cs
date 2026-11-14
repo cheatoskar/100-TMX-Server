@@ -5,6 +5,9 @@ namespace RandomizerAnywhere.Config;
 internal sealed class PresetConfig
 {
     public string DisplayName { get; set; } = string.Empty;
+
+    // one short line for the preset list, in English like everything players see
+    public string Description { get; set; } = string.Empty;
     public string[] Games { get; init; } = [];
 
     public int TimeLimit { get; set; } = 0;
@@ -18,6 +21,9 @@ internal sealed class PresetConfig
     // when true, ignore TmxQuery and instead pick randomly among the locally tracked
     // impossible/cheated map ids (for admin review, not normal play)
     public bool SourceFromImpossibleList { get; set; }
+
+    // when true, ignore TmxQuery and draw from the event list's open maps (EventMode)
+    public bool SourceFromEventList { get; set; }
 
     // an empty Games list means "any game"
     public bool SupportsGame(GameTitle game) =>
@@ -50,5 +56,6 @@ internal sealed class PresetConfig
 
         config.TmxQuery = TmxQuery;
         config.SourceFromImpossibleList = SourceFromImpossibleList;
+        config.SourceFromEventList = SourceFromEventList;
     }
 }

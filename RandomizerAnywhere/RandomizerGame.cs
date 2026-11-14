@@ -1,4 +1,4 @@
-using ManiaAPI.XmlRpc;
+﻿using ManiaAPI.XmlRpc;
 using RandomizerAnywhere.Config;
 using System.Collections.Concurrent;
 using System.Diagnostics;
@@ -103,49 +103,8 @@ internal sealed partial class RandomizerGame
         });
     }
 
-    // TMX metadata does not change while a map is played; caching it means the widget for a late
-    // joiner costs nothing, and BeginRace never waits for tm-exchange.com.
-    private readonly ConcurrentDictionary<int, (string DifficultyLabel, int Awards)> trackMetaCache = new();
     private readonly ConcurrentDictionary<int, string> trackNameCache = new();
     private static readonly TimeSpan TrackMetaBudget = TimeSpan.FromSeconds(15);
-
-    // login null = everyone
-    private void ShowMapInfoWidgetInBackground(int trackId, int authorTime, string? login)
-    {
-        RunInBackground($"showing the map info widget for {trackId}", async () =>
-        {
-            if (!trackMetaCache.TryGetValue(trackId, out var meta))
-            {
-                using var budget = CancellationTokenSource.CreateLinkedTokenSource(appToken);
-                budget.CancelAfter(TrackMetaBudget);
-                meta = await tmxRules.GetTrackMetaAsync(trackId, budget.Token);
-
-                if (trackMetaCache.Count > 500)
-                {
-                    trackMetaCache.Clear();
-                }
-
-                trackMetaCache[trackId] = meta;
-            }
-
-            // the map may have changed while TMX was answering - don't show stale info
-            if (currentMapTrackId != trackId)
-            {
-                return;
-            }
-
-            var manialink = BuildMapInfoManialink(meta.DifficultyLabel, meta.Awards, authorTime);
-
-            if (login is null)
-            {
-                await client.SendManialinkPageAsync(manialink, cancellationToken: appToken);
-            }
-            else
-            {
-                await client.SendManialinkPageToLoginAsync(login, manialink, cancellationToken: appToken);
-            }
-        });
-    }
     private string? randomEnqueuedMapFileName;
 
     // set by /loadmap or a passed /votemap vote, consumed (and cleared) by the next
@@ -327,6 +286,9 @@ internal sealed partial class RandomizerGame
     }
 
     private int? currentMapCheckpointTotal;
+
+    // lap map: PlayerCheckpoint's index counts on across laps (see the checkpoint handler)
+    private bool currentMapLapRace;
     // Concurrent: written by checkpoint callbacks, enumerated by the status writer (which does
     // not take the game lock) - a plain Dictionary can throw "collection was modified" there.
     private readonly ConcurrentDictionary<string, int> playerCheckpointProgress = [];
@@ -450,11 +412,16 @@ internal sealed partial class RandomizerGame
     [
         "start", "stop", "end", "skip", "imp", "blockmap", "hard", "top", "rank", "map", "history",
         "rounds", "info", "help", "testhud", "votepreset", "yes", "no", "commands", "source",
-        "timelimit", "tl", "preset", "presets", "loadmap", "votemap", "afk",
+        "timelimit", "tl", "preset", "presets", "loadmap", "votemap", "afk", "hud",
     ];
 
-    public RandomizerGame(RemoteClient client, TmxRules tmxRules, AppConfig config, DiscordNotifier discordNotifier, Leaderboard leaderboard, SkippedMaps skippedMaps)
+    private readonly EventMode eventMode;
+    private readonly HudSettings hudSettings;
+
+    public RandomizerGame(RemoteClient client, TmxRules tmxRules, AppConfig config, DiscordNotifier discordNotifier, Leaderboard leaderboard, SkippedMaps skippedMaps, EventMode eventMode, HudSettings hudSettings)
     {
+        this.eventMode = eventMode;
+        this.hudSettings = hudSettings;
         this.skippedMaps = skippedMaps;
         this.client = client;
         this.tmxRules = tmxRules;
@@ -491,7 +458,8 @@ internal sealed partial class RandomizerGame
             ["presets"] = PresetsAsync,
             ["loadmap"] = LoadMapAsync,
             ["votemap"] = VoteMapAsync,
-            ["afk"] = AfkAsync
+            ["afk"] = AfkAsync,
+            ["hud"] = HudAsync
         };
 
         if (!commandHandlers.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase).SetEquals(ChatCommandNames))
@@ -602,6 +570,13 @@ internal sealed partial class RandomizerGame
                 }
 
                 lastRunningTrackId = currentMapTrackId;
+                currentMapRawName = info.Name;
+                currentMapLapRace = info.LapRace;
+
+                if (mapChanged)
+                {
+                    ResetHudForNewMap();
+                }
 
                 LogMapTransition(info);
 
@@ -640,11 +615,8 @@ internal sealed partial class RandomizerGame
                     });
                 }
 
-                // a map with no checkpoints at all has nothing to count, and "0/0" is just noise
-                if (info.NbCheckpoints is { } total && total > 0)
-                {
-                    await client.SendManialinkPageAsync(BuildCheckpointManialink(0, total), cancellationToken: cancellationToken);
-                }
+                // the whole HUD for everyone: new map panel, CP counter at 0, times reset
+                await BroadcastHudAsync(HudSection.All, cancellationToken);
 
                 if (info.LapRace)
                 {
@@ -660,8 +632,8 @@ internal sealed partial class RandomizerGame
                 if (currentMapTrackId is { } trackIdForMeta)
                 {
                     // TMX is slow at times (up to its 40s budget) and this handler holds the whole
-                    // callback stream, so the info widget is filled in from the side
-                    ShowMapInfoWidgetInBackground(trackIdForMeta, info.AuthorTime, login: null);
+                    // callback stream, so author, awards and WR are filled in from the side
+                    FetchCurrentMapDetailsInBackground(trackIdForMeta);
                 }
             }
             catch (Exception ex)
@@ -699,6 +671,7 @@ internal sealed partial class RandomizerGame
             try
             {
                 var login = (string)methodParams[1];
+                var time = (int)methodParams[2];
                 var checkpointIndex = (int)methodParams[4];
 
                 if (currentMapCheckpointTotal is not { } total || total <= 0)
@@ -706,13 +679,17 @@ internal sealed partial class RandomizerGame
                     return;
                 }
 
+                RecordCheckpointTime(login, checkpointIndex, time);
+
                 // TMF numbers the finish line as a checkpoint too, so without the clamp the last
-                // one a player crosses reads as "4/3"
-                var current = Math.Min(checkpointIndex + 1, total);
+                // one a player crosses reads as "4/3". On a lap map the index counts on across laps
+                // (each lap is the map's checkpoints plus the lap line), so it is taken per lap.
+                var inLap = currentMapLapRace ? checkpointIndex % (total + 1) : checkpointIndex;
+                var current = Math.Min(inLap + 1, total);
                 playerCheckpointProgress[login] = current;
                 playerCheckpointTimestamp[login] = DateTimeOffset.UtcNow;
 
-                await client.SendManialinkPageToLoginAsync(login, BuildCheckpointManialink(current, total), cancellationToken: cancellationToken);
+                await SendHudAsync(login, HudSection.Cp, cancellationToken);
             }
             catch (Exception ex)
             {
@@ -731,7 +708,6 @@ internal sealed partial class RandomizerGame
                 nicknameCache[login] = await client.GetPlayerNicknameAsync(login, cancellationToken);
 
                 await SendWelcomeMessageAsync(login, cancellationToken);
-                await SendTop10PanelAsync(cancellationToken);
                 await SendMapWidgetsToLoginAsync(login, cancellationToken);
             }
             catch (Exception ex)
@@ -784,6 +760,15 @@ internal sealed partial class RandomizerGame
                 var playerUid = (int)methodParams[0];
                 var login = (string)methodParams[1];
                 var score = (int)methodParams[2];
+
+                try
+                {
+                    await OnHudFinishAsync(login, score, cancellationToken);
+                }
+                catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+                {
+                    Console.WriteLine($"Warning: HUD/event finish handling failed - {ex.Message}");
+                }
 
                 await OnPlayerFinish(playerUid, login, score, cancellationToken);
             }
@@ -848,7 +833,6 @@ internal sealed partial class RandomizerGame
     private const string RoundsPromptManialinkId = "rounds_prompt";
     private const string VotePopupManialinkId = "vote_popup";
     private const string PresetListManialinkId = "preset_list";
-    private const string MapInfoManialinkId = "map_info";
     private const string HistoryManialinkId = "history_list";
 
     // preset names as last shown to any player via the /presets widget, in click-index order -
@@ -861,6 +845,12 @@ internal sealed partial class RandomizerGame
 
     private async Task HandleManialinkAnswerAsync(int playerUid, string login, int answer, CancellationToken cancellationToken)
     {
+        if (answer >= ActionHudBase)
+        {
+            await HandleHudActionAsync(playerUid, login, answer, cancellationToken);
+            return;
+        }
+
         switch (answer)
         {
             case ActionVoteYes:
@@ -1126,6 +1116,7 @@ internal sealed partial class RandomizerGame
 
         _ = StatusWriteLoopAsync(cancellationToken);
         _ = StalledMapWatchLoopAsync(cancellationToken);
+        _ = HudLoopAsync(cancellationToken);
 
         if (config.IsLegacyServer)
         {
@@ -2562,6 +2553,7 @@ internal sealed partial class RandomizerGame
 
         // Check the preset BEFORE touching the session. The session used to be reset first, so a
         // typo answered "not found" with the session already gone - no auto-advance, no watchdog.
+        args[0] = ResolvePresetName(args[0]);
         var (preset, error) = LoadPresetForThisGame(args[0]);
 
         if (preset is null)
@@ -2680,7 +2672,7 @@ internal sealed partial class RandomizerGame
             return;
         }
 
-        var presetName = args[0];
+        var presetName = ResolvePresetName(args[0]);
 
         if (LoadPresetForThisGame(presetName) is { Preset: null, Error: var presetError })
         {
@@ -3109,11 +3101,15 @@ internal sealed partial class RandomizerGame
             return;
         }
 
-        var coloredNames = rawPresetNames.Select(name => $"$FF0{name}$FFF");
-        await SendMessageAsync(login, [$"Presets: {string.Join(", ", coloredNames)}", "Select a preset using $FF0/preset <name>$FFF, or click below to start a vote"], cancellationToken);
+        var presets = rawPresetNames
+            .Select(name => (Name: name, Preset: TomlLoader.LoadPresetConfig(Path.Combine(presetsDir, name + ".toml"))))
+            .ToList();
+
+        var coloredNames = presets.Select(p => $"$FF0{PresetShortName(p.Name, p.Preset)}$FFF");
+        await SendMessageAsync(login, [$"Presets: {string.Join(", ", coloredNames)}", "Click one in the window to start a vote, or type $FF0/votepreset <name>$FFF."], cancellationToken);
 
         lastShownPresetNames = rawPresetNames;
-        await client.SendManialinkPageToLoginAsync(login, BuildPresetListManialink(rawPresetNames), cancellationToken: cancellationToken);
+        await client.SendManialinkPageToLoginAsync(login, BuildPresetWindow(presets), cancellationToken: cancellationToken);
     }
 
     // (login, time) of the finishes already handled on the map of handledFinishesGeneration.
@@ -3480,6 +3476,21 @@ internal sealed partial class RandomizerGame
             return false;
         }
 
+        // The event preset draws only from the event list's open maps. With none left for this
+        // server, asking TMX would only fail over and over - stay on the map and say so once.
+        if (forcedNextMapTrackId is null && config.SourceFromEventList && eventMode.Enabled && eventMode.PickableIds().Count == 0)
+        {
+            if (!eventDoneAnnounced)
+            {
+                eventDoneAnnounced = true;
+                await SendMessageAsync("$FC0» Event: no open maps left for this server - GG everyone! An admin can switch the preset now.", cancellationToken);
+            }
+
+            return false;
+        }
+
+        eventDoneAnnounced = false;
+
         var advanceId = Interlocked.Increment(ref advanceCounter);
         advanceOwner = advanceId;
         advanceStartedAt = DateTimeOffset.UtcNow;
@@ -3788,15 +3799,12 @@ internal sealed partial class RandomizerGame
         return nicknameCache.TryGetValue(login, out var nickname) ? $"$<{nickname}$>" : login;
     }
 
+    // the top finishers show each player's own place, so this goes out per player (see the HUD)
     private async Task SendTop10PanelAsync(CancellationToken cancellationToken)
     {
         try
         {
-            // button icons are served by the built-in web server (see ReplayServer), same host as the replay links
-            var host = string.IsNullOrWhiteSpace(config.PublicHost) ? "localhost" : config.PublicHost;
-            var assetBaseUrl = $"http://{host}:{config.ReplayServerPort}";
-
-            await client.SendManialinkPageAsync(BuildTop10Manialink(leaderboard.GetTop(10), assetBaseUrl, FavoriteServerUrl), cancellationToken: cancellationToken);
+            await BroadcastHudAsync(HudSection.Top, cancellationToken);
         }
         catch (Exception ex)
         {
@@ -3865,31 +3873,22 @@ internal sealed partial class RandomizerGame
     private async Task SendMapWidgetsToLoginAsync(string login, CancellationToken cancellationToken)
     {
         var info = await EnsureCurrentMapStateAsync(cancellationToken);
+        currentMapRawName ??= info.Name;
+        currentMapLapRace = info.LapRace;
 
-        if (currentMapCheckpointTotal is { } total && total > 0)
-        {
-            var current = Math.Min(playerCheckpointProgress.GetValueOrDefault(login, 0), total);
-            await client.SendManialinkPageToLoginAsync(login, BuildCheckpointManialink(current, total), cancellationToken: cancellationToken);
-        }
+        await SendHudAsync(login, HudSection.All, cancellationToken);
 
         if (info.LapRace)
         {
             await client.SendManialinkPageToLoginAsync(login, BuildRoundsPromptManialink(info.NbLaps), cancellationToken: cancellationToken);
         }
 
-        if (currentMapTrackId is { } trackId)
+        if (currentMapTrackId is { } trackId && currentMapDetailsTrackId != trackId)
         {
             // from the side, see BeginRace - a join must never wait for tm-exchange.com
-            ShowMapInfoWidgetInBackground(trackId, info.AuthorTime, login);
+            FetchCurrentMapDetailsInBackground(trackId);
         }
     }
-
-    private static string BuildCheckpointManialink(int current, int total) => $"""
-        <manialink id="cp_counter" version="1">
-            <quad posn="-64 37 4" sizen="13 5" halign="left" valign="center" bgcolor="000A"/>
-            <label posn="-63 37 5" halign="left" valign="center" textsize="2.5" textcolor="FFFF" text="CP {current} / {total}"/>
-        </manialink>
-        """;
 
     // sits just above the CP counter (which is anchored at y=37) so the two never overlap
     private static string GetDifficultyColor(string difficultyLabel) => difficultyLabel switch
@@ -3901,34 +3900,14 @@ internal sealed partial class RandomizerGame
         _ => "FFF",
     };
 
-    private static string BuildMapInfoManialink(string difficultyLabel, int awards, int authorTimeMs)
-    {
-        var difficultyColor = GetDifficultyColor(difficultyLabel);
-
-        // "$o" for bold, then "$z$FFF" to fully reset before the awards count so the bold/color
-        // doesn't bleed into it - same reset pattern as the top-10 panel, see its own note on why
-        // "$<...$>" isn't used instead
-        var awardsSuffix = System.Security.SecurityElement.Escape($" · {awards} award{(awards == 1 ? "" : "s")}");
-        var difficultyText = System.Security.SecurityElement.Escape(difficultyLabel);
-        var authorTimeText = System.Security.SecurityElement.Escape($"AT {new TimeInt32(authorTimeMs)}");
-
-        return $"""
-            <manialink id="{MapInfoManialinkId}" version="1">
-                <quad posn="-64 43 4" sizen="20 7" halign="left" valign="center" bgcolor="000A"/>
-                <label posn="-63 45 5" halign="left" valign="center" textsize="1.3" textcolor="{difficultyColor}F" text="$o{difficultyText}$z$FFF{awardsSuffix}"/>
-                <label posn="-63 41.5 5" halign="left" valign="center" textsize="1.3" textcolor="0F0F" text="$o{authorTimeText}"/>
-            </manialink>
-            """;
-    }
-
     // sits just below the CP counter - only sent while the loaded map is a real multilap
     // challenge (see BeginRace), hidden again the moment a non-multilap map loads
     private static string BuildRoundsPromptManialink(int nbLaps) => $"""
         <manialink id="{RoundsPromptManialinkId}" version="1">
-            <quad posn="-64 22 4" sizen="20 6.5" halign="left" valign="center" bgcolor="000A"/>
-            <label posn="-63 24.1 5" halign="left" valign="center" textsize="1.1" textcolor="FF8" text="Multilap map ({nbLaps} laps)"/>
-            <quad posn="-63 21.4 5" sizen="18 2.6" halign="left" valign="center" bgcolor="0B3A" action="{ActionRoundsAccept}"/>
-            <label posn="-62 21.5 6" halign="left" valign="center" textsize="1" textcolor="FFF" text="Click for Rounds mode"/>
+            <quad posn="-63.6 32.5 4" sizen="20 6.5" halign="left" valign="center" bgcolor="000A"/>
+            <label posn="-62.6 34.6 5" halign="left" valign="center" textsize="1.1" textcolor="FF8" text="Multilap map ({nbLaps} laps)"/>
+            <quad posn="-62.6 31.9 5" sizen="18 2.6" halign="left" valign="center" bgcolor="0B3A" action="{ActionRoundsAccept}"/>
+            <label posn="-61.6 32 6" halign="left" valign="center" textsize="1" textcolor="FFF" text="Click for Rounds mode"/>
         </manialink>
         """;
 
@@ -3974,36 +3953,85 @@ internal sealed partial class RandomizerGame
             """;
     }
 
-    private static string BuildPresetListManialink(IReadOnlyList<string> presetNames)
+    // "lunatic" for lunatic_tmnf, or the short display name ("100% TMX", "Short & LOL") - whatever
+    // a player types that names exactly one preset of this game; anything else is passed on as typed
+    private string ResolvePresetName(string input)
     {
-        // manialink coordinates must use "." as the decimal separator regardless of the host
-        // machine's locale - plain string interpolation of a double formats it with the CURRENT
-        // THREAD CULTURE, which on a German-locale box turns e.g. "18.5" into "18,5" and breaks
-        // the XML attribute (extra token where the parser expects exactly one number pair)
-        static string Inv(double value) => value.ToString(System.Globalization.CultureInfo.InvariantCulture);
-
-        var rows = new System.Text.StringBuilder();
-        var y = 18.0;
-
-        for (var i = 0; i < presetNames.Count; i++)
+        var presetsDir = Path.Combine(AppContext.BaseDirectory, "Presets");
+        if (!Directory.Exists(presetsDir) || File.Exists(Path.Combine(presetsDir, input + ".toml")))
         {
-            var text = System.Security.SecurityElement.Escape(presetNames[i]);
-            rows.AppendLine($"""<quad posn="-19 {Inv(y)} 5" sizen="38 3" halign="left" valign="center" bgcolor="0004" action="{ActionPresetBase + i}"/>""");
-            rows.AppendLine($"""<label posn="0 {Inv(y)} 6" halign="center" valign="center" textsize="1.2" textcolor="FFF" text="{text}"/>""");
-            y -= 3.5;
+            return input;
         }
 
-        var boxHeight = 10 + (presetNames.Count * 3.5);
+        static string Norm(string text) => string.Concat(text.Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant));
+        var wanted = Norm(input);
 
-        return $"""
-            <manialink id="{PresetListManialinkId}" version="1">
-                <quad posn="-20 23 4" sizen="40 {Inv(boxHeight)}" halign="left" valign="top" bgcolor="000C"/>
-                <label posn="0 21.5 5" halign="center" valign="center" textsize="1.5" textcolor="FF0F" text="Click to vote for a preset"/>
-                <quad posn="18.5 21.7 5" sizen="3 3" halign="center" valign="center" bgcolor="B00A" action="{ActionClosePresetList}"/>
-                <label posn="18.5 21.7 6" halign="center" valign="center" textsize="1.1" textcolor="FFF" text="X"/>
-                {rows}
-            </manialink>
-            """;
+        var matches = Directory.EnumerateFiles(presetsDir, "*.toml")
+            .Select(Path.GetFileNameWithoutExtension)
+            .Where(name => !string.IsNullOrEmpty(name) && IsPresetForThisGame(name!))
+            .Select(name => name!)
+            .Where(name =>
+            {
+                var preset = TomlLoader.LoadPresetConfig(Path.Combine(presetsDir, name + ".toml"));
+                var stem = name.Contains('_') ? name[..name.LastIndexOf('_')] : name;
+                return Norm(stem) == wanted || (preset is not null && Norm(PresetShortName(name, preset)) == wanted);
+            })
+            .ToList();
+
+        return matches.Count == 1 ? matches[0] : input;
+    }
+
+    private static string PresetShortName(string fileName, Config.PresetConfig? preset) =>
+        preset is not null && !string.IsNullOrWhiteSpace(preset.DisplayName) ? ShortenPresetDisplayName(preset.DisplayName) : fileName;
+
+    // The preset vote window in the HUD's style: a card per preset with its name and one line about
+    // it, the running one marked. A click starts the vote (ActionPresetBase + index).
+    private string BuildPresetWindow(IReadOnlyList<(string Name, Config.PresetConfig? Preset)> presets)
+    {
+        const double width = 62;
+        const double cardWidth = 30;
+        const double cardHeight = 5.2;
+        var rows = (presets.Count + 1) / 2;
+        var height = 6.5 + rows * (cardHeight + 0.4) + 2.4;
+        var current = config.LastPreset;
+
+        var b = new System.Text.StringBuilder();
+        b.Append($"<manialink id=\"{PresetListManialinkId}\"><frame posn=\"{Inv(-width / 2)} {Inv(height / 2 + 4)} 20\">");
+        b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"BgWindow2\"/>");
+        b.Append($"<quad posn=\"0.4 -0.36 0.01\" sizen=\"{Inv(width - 0.8)} 2.6\" style=\"BgsPlayerCard\" substyle=\"BgRacePlayerName\"/>");
+        b.Append("<quad posn=\"0.7 0 0.02\" sizen=\"3 3\" style=\"Icons128x128_1\" substyle=\"Browse\"/>");
+        b.Append("<label posn=\"4.2 -0.75 0.02\" sizen=\"40 2\" textsize=\"2\" text=\"Choose a preset\"/>");
+        b.Append($"<quad posn=\"{Inv(width - 3.2)} -0.5 0.03\" sizen=\"2.4 2.4\" style=\"Icons64x64_1\" substyle=\"Close\" action=\"{ActionClosePresetList}\"/>");
+        b.Append("<label posn=\"1.2 -3.6 0.02\" sizen=\"60 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"CCCF\" text=\"Click a preset to start a vote. Everyone on the server can vote with Yes / No.\"/>");
+
+        for (var i = 0; i < presets.Count; i++)
+        {
+            var (name, preset) = presets[i];
+            var x = 1 + (i % 2) * cardWidth;
+            var y = -6 - (i / 2) * (cardHeight + 0.4);
+            var active = current is not null && preset is not null && current.DisplayName == preset.DisplayName && current.SourceFromEventList == preset.SourceFromEventList;
+            var title = PresetShortName(name, preset);
+            var description = string.IsNullOrWhiteSpace(preset?.Description) ? name : preset.Description;
+
+            b.Append($"<frame posn=\"{Inv(x)} {Inv(y)} 0.02\">");
+            b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(cardWidth - 0.4)} {Inv(cardHeight)}\" style=\"BgsPlayerCard\" substyle=\"{(active ? "BgCardSystem" : "ProgressBar")}\" action=\"{ActionPresetBase + i}\"/>");
+            b.Append($"<label posn=\"1 -0.7 0.01\" sizen=\"{Inv((cardWidth - 9) / 1.0)} 2\" textsize=\"2\" text=\"{Esc((active ? "$3F5" : "$FFF") + title)}\"/>");
+            if (active)
+            {
+                b.Append($"<label posn=\"{Inv(cardWidth - 1.4)} -0.9 0.01\" sizen=\"10 2\" halign=\"right\" textsize=\"1\" scale=\"0.75\" textcolor=\"3F5F\" text=\"ACTIVE NOW\"/>");
+            }
+            else
+            {
+                b.Append($"<label posn=\"{Inv(cardWidth - 1.4)} -0.9 0.01\" sizen=\"10 2\" halign=\"right\" textsize=\"1\" scale=\"0.75\" textcolor=\"FC0F\" text=\"VOTE\"/>");
+            }
+
+            b.Append($"<label posn=\"1 -3.0 0.01\" sizen=\"{Inv((cardWidth - 2.4) / 0.85)} 2\" textsize=\"1\" scale=\"0.85\" textcolor=\"DDDF\" text=\"{Esc(description)}\"/>");
+            b.Append("</frame>");
+        }
+
+        b.Append($"<label posn=\"1.2 {Inv(-height + 2)} 0.02\" sizen=\"60 2\" textsize=\"1\" scale=\"0.8\" textcolor=\"AAAF\" text=\"{Esc("Tip: /votepreset lunatic - short names work too.")}\"/>");
+        b.Append("</frame></manialink>");
+        return b.ToString();
     }
 
     private const double HistoryNameWidthBudget = 30.0;
@@ -4158,65 +4186,11 @@ internal sealed partial class RandomizerGame
     private const double EastAsianWideWidth = 3.0;
 
     // gold/silver/bronze colors for the top 3 ranks - "$o" bolds, reset with "$z" before the name
-    // itself so a player's own raw nickname color (or the default white) takes back over
-    private static readonly string[] RankColors = ["FD0", "CCC", "C83"];
 
     private const string DiscordInviteUrl = "https://discord.gg/HRShWnzpK3";
     // TMF prepends "http://" to a quad's url attribute itself, so it must be given without a scheme
     private const string DiscordInviteUrlNoScheme = "discord.gg/HRShWnzpK3";
     private string FavoriteServerUrl => $"tmtp://#addfavourite={config.FavoriteLogin}";
-
-    private static string BuildTop10Manialink(IReadOnlyList<LeaderboardEntry> top, string assetBaseUrl, string favoriteUrl)
-    {
-        // manialink coordinates must use "." as the decimal separator regardless of the host
-        // machine's locale - see the identical note on BuildPresetListManialink
-        static string Inv(double value) => value.ToString(System.Globalization.CultureInfo.InvariantCulture);
-
-        var rows = new System.Text.StringBuilder();
-        var y = 16;
-
-        // box is right-anchored at x=64 with this width, so its center (for the title) sits at
-        // 64 - width/2 - keep these two in sync if the width ever changes again
-        const double boxWidth = 17.0;
-        const double boxCenterX = 64.0 - (boxWidth / 2.0);
-
-        rows.AppendLine($"""<label posn="{Inv(boxCenterX)} 18 5" halign="center" valign="center" textsize="1.6" textcolor="FF0F" text="$s$oTop 10 Finishers"/>""");
-
-        // thin yellow rule under the header, same color as the header text
-        rows.AppendLine($"""<quad posn="{Inv(64.0 - boxWidth + 0.8)} 16.6 5" sizen="{Inv(boxWidth - 1.6)} 0.2" halign="left" valign="center" bgcolor="FF0F"/>""");
-
-        for (var i = 0; i < top.Count; i++)
-        {
-            var entry = top[i];
-
-            // truncation is code-aware (see TruncateForDisplayWidth), so even a cut-off name keeps
-            // its real in-game color. Reset with "$z" rather than wrapping in "$<...$>" - TMF's
-            // manialink parser isn't standards-compliant XML, so a literal "<"/">" here would get
-            // entity-escaped below and might not get decoded back by the game
-            var source = string.IsNullOrEmpty(entry.RawNickname) ? entry.LastNickname : entry.RawNickname;
-            var displayName = TruncateForDisplayWidth(source, Top10NicknameWidthBudget);
-
-            // name and score share ONE right-aligned label - splitting them into two independently
-            // anchored labels left a visible gap between a truncated "…" and the score whenever the
-            // name didn't reach its own anchor. A single label keeps them contiguous, and the score
-            // (as the last characters in the string) still lands exactly on the right anchor.
-            var rankPrefix = i < RankColors.Length ? $"$o${RankColors[i]}{i + 1}.$z" : $"{i + 1}.";
-            var text = System.Security.SecurityElement.Escape($"{rankPrefix} {displayName} $z$FFF- {entry.Finishes}");
-            y -= 4;
-            rows.AppendLine($"""<label posn="63.5 {y} 5" halign="right" valign="center" textsize="1.2" textcolor="FFF" text="{text}"/>""");
-        }
-
-        var boxHeight = 7 + (top.Count * 4);
-
-        return $"""
-            <manialink id="top10_panel" version="1">
-                <quad posn="64 20 4" sizen="{Inv(boxWidth)} {boxHeight}" halign="right" valign="top" bgcolor="0008"/>
-                {rows}
-                <quad posn="55.5 27 5" sizen="3.9 5.2" halign="left" valign="top" image="{assetBaseUrl}/discord.png" url="{DiscordInviteUrlNoScheme}"/>
-                <quad posn="60.1 27 5" sizen="3.9 5.2" halign="left" valign="top" image="{assetBaseUrl}/favorite.png" manialink="{favoriteUrl}"/>
-            </manialink>
-            """;
-    }
 
     // plain-text nickname for destinations that don't understand TM's $-formatting codes (e.g. Discord)
     private string GetPlainNickname(string login)

@@ -1,0 +1,1000 @@
+using System.Collections.Concurrent;
+using System.Globalization;
+using System.Security;
+using System.Text;
+using System.Text.RegularExpressions;
+using TmEssentials;
+
+namespace RandomizerAnywhere;
+
+// The in-game HUD: map panel (top left), tile bar (top right), top finishers (right), event list
+// (left, only with the event module on), checkpoint counter (bottom) and personal times (bottom
+// right). Laid out and styled after Records Eyepiece (XAseco): the game's own Bgs1InRace/NavButton
+// boxes, BgsPlayerCard title bars and highlight bars, Icons128x128_1 icons, line height 1.8.
+//
+// Everything is sent per player - the top finishers show the player's own place, and every player
+// can fold or switch off parts (HudSettings) - as one <manialinks> page per player and update. A
+// part that is off is sent as an empty manialink with its id, which removes it.
+internal sealed partial class RandomizerGame
+{
+    [Flags]
+    private enum HudSection
+    {
+        None = 0,
+        Map = 1,
+        Toolbar = 2,
+        Top = 4,
+        Event = 8,
+        Cp = 16,
+        Times = 32,
+        Keys = 64,
+        All = Map | Toolbar | Top | Event | Cp | Times | Keys,
+    }
+
+    // manialink ids - the first three are the ids the old widgets used, so the new ones replace them
+    private const string HudMapId = "map_info";
+    private const string HudCpId = "cp_counter";
+    private const string HudTopId = "top10_panel";
+    private const string HudToolbarId = "hud_toolbar";
+    private const string HudEventId = "event_list";
+    private const string HudTimesId = "hud_times";
+    private const string HudKeysId = "hud_keys";
+
+    // click actions, all >= ActionHudBase so they never reach the preset/history ranges
+    private const int ActionHudBase = 1000;
+    private const int ActionHudSkipVote = 1001;
+    private const int ActionHudMapVoteHint = 1002;
+    private const int ActionHudPresets = 1003;
+    private const int ActionHudHistory = 1004;
+    private const int ActionHudToggleAll = 1005;
+    private const int ActionHudHelp = 1006;
+    private const int ActionHudMenuClose = 1007;
+    private const int ActionHudMenuReset = 1009;
+    private const int ActionHudMenuToggleBase = 1200;
+    private const string HudMenuId = "hud_menu";
+    private const int ActionHudCollapseMap = 1010;
+    private const int ActionHudCollapseTop = 1011;
+    private const int ActionHudCollapseEvent = 1012;
+    private const int ActionEventPagePrev = 1020;
+    private const int ActionEventPageNext = 1021;
+    private const int ActionEventRowBase = 1100;
+
+    private const double LineHeight = 1.8;
+    private const int EventRowsPerPage = 10;
+
+    private readonly object hudGate = new();
+
+    // this map's best time per player, the checkpoint times of that best run, and the run in progress
+    private readonly Dictionary<string, int> mapBestTimes = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int[]> mapBestCheckpoints = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, List<int>> runCheckpoints = new(StringComparer.OrdinalIgnoreCase);
+
+    // TMX details of the running map (author, difficulty, awards, WR), filled in from the side
+    private int? currentMapDetailsTrackId;
+    private TmxRules.TrackDetails? currentMapDetails;
+    private string? currentMapRawName;
+
+    private readonly ConcurrentDictionary<int, TmxRules.TrackDetails> eventMapDetails = new();
+    private readonly ConcurrentDictionary<string, int> eventPage = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, int[]> eventRowsShown = new(StringComparer.OrdinalIgnoreCase);
+
+    private int mapsStartedCount;
+    private bool eventDoneAnnounced;
+    private int? cachedMaxPlayers;
+
+    private bool HudAvailable => !config.IsLegacyServer;
+
+    private static string Inv(double value) => value.ToString("0.###", CultureInfo.InvariantCulture);
+
+    private static string Esc(string text) => SecurityElement.Escape(text) ?? string.Empty;
+
+    private static string FormatTime(int ms) => ms <= 0 ? "--" : new TimeInt32(ms).ToString();
+
+    // ---- state updates ----
+
+    private void ResetHudForNewMap()
+    {
+        lock (hudGate)
+        {
+            mapBestTimes.Clear();
+            mapBestCheckpoints.Clear();
+            runCheckpoints.Clear();
+            currentMapDetails = null;
+            currentMapDetailsTrackId = null;
+            mapsStartedCount++;
+        }
+    }
+
+    // CheckpointIndex counts on across laps; the run starts over when it is 0 again
+    private void RecordCheckpointTime(string login, int checkpointIndex, int time)
+    {
+        lock (hudGate)
+        {
+            if (checkpointIndex == 0 || !runCheckpoints.TryGetValue(login, out var run))
+            {
+                run = [];
+                runCheckpoints[login] = run;
+            }
+
+            while (run.Count <= checkpointIndex)
+            {
+                run.Add(0);
+            }
+
+            run[checkpointIndex] = time;
+        }
+    }
+
+    // split of this checkpoint against the same checkpoint of the player's best run on this map
+    private int? CheckpointSplit(string login, int checkpointIndex)
+    {
+        lock (hudGate)
+        {
+            if (mapBestCheckpoints.TryGetValue(login, out var best) && checkpointIndex < best.Length
+                && runCheckpoints.TryGetValue(login, out var run) && checkpointIndex < run.Count)
+            {
+                return run[checkpointIndex] - best[checkpointIndex];
+            }
+
+            return null;
+        }
+    }
+
+    // a finish: keeps the best time and that run's checkpoints. True when it is a new best.
+    private bool RecordMapFinishTime(string login, int time)
+    {
+        if (time <= 0)
+        {
+            return false;
+        }
+
+        lock (hudGate)
+        {
+            if (mapBestTimes.TryGetValue(login, out var best) && best <= time)
+            {
+                return false;
+            }
+
+            mapBestTimes[login] = time;
+            if (runCheckpoints.TryGetValue(login, out var run))
+            {
+                mapBestCheckpoints[login] = [.. run];
+            }
+
+            return true;
+        }
+    }
+
+    // Called from the PlayerFinish callback for every finish, before the auto-skip logic.
+    private async Task OnHudFinishAsync(string login, int time, CancellationToken cancellationToken)
+    {
+        if (time <= 0)
+        {
+            return;
+        }
+
+        RecordMapFinishTime(login, time);
+
+        if (eventMode.Enabled && currentMapTrackId is { } trackId && eventMode.IsListed(trackId))
+        {
+            if (await eventMode.RecordFinishAsync(trackId, login, GetRawNickname(login), time))
+            {
+                var name = eventMapDetails.TryGetValue(trackId, out var d) ? d.Name : $"#{trackId}";
+                await SendMessageAsync($"$FC0» Event: {GetNicknameOrLogin(login)}$z$FC0 finished {name} first ({FormatTime(time)}) - {eventMode.OpenMaps.Count} map(s) left.", cancellationToken);
+            }
+        }
+
+        await BroadcastHudAsync(HudSection.Times, cancellationToken);
+    }
+
+    // ---- sending ----
+
+    private async Task SendHudAsync(string login, HudSection sections, CancellationToken cancellationToken)
+    {
+        if (!HudAvailable || sections == HudSection.None)
+        {
+            return;
+        }
+
+        var page = BuildHudPage(login, sections);
+        await client.SendManialinkPageToLoginAsync(login, page, cancellationToken: cancellationToken);
+    }
+
+    private async Task BroadcastHudAsync(HudSection sections, CancellationToken cancellationToken)
+    {
+        if (!HudAvailable)
+        {
+            return;
+        }
+
+        IReadOnlyList<PlayerSummary> players;
+        try
+        {
+            players = await client.GetPlayersAsync(cancellationToken);
+            lastPolledPlayers = players;
+        }
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            players = lastPolledPlayers;
+        }
+
+        foreach (var player in players)
+        {
+            try
+            {
+                await SendHudAsync(player.Login, sections, cancellationToken);
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                // a player who just left - the others still get theirs
+                Diagnostics.Trace($"hud send to {player.Login} failed: {ex.Message}");
+            }
+        }
+    }
+
+    // TMX details for the running map, from the side - BeginRace never waits for TMX
+    private void FetchCurrentMapDetailsInBackground(int trackId)
+    {
+        RunInBackground($"loading the TMX details of map {trackId}", async () =>
+        {
+            using var budget = CancellationTokenSource.CreateLinkedTokenSource(appToken);
+            budget.CancelAfter(TrackMetaBudget);
+            var details = await tmxRules.GetTrackDetailsAsync(trackId, budget.Token);
+
+            if (currentMapTrackId != trackId)
+            {
+                return;
+            }
+
+            lock (hudGate)
+            {
+                currentMapDetails = details;
+                currentMapDetailsTrackId = trackId;
+            }
+
+            await BroadcastHudAsync(HudSection.Map | HudSection.Times, appToken);
+        });
+    }
+
+    // the event list changed (hand edit, a finish here or on another server)
+    private void OnEventChanged()
+    {
+        RunInBackground("refreshing the event list", async () =>
+        {
+            await LoadEventMapDetailsAsync(appToken);
+            await BroadcastHudAsync(HudSection.Event | HudSection.Toolbar, appToken);
+        });
+    }
+
+    private async Task LoadEventMapDetailsAsync(CancellationToken cancellationToken)
+    {
+        var missing = eventMode.AllMaps.Select(m => m.TrackId).Where(id => !eventMapDetails.ContainsKey(id)).ToList();
+        if (missing.Count == 0)
+        {
+            return;
+        }
+
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        budget.CancelAfter(TimeSpan.FromSeconds(30));
+
+        try
+        {
+            foreach (var (id, details) in await tmxRules.GetTrackDetailsBatchAsync(missing, budget.Token))
+            {
+                eventMapDetails[id] = details;
+            }
+        }
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            Console.WriteLine($"Warning: couldn't load the event maps' names from TMX - {ex.Message}. Showing ids until the next try.");
+        }
+    }
+
+    // every 15 s: tiles (players, session time), the event list (other servers' maps) and, with the
+    // event module on, this server's heartbeat in the shared state file
+    private async Task HudLoopAsync(CancellationToken cancellationToken)
+    {
+        if (eventMode.Enabled)
+        {
+            eventMode.Changed += OnEventChanged;
+            await LoadEventMapDetailsAsync(cancellationToken);
+        }
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                if (eventMode.Enabled)
+                {
+                    await eventMode.PublishServerAsync(config.FavoriteLogin, currentMapTrackId, currentMapRawName is null ? null : StripTmCodes(currentMapRawName),
+                        lastPolledPlayers.Count, cachedMaxPlayers ?? 0);
+                }
+
+                if (HudAvailable)
+                {
+                    await EnsureMaxPlayersAsync(cancellationToken);
+                    await BroadcastHudAsync(HudSection.Toolbar | (eventMode.Enabled ? HudSection.Event : HudSection.None), cancellationToken);
+                }
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                Diagnostics.Trace($"hud loop: {ex.Message}");
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(15), cancellationToken);
+        }
+    }
+
+    private async Task EnsureMaxPlayersAsync(CancellationToken cancellationToken)
+    {
+        if (cachedMaxPlayers is not null)
+        {
+            return;
+        }
+
+        try
+        {
+            var result = await client.TracedCallAsync<Dictionary<string, object>>("GetMaxPlayers", [], cancellationToken);
+            cachedMaxPlayers = result.TryGetValue("CurrentValue", out var v) && v is int max ? max : null;
+        }
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            // the tile shows the count alone until it works
+        }
+    }
+
+    // ---- clicks and /hud ----
+
+    private async Task HandleHudActionAsync(int playerUid, string login, int answer, CancellationToken cancellationToken)
+    {
+        switch (answer)
+        {
+            case ActionHudSkipVote:
+                await SkipAsync(playerUid, login, [], cancellationToken);
+                return;
+            case ActionHudMapVoteHint:
+                await SendMessageAsync(login, eventMode.Enabled && eventMode.AllMaps.Count > 0
+                    ? "Click a map in the event list to vote for it, or type $FF0/votemap <TMX id>$FFF."
+                    : "Type $FF0/votemap <TMX id>$FFF in chat to vote for a map (the id is in the map's TMX link).", cancellationToken);
+                return;
+            case ActionHudPresets:
+                await PresetsAsync(playerUid, login, [], cancellationToken);
+                return;
+            case ActionHudHistory:
+                await HistoryAsync(playerUid, login, [], cancellationToken);
+                return;
+            case ActionHudToggleAll:
+                await hudSettings.UpdateAsync(login, p => p.AllHidden = !p.AllHidden);
+                await SendHudAsync(login, HudSection.All, cancellationToken);
+                return;
+            case ActionHudHelp:
+                await client.SendManialinkPageToLoginAsync(login, BuildHudMenu(login), cancellationToken: cancellationToken);
+                return;
+            case ActionHudMenuClose:
+                await client.SendManialinkPageToLoginAsync(login, $"<manialink id=\"{HudMenuId}\"></manialink>", cancellationToken: cancellationToken);
+                return;
+            case ActionHudMenuReset:
+                await hudSettings.UpdateAsync(login, p =>
+                {
+                    p.AllHidden = false;
+                    p.Hidden.Clear();
+                    p.Collapsed.Clear();
+                });
+                await SendHudAsync(login, HudSection.All, cancellationToken);
+                await client.SendManialinkPageToLoginAsync(login, BuildHudMenu(login), cancellationToken: cancellationToken);
+                return;
+            case ActionHudCollapseMap:
+                await ToggleCollapsedAsync(login, HudPart.Map, HudSection.Map, cancellationToken);
+                return;
+            case ActionHudCollapseTop:
+                await ToggleCollapsedAsync(login, HudPart.Top, HudSection.Top, cancellationToken);
+                return;
+            case ActionHudCollapseEvent:
+                await ToggleCollapsedAsync(login, HudPart.Event, HudSection.Event, cancellationToken);
+                return;
+            case ActionEventPagePrev:
+            case ActionEventPageNext:
+                eventPage.AddOrUpdate(login, _ => answer == ActionEventPageNext ? 1 : 0,
+                    (_, page) => Math.Max(0, page + (answer == ActionEventPageNext ? 1 : -1)));
+                await SendHudAsync(login, HudSection.Event, cancellationToken);
+                return;
+        }
+
+        if (answer >= ActionHudMenuToggleBase && answer < ActionHudMenuToggleBase + 20 && Enum.IsDefined(typeof(HudPart), answer - ActionHudMenuToggleBase))
+        {
+            var part = (HudPart)(answer - ActionHudMenuToggleBase);
+            await hudSettings.UpdateAsync(login, p =>
+            {
+                p.AllHidden = false;
+                if (!p.Hidden.Remove(part))
+                {
+                    p.Hidden.Add(part);
+                }
+            });
+            await SendHudAsync(login, HudSection.All, cancellationToken);
+            await client.SendManialinkPageToLoginAsync(login, BuildHudMenu(login), cancellationToken: cancellationToken);
+            return;
+        }
+
+        var row = answer - ActionEventRowBase;
+        if (row >= 0 && row < EventRowsPerPage && eventRowsShown.TryGetValue(login, out var ids) && row < ids.Length)
+        {
+            await VoteMapAsync(playerUid, login, [ids[row].ToString(CultureInfo.InvariantCulture)], cancellationToken);
+        }
+    }
+
+    private async Task ToggleCollapsedAsync(string login, HudPart part, HudSection section, CancellationToken cancellationToken)
+    {
+        await hudSettings.UpdateAsync(login, p =>
+        {
+            if (!p.Collapsed.Remove(part))
+            {
+                p.Collapsed.Add(part);
+            }
+        });
+
+        await SendHudAsync(login, section, cancellationToken);
+    }
+
+    private static readonly Dictionary<string, HudPart> HudPartNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["map"] = HudPart.Map,
+        ["top"] = HudPart.Top,
+        ["finishers"] = HudPart.Top,
+        ["event"] = HudPart.Event,
+        ["list"] = HudPart.Event,
+        ["cp"] = HudPart.Cp,
+        ["checkpoints"] = HudPart.Cp,
+        ["times"] = HudPart.Times,
+        ["toolbar"] = HudPart.Toolbar,
+        ["tiles"] = HudPart.Toolbar,
+    };
+
+    private async Task HudAsync(int playerUid, string login, string[] args, CancellationToken cancellationToken)
+    {
+        if (!HudAvailable)
+        {
+            await SendMessageAsync(login, "This server has no HUD widgets.", cancellationToken);
+            return;
+        }
+
+        if (args.Length == 0)
+        {
+            await SendHudHelpAsync(login, cancellationToken);
+            return;
+        }
+
+        var first = args[0].ToLowerInvariant();
+
+        if (first is "on" or "off")
+        {
+            await hudSettings.UpdateAsync(login, p => p.AllHidden = first == "off");
+        }
+        else if (first == "reset")
+        {
+            await hudSettings.UpdateAsync(login, p =>
+            {
+                p.AllHidden = false;
+                p.Hidden.Clear();
+                p.Collapsed.Clear();
+            });
+        }
+        else if (HudPartNames.TryGetValue(first, out var part))
+        {
+            var turnOn = args.Length > 1 ? args[1].Equals("on", StringComparison.OrdinalIgnoreCase) : !hudSettings.Get(login).Shows(part);
+            await hudSettings.UpdateAsync(login, p =>
+            {
+                p.AllHidden = false;
+                if (turnOn)
+                {
+                    p.Hidden.Remove(part);
+                }
+                else
+                {
+                    p.Hidden.Add(part);
+                }
+            });
+            await SendMessageAsync(login, $"HUD: {first} is now {(turnOn ? "$0F0on" : "$F33off")}$FFF.", cancellationToken);
+        }
+        else
+        {
+            await SendHudHelpAsync(login, cancellationToken);
+            return;
+        }
+
+        await SendHudAsync(login, HudSection.All, cancellationToken);
+    }
+
+    private async Task SendHudHelpAsync(string login, CancellationToken cancellationToken)
+    {
+        var prefs = hudSettings.Get(login);
+        var off = prefs.Hidden.Count == 0 ? "none" : string.Join(", ", prefs.Hidden.Select(p => p.ToString().ToLowerInvariant()));
+        await SendMessageAsync(login,
+        [
+            "$FC0HUD$FFF: $FF0F7$FFF or $FF0/hud off$FFF/$FF0on$FFF hides/shows everything, $FF0/hud reset$FFF restores the default.",
+            $"Single parts: $FF0/hud map|top|event|cp|times|toolbar off$FFF (or on). Off right now: {off}.",
+        ], cancellationToken);
+    }
+
+    // The HUD menu (tile "HUD" or /hud without arguments shows the chat help): every part with an
+    // on/off switch, plus "reset". Kept per player in HudSettings like the "-" folding.
+    private string BuildHudMenu(string login)
+    {
+        var prefs = hudSettings.Get(login);
+        (HudPart Part, string Name, string Note)[] parts =
+        [
+            (HudPart.Map, "Current map", "name, author, AT, TMX, votes"),
+            (HudPart.Top, "Top finishers", "top 10 and your place"),
+            (HudPart.Event, "Event list", "open maps, other servers"),
+            (HudPart.Cp, "Checkpoint counter", "CP and split to your best"),
+            (HudPart.Times, "Personal times", "PB, server best, TMX WR"),
+            (HudPart.Toolbar, "Tile bar", "players, preset, links"),
+        ];
+
+        const double width = 40;
+        var height = 6.6 + parts.Length * 2.6 + 3.2;
+
+        var b = new StringBuilder();
+        b.Append($"<manialink id=\"{HudMenuId}\"><frame posn=\"{Inv(-width / 2)} {Inv(height / 2 + 2)} 20\">");
+        b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"BgWindow2\"/>");
+        b.Append($"<quad posn=\"0.4 -0.36 0.01\" sizen=\"{Inv(width - 0.8)} 2.6\" style=\"BgsPlayerCard\" substyle=\"BgRacePlayerName\"/>");
+        b.Append("<quad posn=\"0.7 0 0.02\" sizen=\"3 3\" style=\"Icons128x128_1\" substyle=\"Advanced\"/>");
+        b.Append("<label posn=\"4.2 -0.75 0.02\" sizen=\"30 2\" textsize=\"2\" text=\"HUD settings\"/>");
+        b.Append($"<quad posn=\"{Inv(width - 3.2)} -0.5 0.03\" sizen=\"2.4 2.4\" style=\"Icons64x64_1\" substyle=\"Close\" action=\"{ActionHudMenuClose}\"/>");
+        b.Append("<label posn=\"1.2 -3.6 0.02\" sizen=\"42 2\" textsize=\"1\" scale=\"0.85\" textcolor=\"CCCF\" text=\"Saved for your login. F7 hides or shows everything at once.\"/>");
+
+        var y = -6.0;
+        foreach (var (part, name, note) in parts)
+        {
+            var on = !prefs.Hidden.Contains(part);
+            b.Append($"<quad posn=\"0.8 {Inv(y)} 0.01\" sizen=\"{Inv(width - 1.6)} 2.3\" style=\"BgsPlayerCard\" substyle=\"ProgressBar\"/>");
+            b.Append($"<label posn=\"1.6 {Inv(y - 0.4)} 0.02\" sizen=\"14 2\" textsize=\"1\" text=\"{Esc(name)}\"/>");
+            b.Append($"<label posn=\"15.5 {Inv(y - 0.5)} 0.02\" sizen=\"{Inv(15 / 0.8)} 2\" textsize=\"1\" scale=\"0.8\" textcolor=\"AAAF\" text=\"{Esc(note)}\"/>");
+            b.Append($"<quad posn=\"{Inv(width - 7.2)} {Inv(y - 0.25)} 0.02\" sizen=\"5.8 1.8\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\" action=\"{ActionHudMenuToggleBase + (int)part}\"/>");
+            b.Append($"<label posn=\"{Inv(width - 4.3)} {Inv(y - 1.15)} 0.03\" sizen=\"5.6 2\" halign=\"center\" valign=\"center\" textsize=\"1\" text=\"{(on ? "$3F5ON" : "$F33OFF")}\"/>");
+            y -= 2.6;
+        }
+
+        y -= 0.4;
+        b.Append($"<quad posn=\"0.8 {Inv(y)} 0.02\" sizen=\"12 2.2\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\" action=\"{ActionHudToggleAll}\"/>");
+        b.Append($"<label posn=\"6.8 {Inv(y - 1.1)} 0.03\" sizen=\"12 2\" halign=\"center\" valign=\"center\" textsize=\"1\" text=\"{(prefs.AllHidden ? "Show all (F7)" : "Hide all (F7)")}\"/>");
+        b.Append($"<quad posn=\"13.4 {Inv(y)} 0.02\" sizen=\"9 2.2\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\" action=\"{ActionHudMenuReset}\"/>");
+        b.Append($"<label posn=\"17.9 {Inv(y - 1.1)} 0.03\" sizen=\"9 2\" halign=\"center\" valign=\"center\" textsize=\"1\" text=\"Reset\"/>");
+        b.Append("</frame></manialink>");
+        return b.ToString();
+    }
+
+    // ---- page building ----
+
+    private string BuildHudPage(string login, HudSection sections)
+    {
+        var prefs = hudSettings.Get(login);
+        var b = new StringBuilder("<?xml version=\"1.0\" encoding=\"UTF-8\"?><manialinks>");
+
+        void Part(HudSection section, HudPart? part, string id, Func<string> build)
+        {
+            if (!sections.HasFlag(section))
+            {
+                return;
+            }
+
+            var visible = part is not { } p ? !prefs.AllHidden : prefs.Shows(p);
+            var body = visible ? build() : string.Empty;
+            b.Append("<manialink id=\"").Append(id).Append("\">").Append(body).Append("</manialink>");
+        }
+
+        Part(HudSection.Map, HudPart.Map, HudMapId, () => BuildMapPanel(prefs.Collapsed.Contains(HudPart.Map)));
+        Part(HudSection.Toolbar, HudPart.Toolbar, HudToolbarId, BuildToolbar);
+        Part(HudSection.Top, HudPart.Top, HudTopId, () => BuildTopFinishers(login, prefs.Collapsed.Contains(HudPart.Top)));
+        Part(HudSection.Event, HudPart.Event, HudEventId, () => BuildEventPanel(login, prefs.Collapsed.Contains(HudPart.Event)));
+        Part(HudSection.Cp, HudPart.Cp, HudCpId, () => BuildCheckpointCounter(login));
+        Part(HudSection.Times, HudPart.Times, HudTimesId, () => BuildTimesBlock(login));
+
+        if (sections.HasFlag(HudSection.Keys))
+        {
+            // F7 (actionkey 3) toggles the whole HUD, like Records Eyepiece - the quad itself is off screen
+            b.Append("<manialink id=\"").Append(HudKeysId).Append("\">")
+                .Append($"<quad posn=\"70 70 1\" sizen=\"0 0\" action=\"{ActionHudToggleAll}\" actionkey=\"3\"/>")
+                .Append("</manialink>");
+        }
+
+        b.Append("</manialinks>");
+        return b.ToString();
+    }
+
+    // background box, title bar, icon, title and the fold button - Records Eyepiece's widget header
+    private static void AppendWidgetFrame(StringBuilder b, double width, double height, string iconStyle, string iconSubstyle, string title, int? collapseAction, bool collapsed)
+    {
+        b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\"/>");
+        b.Append($"<quad posn=\"0.4 -0.36 0.01\" sizen=\"{Inv(width - 0.8)} 2\" style=\"BgsPlayerCard\" substyle=\"BgRacePlayerName\"/>");
+        b.Append($"<quad posn=\"0.6 -0.1 0.02\" sizen=\"2.5 2.5\" style=\"{iconStyle}\" substyle=\"{iconSubstyle}\"/>");
+        b.Append($"<label posn=\"3.4 -0.62 0.02\" sizen=\"{Inv(width - 6.5)} 2\" textsize=\"1\" text=\"{Esc(title)}\"/>");
+
+        if (collapseAction is { } action)
+        {
+            b.Append($"<quad posn=\"{Inv(width - 2.4)} -0.5 0.03\" sizen=\"1.7 1.7\" style=\"Icons64x64_1\" substyle=\"{(collapsed ? "ArrowDown" : "ArrowUp")}\" action=\"{action}\"/>");
+        }
+    }
+
+    private string ShortPresetName()
+    {
+        var name = config.LastPreset?.DisplayName;
+        return string.IsNullOrWhiteSpace(name) ? "-" : ShortenPresetDisplayName(name);
+    }
+
+    // "100% TMX Project (TMUF Bay)" -> "100% TMX Bay", "100% TMX Project (TMNF)" -> "100% TMX"
+    internal static string ShortenPresetDisplayName(string displayName)
+    {
+        var name = PresetGameSuffixRegex().Replace(displayName, m => m.Groups[1].Value.Length > 0 ? " " + m.Groups[1].Value : string.Empty);
+        return name.Replace("100% TMX Project", "100% TMX", StringComparison.OrdinalIgnoreCase).Trim();
+    }
+
+    [GeneratedRegex(@"\s*\((?:TMNF|TMUF|ESWC|TMN)\s*([^)]*)\)", RegexOptions.IgnoreCase)]
+    private static partial Regex PresetGameSuffixRegex();
+
+    private static string DifficultyColorCode(string difficultyLabel) => difficultyLabel switch
+    {
+        "Beginner" => "$0F0",
+        "Intermediate" => "$0AF",
+        "Expert" => "$FA0",
+        "Lunatic" => "$F0F",
+        _ => "$FFF",
+    };
+
+    private string BuildMapPanel(bool collapsed)
+    {
+        const double width = 23;
+        var b = new StringBuilder();
+        b.Append("<frame posn=\"-63.6 47.6 1\">");
+
+        var title = $"Current Map $AAA· {ShortPresetName()}";
+
+        if (collapsed)
+        {
+            AppendWidgetFrame(b, width, 2.8, "Icons128x128_1", "NewTrack", title, ActionHudCollapseMap, collapsed: true);
+            b.Append("</frame>");
+            return b.ToString();
+        }
+
+        AppendWidgetFrame(b, width, 12.2, "Icons128x128_1", "NewTrack", title, ActionHudCollapseMap, collapsed: false);
+
+        TmxRules.TrackDetails? details;
+        string? rawName;
+        int? trackId;
+        lock (hudGate)
+        {
+            details = currentMapDetailsTrackId == currentMapTrackId ? currentMapDetails : null;
+            rawName = currentMapRawName;
+            trackId = currentMapTrackId;
+        }
+
+        var name = rawName ?? details?.Name ?? "Loading...";
+        b.Append($"<label posn=\"1 -3 0.02\" sizen=\"21 2.6\" textsize=\"2\" text=\"{Esc(name)}\"/>");
+
+        var line2 = details is null
+            ? (trackId is { } id ? $"TMX #{id}" : "not a TMX map")
+            : $"by {details.Author}$z · {DifficultyColorCode(details.DifficultyLabel)}{details.DifficultyLabel}$z · $FC0{details.Awards} award{(details.Awards == 1 ? "" : "s")}"
+              + (details.Tags.Count > 0 ? $"$z · {details.Tags[0]}" : string.Empty);
+        b.Append($"<label posn=\"1 -5.7 0.02\" sizen=\"21 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(line2)}\"/>");
+
+        var authorTime = currentMap?.AuthorTime ?? details?.AuthorTimeMs ?? 0;
+        var line3 = $"$0F0AT {FormatTime(authorTime)}"
+            + (details?.WrTimeMs is { } wr ? $"$z   $AAATMX WR $8DF{FormatTime(wr)}" : details is not null ? "$z   $AAANo TMX record yet" : string.Empty);
+        b.Append($"<label posn=\"1 -7.5 0.02\" sizen=\"21 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(line3)}\"/>");
+
+        // buttons
+        var x = 0.8;
+        void Button(double w, string text, string attributes)
+        {
+            b.Append($"<quad posn=\"{Inv(x)} -9.4 0.02\" sizen=\"{Inv(w)} 2.2\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\" {attributes}/>");
+            b.Append($"<label posn=\"{Inv(x + w / 2)} -10.5 0.03\" sizen=\"{Inv(w)} 2\" halign=\"center\" valign=\"center\" textsize=\"1\" scale=\"0.85\" text=\"{Esc(text)}\"/>");
+            x += w + 0.4;
+        }
+
+        if (trackId is { } tmxId)
+        {
+            Button(4.2, "TMX", $"url=\"{tmxRules.GetSiteUrl()}/trackshow/{tmxId}\"");
+        }
+
+        Button(6.4, "Skip vote", $"action=\"{ActionHudSkipVote}\"");
+        Button(6.4, "Map vote", $"action=\"{ActionHudMapVoteHint}\"");
+
+        b.Append("</frame>");
+        return b.ToString();
+    }
+
+    private string BuildToolbar()
+    {
+        const double tile = 4.6;
+        const double gap = 0.3;
+        const double height = 5.6;
+        const double wideTile = 9.6;
+
+        var host = string.IsNullOrWhiteSpace(config.PublicHost) ? "localhost" : config.PublicHost;
+        var assetBaseUrl = $"http://{host}:{config.ReplayServerPort}";
+
+        var openEventMaps = eventMode.Enabled && eventMode.AllMaps.Count > 0 ? eventMode.OpenMaps.Count : (int?)null;
+        var players = lastPolledPlayers.Count;
+        var session = sessionStopwatch is { } sw ? sw.Elapsed : (TimeSpan?)null;
+
+        var tiles = new List<(double Width, Action<StringBuilder, double> Draw, string? Attributes)>
+        {
+            (tile, (b, w) => TileText(b, w, cachedMaxPlayers is { } max ? $"{players}/{max}" : players.ToString(CultureInfo.InvariantCulture), "PLAYERS"), null),
+            (tile, (b, w) => TileText(b, w, openEventMaps is { } open ? open.ToString(CultureInfo.InvariantCulture) : mapsStartedCount.ToString(CultureInfo.InvariantCulture), openEventMaps is null ? "MAPS" : "OPEN"), null),
+            (tile, (b, w) => TileText(b, w, session is { } s ? $"{(int)s.TotalHours}:{s.Minutes:00}" : "--", "SESSION"), null),
+            (wideTile, (b, w) => TileText(b, w, ShortPresetName(), "PRESET · VOTE"), $"action=\"{ActionHudPresets}\""),
+            (tile, (b, w) => TileIcon(b, w, "style=\"Icons128x128_1\" substyle=\"LoadTrack\"", "HISTORY"), $"action=\"{ActionHudHistory}\""),
+            (tile, (b, w) => TileIcon(b, w, $"image=\"{assetBaseUrl}/discord.png\"", "DISCORD"), $"url=\"{DiscordInviteUrlNoScheme}\""),
+            (tile, (b, w) => TileIcon(b, w, $"image=\"{assetBaseUrl}/favorite.png\"", "FAVORITE"), $"manialink=\"{FavoriteServerUrl}\""),
+            (tile, (b, w) => TileIcon(b, w, "style=\"Icons128x128_1\" substyle=\"Advanced\"", "HUD · F7"), $"action=\"{ActionHudHelp}\""),
+        };
+
+        var total = tiles.Sum(t => t.Width) + gap * (tiles.Count - 1);
+        var sb = new StringBuilder();
+        sb.Append($"<frame posn=\"{Inv(63.6 - total)} 47.6 1\">");
+
+        var x = 0.0;
+        foreach (var (w, draw, attributes) in tiles)
+        {
+            sb.Append($"<frame posn=\"{Inv(x)} 0 0\">");
+            sb.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(w)} {Inv(height)}\" style=\"BgsPlayerCard\" substyle=\"ProgressBar\" {attributes ?? string.Empty}/>");
+            draw(sb, w);
+            sb.Append("</frame>");
+            x += w + gap;
+        }
+
+        sb.Append("</frame>");
+        return sb.ToString();
+
+        static void TileText(StringBuilder b, double w, string value, string label)
+        {
+            b.Append($"<label posn=\"{Inv(w / 2)} -1.3 0.01\" sizen=\"{Inv(w - 0.4)} 2\" halign=\"center\" textsize=\"1\" text=\"{Esc(value)}\"/>");
+            b.Append($"<label posn=\"{Inv(w / 2)} -3.7 0.01\" sizen=\"{Inv((w - 0.2) / 0.6)} 2\" halign=\"center\" textsize=\"1\" scale=\"0.6\" textcolor=\"FC0F\" text=\"{Esc(label)}\"/>");
+        }
+
+        static void TileIcon(StringBuilder b, double w, string iconAttributes, string label)
+        {
+            b.Append($"<quad posn=\"{Inv(w / 2 - 1.6)} -0.2 0.01\" sizen=\"3.2 3.2\" {iconAttributes}/>");
+            b.Append($"<label posn=\"{Inv(w / 2)} -3.7 0.01\" sizen=\"{Inv((w - 0.2) / 0.6)} 2\" halign=\"center\" textsize=\"1\" scale=\"0.6\" textcolor=\"FC0F\" text=\"{Esc(label)}\"/>");
+        }
+    }
+
+    private string BuildTopFinishers(string login, bool collapsed)
+    {
+        const double width = 17.5;
+        var top = leaderboard.GetTop(10);
+        var own = leaderboard.GetRank(login);
+        var ownInTop = own is { } o && o.Position <= top.Count;
+
+        var b = new StringBuilder();
+        b.Append($"<frame posn=\"{Inv(63.6 - width)} 23.5 1\">");
+
+        if (collapsed)
+        {
+            AppendWidgetFrame(b, width, 2.8, "Icons128x128_1", "Rankings", "Top Finishers", ActionHudCollapseTop, collapsed: true);
+            b.Append("</frame>");
+            return b.ToString();
+        }
+
+        var rows = top.Count + (own is not null && !ownInTop ? 1 : 0);
+        var height = 3.3 + Math.Max(rows, 1) * LineHeight + (own is not null && !ownInTop ? 0.6 : 0) + 0.4;
+        AppendWidgetFrame(b, width, height, "Icons128x128_1", "Rankings", "Top Finishers", ActionHudCollapseTop, collapsed: false);
+
+        // Records Eyepiece colours: top 3 yellow, ahead of you red, you green, behind you grey
+        string CountColor(int position) =>
+            own is { } me && position == me.Position ? "3F5F"
+            : position <= 3 ? "FF0F"
+            : own is { } me2 && position < me2.Position ? "F33F"
+            : own is null ? "FFFF" : "CCCF";
+
+        // dark bar behind the top 3, like the records widgets
+        b.Append($"<quad posn=\"0.4 -2.6 0.01\" sizen=\"{Inv(width - 0.8)} {Inv(Math.Min(3, top.Count) * LineHeight + 0.3)}\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\"/>");
+
+        var y = -2.75;
+        for (var i = 0; i < top.Count; i++)
+        {
+            var position = i + 1;
+            if (own is { } me && me.Position == position)
+            {
+                b.Append($"<quad posn=\"0.4 {Inv(y + 0.15)} 0.015\" sizen=\"{Inv(width - 0.8)} {Inv(LineHeight + 0.1)}\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\"/>");
+            }
+
+            AppendRankRow(b, y, position, top[i].Finishes, string.IsNullOrEmpty(top[i].RawNickname) ? top[i].LastNickname : top[i].RawNickname, CountColor(position), width);
+            y -= LineHeight;
+        }
+
+        if (top.Count == 0)
+        {
+            b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv(width - 2)} 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"CCCF\" text=\"No finishes yet\"/>");
+        }
+
+        if (own is { } mine && !ownInTop)
+        {
+            y -= 0.6;
+            b.Append($"<quad posn=\"0.4 {Inv(y + 0.15)} 0.015\" sizen=\"{Inv(width - 0.8)} {Inv(LineHeight + 0.1)}\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\"/>");
+            AppendRankRow(b, y, mine.Position, mine.Finishes, GetRawNickname(login), "3F5F", width);
+        }
+
+        b.Append("</frame>");
+        return b.ToString();
+    }
+
+    private static void AppendRankRow(StringBuilder b, double y, int position, int count, string nickname, string countColor, double width)
+    {
+        b.Append($"<label posn=\"2.6 {Inv(y)} 0.02\" sizen=\"2.4 2\" halign=\"right\" textsize=\"1\" scale=\"0.9\" text=\"{position}.\"/>");
+        b.Append($"<label posn=\"2.9 {Inv(y)} 0.02\" sizen=\"3.4 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"{countColor}\" text=\"{count}\"/>");
+        b.Append($"<label posn=\"6.4 {Inv(y)} 0.02\" sizen=\"{Inv((width - 7) / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(nickname)}\"/>");
+    }
+
+    private string BuildEventPanel(string login, bool collapsed)
+    {
+        if (!eventMode.Enabled || eventMode.AllMaps.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        const double width = 23;
+        var all = eventMode.AllMaps;
+        var open = eventMode.OpenMaps;
+        var title = $"{eventMode.Title} $AAA· {all.Count - open.Count}/{all.Count} done";
+
+        var b = new StringBuilder();
+        b.Append("<frame posn=\"-63.6 23.5 1\">");
+
+        if (collapsed)
+        {
+            AppendWidgetFrame(b, width, 2.8, "Icons128x128_1", "Challenge", title, ActionHudCollapseEvent, collapsed: true);
+            b.Append("</frame>");
+            return b.ToString();
+        }
+
+        var pages = Math.Max(1, (open.Count + EventRowsPerPage - 1) / EventRowsPerPage);
+        var page = Math.Clamp(eventPage.GetValueOrDefault(login, 0), 0, pages - 1);
+        eventPage[login] = page;
+        var shown = open.Skip(page * EventRowsPerPage).Take(EventRowsPerPage).ToArray();
+        eventRowsShown[login] = [.. shown.Select(m => m.TrackId)];
+
+        var others = eventMode.OtherServers();
+        var recent = eventMode.RecentFinishes(3);
+        var runningHere = currentMapTrackId;
+        var runningElsewhere = others.Where(s => s.TrackId is not null).ToDictionary(s => s.TrackId!.Value, s => s.Label);
+
+        var rowsHeight = Math.Max(shown.Length, 1) * LineHeight;
+        var serversHeight = others.Count > 0 ? 2.2 + others.Count * LineHeight : 0;
+        var recentHeight = recent.Count > 0 ? 2.2 + recent.Count * LineHeight : 0;
+        var height = 3.3 + rowsHeight + 2.4 + serversHeight + recentHeight + 0.3;
+
+        AppendWidgetFrame(b, width, height, "Icons128x128_1", "Challenge", title, ActionHudCollapseEvent, collapsed: false);
+
+        var y = -2.75;
+        if (shown.Length == 0)
+        {
+            b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"21 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"3F5F\" text=\"All maps finished - GG!\"/>");
+            y -= LineHeight;
+        }
+
+        for (var i = 0; i < shown.Length; i++)
+        {
+            var map = shown[i];
+            var number = page * EventRowsPerPage + i + 1;
+            var name = eventMapDetails.TryGetValue(map.TrackId, out var d) ? d.Name : $"TMX #{map.TrackId}";
+            var tag = map.TrackId == runningHere ? "$0F0here"
+                : runningElsewhere.TryGetValue(map.TrackId, out var label) ? $"$FC0{label}"
+                : map.Unlimiter ? "$F80Unlim."
+                : d is not null ? $"$AAA{FormatTime(d.AuthorTimeMs)}" : string.Empty;
+
+            if (map.TrackId == runningHere)
+            {
+                b.Append($"<quad posn=\"0.4 {Inv(y + 0.15)} 0.015\" sizen=\"{Inv(width - 0.8)} {Inv(LineHeight + 0.1)}\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\"/>");
+            }
+
+            // the whole row votes for the map
+            b.Append($"<quad posn=\"0.4 {Inv(y + 0.15)} 0.016\" sizen=\"{Inv(width - 0.8)} {Inv(LineHeight)}\" bgcolor=\"0000\" action=\"{ActionEventRowBase + i}\"/>");
+            b.Append($"<label posn=\"2.6 {Inv(y)} 0.02\" sizen=\"2.4 2\" halign=\"right\" textsize=\"1\" scale=\"0.9\" text=\"{number}.\"/>");
+            b.Append($"<label posn=\"3.0 {Inv(y)} 0.02\" sizen=\"{Inv(14.6 / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(name)}\"/>");
+            b.Append($"<label posn=\"{Inv(width - 0.8)} {Inv(y)} 0.02\" sizen=\"{Inv(5 / 0.8)} 2\" halign=\"right\" textsize=\"1\" scale=\"0.8\" text=\"{Esc(tag)}\"/>");
+            y -= LineHeight;
+        }
+
+        // pages
+        y -= 0.3;
+        b.Append($"<quad posn=\"0.8 {Inv(y + 0.1)} 0.02\" sizen=\"2 2\" style=\"Icons64x64_1\" substyle=\"ArrowPrev\" action=\"{ActionEventPagePrev}\"/>");
+        b.Append($"<label posn=\"{Inv(width / 2)} {Inv(y - 0.2)} 0.02\" sizen=\"14 2\" halign=\"center\" textsize=\"1\" scale=\"0.8\" textcolor=\"CCCF\" text=\"{Esc($"page {page + 1}/{pages} · {open.Count} open · click a map to vote")}\"/>");
+        b.Append($"<quad posn=\"{Inv(width - 2.8)} {Inv(y + 0.1)} 0.02\" sizen=\"2 2\" style=\"Icons64x64_1\" substyle=\"ArrowNext\" action=\"{ActionEventPageNext}\"/>");
+        y -= 2.1;
+
+        if (others.Count > 0)
+        {
+            b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"21 2\" textsize=\"1\" scale=\"0.8\" textcolor=\"FC0F\" text=\"OTHER SERVERS\"/>");
+            y -= 1.9;
+            foreach (var server in others)
+            {
+                var mapName = server.TrackId is { } sid && eventMapDetails.TryGetValue(sid, out var sd) ? sd.Name : server.MapName ?? "-";
+                b.Append($"<quad posn=\"0.4 {Inv(y + 0.15)} 0.016\" sizen=\"{Inv(width - 0.8)} {Inv(LineHeight)}\" bgcolor=\"0000\" manialink=\"tmtp://#join={Esc(server.Login)}\"/>");
+                b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv(16 / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc($"$FC0{server.Label}$z  {mapName}")}\"/>");
+                b.Append($"<label posn=\"{Inv(width - 0.8)} {Inv(y)} 0.02\" sizen=\"{Inv(5 / 0.8)} 2\" halign=\"right\" textsize=\"1\" scale=\"0.8\" text=\"{Esc($"{server.Players}/{server.MaxPlayers} $0F0join")}\"/>");
+                y -= LineHeight;
+            }
+        }
+
+        if (recent.Count > 0)
+        {
+            y -= 0.3;
+            b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"21 2\" textsize=\"1\" scale=\"0.8\" textcolor=\"FC0F\" text=\"LAST FINISHED\"/>");
+            y -= 1.9;
+            foreach (var (trackId, finish) in recent)
+            {
+                var mapName = eventMapDetails.TryGetValue(trackId, out var fd) ? fd.Name : $"#{trackId}";
+                var ago = DateTimeOffset.UtcNow - finish.At;
+                var agoText = ago.TotalMinutes < 1 ? "now" : ago.TotalHours < 1 ? $"{(int)ago.TotalMinutes}m" : $"{(int)ago.TotalHours}h";
+                b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv(9 / 0.85)} 2\" textsize=\"1\" scale=\"0.85\" text=\"{Esc(mapName)}\"/>");
+                b.Append($"<label posn=\"10.3 {Inv(y)} 0.02\" sizen=\"{Inv(7 / 0.85)} 2\" textsize=\"1\" scale=\"0.85\" text=\"{Esc(finish.Nickname)}\"/>");
+                b.Append($"<label posn=\"{Inv(width - 0.8)} {Inv(y)} 0.02\" sizen=\"{Inv(5 / 0.8)} 2\" halign=\"right\" textsize=\"1\" scale=\"0.8\" text=\"{Esc($"$3F5{FormatTime(finish.Time)} $AAA{agoText}")}\"/>");
+                y -= LineHeight;
+            }
+        }
+
+        b.Append("</frame>");
+        return b.ToString();
+    }
+
+    private string BuildCheckpointCounter(string login)
+    {
+        if (currentMapCheckpointTotal is not { } total || total <= 0)
+        {
+            return string.Empty;
+        }
+
+        int current;
+        int? split = null;
+        lock (hudGate)
+        {
+            current = playerCheckpointProgress.GetValueOrDefault(login, 0);
+            if (current > 0 && runCheckpoints.TryGetValue(login, out var run) && run.Count > 0)
+            {
+                split = CheckpointSplit(login, run.Count - 1);
+            }
+        }
+
+        var splitText = split is { } s ? (s <= 0 ? $"  $3F5-{FormatSplit(-s)}" : $"  $F33+{FormatSplit(s)}") : string.Empty;
+        var text = $"CP {Math.Min(current, total)}$AAA/{total}{splitText}";
+
+        return "<frame posn=\"-20 -43.2 1\">"
+            + "<quad posn=\"0 0 0\" sizen=\"11.5 2.7\" style=\"Bgs1InRace\" substyle=\"NavButton\"/>"
+            + $"<label posn=\"5.75 -1.35 0.01\" sizen=\"11 2\" halign=\"center\" valign=\"center\" textsize=\"1\" text=\"{Esc(text)}\"/>"
+            + "</frame>";
+    }
+
+    private static string FormatSplit(int ms) => (ms / 1000.0).ToString("0.00", CultureInfo.InvariantCulture);
+
+    private string BuildTimesBlock(string login)
+    {
+        int? own;
+        int? best;
+        int? wr;
+        lock (hudGate)
+        {
+            own = mapBestTimes.TryGetValue(login, out var t) ? t : null;
+            best = mapBestTimes.Count > 0 ? mapBestTimes.Values.Min() : null;
+            wr = currentMapDetailsTrackId == currentMapTrackId ? currentMapDetails?.WrTimeMs : null;
+        }
+
+        var lines = new List<string>
+        {
+            $"PB: {(own is { } o ? "$3F5" + FormatTime(o) : "$AAA--")}",
+            $"Server: {(best is { } s ? "$FF0" + FormatTime(s) : "$AAA--")}",
+            $"TMX: {(wr is { } w ? "$8DF" + FormatTime(w) : "$AAA--")}",
+        };
+
+        var b = new StringBuilder("<frame posn=\"63.4 -37.4 1\">");
+        var y = 0.0;
+        foreach (var line in lines)
+        {
+            b.Append($"<label posn=\"0 {Inv(y)} 0\" sizen=\"14 2\" halign=\"right\" textsize=\"1\" text=\"{Esc("$s" + line)}\"/>");
+            y -= 2;
+        }
+
+        b.Append("</frame>");
+        return b.ToString();
+    }
+}

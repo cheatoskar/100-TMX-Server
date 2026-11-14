@@ -55,6 +55,12 @@ try
     var leaderboard = provider.GetRequiredService<Leaderboard>();
     await leaderboard.LoadAsync(cts.Token);
 
+    var eventMode = provider.GetRequiredService<EventMode>();
+    await eventMode.LoadAsync(cts.Token);
+    _ = eventMode.RunReloadLoopAsync(TimeSpan.FromSeconds(5), cts.Token);
+
+    await provider.GetRequiredService<HudSettings>().LoadAsync(cts.Token);
+
     serverSetup = provider.GetRequiredService<ServerSetup>();
     await serverSetup.TrySetupAsync(cts.Token);
 
@@ -173,6 +179,8 @@ finally
 [Singleton(typeof(Leaderboard))]
 [Singleton(typeof(MapPool))]
 [Singleton(typeof(PoolCache))]
+[Singleton(typeof(EventMode))]
+[Singleton(typeof(HudSettings))]
 internal partial class AppServiceProvider
 {
     // Every TMX call on this client runs on the XML-RPC callback dispatch loop, which handles
@@ -282,6 +290,11 @@ internal partial class AppServiceProvider
             ConnectionUploadRate = Math.Max(globalConfig.ConnectionUploadRate, 0),
             VerboseRpc = !globalConfig.DisableVerboseRpc,
             KeepConsoleLogs = globalConfig.KeepConsoleLogs > 0 ? globalConfig.KeepConsoleLogs : 30,
+            EventEnabled = Configurator.GetBool(globalConfig.EventEnabled, cmdValue: null, "RANDANY_EVENT_ENABLED"),
+            EventMapsFile = Configurator.GetString(globalConfig.EventMapsFile, cmdValue: null, "RANDANY_EVENT_MAPS_FILE"),
+            EventStateFile = Configurator.GetString(globalConfig.EventStateFile, cmdValue: null, "RANDANY_EVENT_STATE_FILE"),
+            EventServerLabel = Configurator.GetString(globalConfig.EventServerLabel, cmdValue: null, "RANDANY_EVENT_SERVER_LABEL"),
+            EventUnlimiter = Configurator.GetBool(globalConfig.EventUnlimiter, cmdValue: null, "RANDANY_EVENT_UNLIMITER"),
         };
 
         if (!string.IsNullOrWhiteSpace(globalConfig.Preset))

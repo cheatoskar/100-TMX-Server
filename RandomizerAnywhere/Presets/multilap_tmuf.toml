@@ -1,4 +1,5 @@
 DisplayName = "Multilap"
+Description = "Lap maps - switch a map to Rounds with one click for a valid replay."
 Games = ["TMUF"]
 
 TmxGame = "TMUF"

@@ -1,4 +1,5 @@
 DisplayName = "RPG Together"
+Description = "RPG and Trial maps. Long and puzzling, best played as a group."
 Games = ["TMNF"]
 
 TmxGame = "TMNF"

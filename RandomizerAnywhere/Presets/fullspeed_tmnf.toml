@@ -1,4 +1,5 @@
 DisplayName = "Fullspeed"
+Description = "Full throttle, hardly any braking. Fullspeed-tagged maps only."
 Games = ["TMNF"]
 
 TmxGame = "TMNF"

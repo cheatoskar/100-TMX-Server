@@ -41,6 +41,20 @@ Lan = false
 DiscordWebhookUrl = ""
 DiscordWebhookUrlHard = ""
 
+# Event module (off unless EventEnabled = true). A hand-made map list (EventMapsFile, re-read
+# within seconds while the server runs) shown as a list on the left; a finished map is marked
+# done with who, time and when. With the "event" preset the server plays only the open maps.
+# Several servers on one machine run one event together: point their EventMapsFile and
+# EventStateFile at the same files - they share progress, never play the same map at once and
+# list each other's current map. Empty paths = event-maps.json / event-state.json next to the
+# program. EventServerLabel = this server's short name in that list (empty = ServerName).
+# EventUnlimiter = true: this server plays the list's Unlimiter maps ({"id": 123, "unlimiter": true}).
+EventEnabled = false
+EventMapsFile = ""
+EventStateFile = ""
+EventServerLabel = ""
+EventUnlimiter = false
+
 WelcomeMessage = '''
 Built on $FF0Randomizer Anywhere$FF0 (modified) - type $FF0/source$FF0 for the code.
 $FF0Welcome to $s$0BF100% TMX $FF8Project$FF0!

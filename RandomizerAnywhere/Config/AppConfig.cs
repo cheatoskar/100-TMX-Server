@@ -27,6 +27,15 @@ internal sealed class AppConfig
     public required string ServerComment { get; init; }
     public required string GameSettings { get; init; }
     public bool SourceFromImpossibleList { get; set; }
+
+    // the preset draws from the event list's open maps (see EventMode), not from TmxQuery
+    public bool SourceFromEventList { get; set; }
+
+    public bool EventEnabled { get; init; }
+    public string EventMapsFile { get; init; } = string.Empty;
+    public string EventStateFile { get; init; } = string.Empty;
+    public string EventServerLabel { get; init; } = string.Empty;
+    public bool EventUnlimiter { get; init; }
     public required bool AutoStart { get; init; }
     public required IReadOnlySet<string> AdminLogins { get; init; }
     public required string PublicHost { get; init; }

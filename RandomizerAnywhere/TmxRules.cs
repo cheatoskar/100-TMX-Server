@@ -31,6 +31,7 @@ internal sealed class TmxRules
     private readonly SkippedMaps skippedMaps;
     private readonly MapPool mapPool;
     private readonly PoolCache poolCache;
+    private readonly EventMode eventMode;
 
     // After TMX failed to answer, maps come straight from the local pool copy for a while instead
     // of every map switch first waiting for TMX to time out again.
@@ -141,8 +142,9 @@ internal sealed class TmxRules
         return bytes;
     }
 
-    public TmxRules(HttpClient http, AppConfig config, ImpossibleMaps impossibleMaps, SkippedMaps skippedMaps, MapPool mapPool, PoolCache poolCache)
+    public TmxRules(HttpClient http, AppConfig config, ImpossibleMaps impossibleMaps, SkippedMaps skippedMaps, MapPool mapPool, PoolCache poolCache, EventMode eventMode)
     {
+        this.eventMode = eventMode;
         this.http = http;
         this.config = config;
         this.impossibleMaps = impossibleMaps;
@@ -153,8 +155,20 @@ internal sealed class TmxRules
         game = config.TmxGame ?? config.Game;
     }
 
+    // The event preset draws from the event list's open maps (EventMode.PickableIds) - the list is
+    // curated by hand, so the impossible list and the record filter don't apply to it.
+    private bool SourcesFromList => config.SourceFromImpossibleList || (config.SourceFromEventList && eventMode.Enabled);
+
     public string BuildQuery()
     {
+        if (config.SourceFromEventList && eventMode.Enabled)
+        {
+            var eventIds = eventMode.PickableIds();
+            return eventIds.Count == 0
+                ? "id=0" // nothing open - yields "not found"; RandomizerGame stops asking before this
+                : $"id={Uri.EscapeDataString(string.Join(',', eventIds))}";
+        }
+
         if (config.SourceFromImpossibleList)
         {
             var ids = impossibleMaps.AllIds();
@@ -244,7 +258,7 @@ internal sealed class TmxRules
         [18] = "Transitional",
     };
 
-    public sealed record TrackDetails(string Name, string Author, string DifficultyLabel, int Awards, int AuthorTimeMs, IReadOnlyList<string> Tags);
+    public sealed record TrackDetails(string Name, string Author, string DifficultyLabel, int Awards, int AuthorTimeMs, IReadOnlyList<string> Tags, int? WrTimeMs = null);
 
     // richer metadata for a single specific track (name, author, difficulty, AT, style tags) -
     // used to show what a player is voting to load, before it's ever downloaded/enqueued.
@@ -252,7 +266,7 @@ internal sealed class TmxRules
     // "Author"/etc all 400 with "field does not exist", verified live against the real API
     public async Task<TrackDetails> GetTrackDetailsAsync(int trackId, CancellationToken cancellationToken = default)
     {
-        var url = $"https://{GetSiteUrl()}/api/tracks?id={trackId}&fields=TrackName,Uploader.Name,Difficulty,Awards,AuthorTime,Tags";
+        var url = $"https://{GetSiteUrl()}/api/tracks?id={trackId}&fields=TrackName,Uploader.Name,Difficulty,Awards,AuthorTime,Tags,WRReplay.ReplayTime";
         using var response = await http.GetAsync(url, cancellationToken);
         response.EnsureSuccessStatusCode();
 
@@ -272,14 +286,48 @@ internal sealed class TmxRules
         var authorName = result.Uploader?.Name is { Length: > 0 } uploaderName ? uploaderName : "unknown";
         var trackName = result.TrackName is { Length: > 0 } name ? name : $"Track {trackId}";
 
-        return new TrackDetails(trackName, authorName, difficultyLabel, result.Awards, result.AuthorTime, tagNames);
+        return new TrackDetails(trackName, authorName, difficultyLabel, result.Awards, result.AuthorTime, tagNames, result.WRReplay?.ReplayTime);
+    }
+
+    // The same details for many tracks in one request (TMX takes a comma-separated id list), for the
+    // event list. Tracks TMX doesn't know are simply missing from the result.
+    public async Task<Dictionary<int, TrackDetails>> GetTrackDetailsBatchAsync(IReadOnlyCollection<int> trackIds, CancellationToken cancellationToken = default)
+    {
+        var result = new Dictionary<int, TrackDetails>();
+
+        foreach (var chunk in trackIds.Distinct().Chunk(50))
+        {
+            var url = $"https://{GetSiteUrl()}/api/tracks?id={string.Join(',', chunk)}&count={chunk.Length}&fields=TrackId,TrackName,Uploader.Name,Difficulty,Awards,AuthorTime,Tags,WRReplay.ReplayTime";
+            using var response = await http.GetAsync(url, cancellationToken);
+            response.EnsureSuccessStatusCode();
+
+            var payload = await response.Content.ReadFromJsonAsync<TmxApiTrackDetailsResponse>(cancellationToken);
+
+            foreach (var r in payload?.Results ?? [])
+            {
+                if (r.TrackId is not { } id)
+                {
+                    continue;
+                }
+
+                var difficultyLabel = r.Difficulty >= 0 && r.Difficulty < DifficultyLabels.Length ? DifficultyLabels[r.Difficulty] : $"Difficulty {r.Difficulty}";
+                var tagNames = (r.Tags ?? []).Select(t => TagNames.GetValueOrDefault(t, $"Tag {t}")).ToList();
+                result[id] = new TrackDetails(
+                    r.TrackName is { Length: > 0 } n ? n : $"Track {id}",
+                    r.Uploader?.Name is { Length: > 0 } a ? a : "unknown",
+                    difficultyLabel, r.Awards, r.AuthorTime, tagNames, r.WRReplay?.ReplayTime);
+            }
+        }
+
+        return result;
     }
 
     private sealed record TmxApiTrackDetailsResponse(List<TmxApiTrackDetailsResult>? Results);
     // on the impossible or skip list - such a map is never started on purpose
     public bool IsExcludedFromRotation(int trackId) => impossibleMaps.Contains(trackId) || skippedMaps.Contains(trackId);
 
-    private sealed record TmxApiTrackDetailsResult(string? TrackName, TmxApiUploader? Uploader, int Difficulty, int Awards, int AuthorTime, List<int>? Tags);
+    private sealed record TmxApiTrackDetailsResult(string? TrackName, TmxApiUploader? Uploader, int Difficulty, int Awards, int AuthorTime, List<int>? Tags, TmxApiWrReplay? WRReplay = null, int? TrackId = null);
+    private sealed record TmxApiWrReplay(int? ReplayTime);
     private sealed record TmxApiUploader(string? Name);
 
     // downloads a SPECIFIC track by id directly, bypassing /trackrandom entirely - unlike
@@ -344,7 +392,7 @@ internal sealed class TmxRules
 
     private async Task RefreshPoolCopyIfDueAsync(CancellationToken cancellationToken)
     {
-        if (config.SourceFromImpossibleList)
+        if (SourcesFromList)
         {
             return;
         }
@@ -602,7 +650,7 @@ internal sealed class TmxRules
     // right now) - the caller then falls back to /trackrandom.
     private async Task<int[]?> GetCompletePoolAsync(string query, CancellationToken cancellationToken)
     {
-        if (config.SourceFromImpossibleList)
+        if (SourcesFromList)
         {
             return null;
         }
@@ -751,7 +799,7 @@ internal sealed class TmxRules
                 continue;
             }
 
-            if (!config.SourceFromImpossibleList && (impossibleMaps.Contains(trackId) || IsSessionExcluded(trackId)))
+            if (!SourcesFromList && (impossibleMaps.Contains(trackId) || IsSessionExcluded(trackId)))
             {
                 continue;
             }

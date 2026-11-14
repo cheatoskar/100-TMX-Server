@@ -1,4 +1,5 @@
 DisplayName = "Short & LOL"
+Description = "Short, silly maps under 45 seconds. Good for a quick round."
 Games = ["TMUF"]
 
 TmxGame = "TMUF"
