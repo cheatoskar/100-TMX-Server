@@ -4,7 +4,18 @@ namespace RandomizerAnywhere;
 
 internal sealed class ImpossibleMaps
 {
-    private const string SheetCsvUrl = "https://docs.google.com/spreadsheets/d/1fqmzFGPIFBlJuxlwnPJSh1nCTTxqWXtHtvP5OUxE4Ow/export?format=csv&gid=605781157";
+    private const string SheetCsvUrl = "https://docs.google.com/spreadsheets/d/1fqmzFGPIFBlJuxlwnPJSh1nCTTxqWXtHtvP5OUxE4Ow/export?format=csv&gid=";
+
+    // One tab per exchange, same layout (track id in column B, data from row 4). Track ids are
+    // per exchange, so each server reads only the tab of the exchange it draws from. Until
+    // 2026-11-14 only the TMNF tab was read and TMUF/ESWC excluded nothing: TMUF drew 4876836,
+    // which is on the TMUF tab as "Cheated AT".
+    private static readonly Dictionary<GameTitle, string> SheetTabByGame = new()
+    {
+        [GameTitle.TMNF] = "605781157",
+        [GameTitle.TMUF] = "2132753700",
+        [GameTitle.TMN] = "38022687",
+    };
     private const int SheetTrackIdColumn = 1;
     private const int SheetFirstDataRow = 4;
 
@@ -70,18 +81,16 @@ internal sealed class ImpossibleMaps
     // getting excluded without needing a restart
     public async Task RefreshFromSheetAsync(CancellationToken cancellationToken = default)
     {
-        // the shared sheet lists TMNF track ids; on another exchange the same numbers are different
-        // maps, so only a server drawing from tmnf.exchange may use it
-        if (config.EffectiveTmxGame != GameTitle.TMNF)
+        if (!SheetTabByGame.TryGetValue(config.EffectiveTmxGame, out var sheetTab))
         {
-            Console.WriteLine($"Impossible maps: shared sheet is TMNF-only, skipped for {config.EffectiveTmxGame} (local list only).");
+            Console.WriteLine($"Impossible maps: the shared sheet has no tab for {config.EffectiveTmxGame} (local list only).");
             await SaveAsync(cancellationToken);
             return;
         }
 
         try
         {
-            var csv = await FetchFollowingRedirectsAsync(SheetCsvUrl, cancellationToken);
+            var csv = await FetchFollowingRedirectsAsync(SheetCsvUrl + sheetTab, cancellationToken);
             var sheetIds = new HashSet<int>();
 
             using var reader = new StringReader(csv);
@@ -121,7 +130,7 @@ internal sealed class ImpossibleMaps
                     excludedTrackIds.UnionWith(sheetIds);
                 }
 
-                Console.WriteLine($"Impossible maps: {sheetIds.Count} on the sheet ({added} new, {removed} taken off the sheet and allowed again).");
+                Console.WriteLine($"Impossible maps: {sheetIds.Count} on the {config.EffectiveTmxGame} sheet ({added} new, {removed} taken off the sheet and allowed again).");
             }
         }
         catch (Exception ex)
