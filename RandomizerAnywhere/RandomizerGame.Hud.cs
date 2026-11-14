@@ -512,7 +512,7 @@ internal sealed partial class RandomizerGame
 
     private static void AppendWindowHeader(StringBuilder b, double width, double height, string title, int closeAction, string iconStyle = "Icons128x128_1", string iconSubstyle = "Challenge")
     {
-        b.Append($"<quad posn=\"0 0 -0.01\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\"/>");
+        AppendShade(b, width, height, "0005");
         b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\"/>");
         b.Append($"<quad posn=\"0.4 -0.36 0.01\" sizen=\"{Inv(width - 0.8)} 2.6\" style=\"BgsPlayerCard\" substyle=\"BgRacePlayerName\"/>");
         b.Append($"<quad posn=\"0.7 0 0.02\" sizen=\"3 3\" style=\"{iconStyle}\" substyle=\"{iconSubstyle}\"/>");
@@ -531,7 +531,7 @@ internal sealed partial class RandomizerGame
 
         var b = new StringBuilder();
         b.Append($"<manialink id=\"{EventResultsId}\"><frame posn=\"{Inv(-width / 2)} {Inv(height / 2 + 4)} 25\">");
-        b.Append($"<quad posn=\"0 0 -0.01\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\"/>");
+        AppendShade(b, width, height, "0005");
         b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\"/>");
         b.Append($"<quad posn=\"0.4 -0.36 0.01\" sizen=\"{Inv(width - 0.8)} 3\" style=\"BgsPlayerCard\" substyle=\"BgRacePlayerName\"/>");
         b.Append("<quad posn=\"0.7 0 0.02\" sizen=\"3.4 3.4\" style=\"Icons128x128_1\" substyle=\"Rankings\"/>");
@@ -618,7 +618,10 @@ internal sealed partial class RandomizerGame
                         using var budget = CancellationTokenSource.CreateLinkedTokenSource(appToken);
                         budget.CancelAfter(TimeSpan.FromSeconds(30));
                         var file = await tmxRules.GetMapGbxByIdAsync(map.TrackId, budget.Token);
-                        var path = Path.Combine("_RandomizerAny", "event", $"tmx{map.TrackId}.Challenge.Gbx");
+                        // The game server remembers a map under the first path it saw, so when this
+                        // map is played later it reports THIS file. The _tmx<id>_ marker lets the
+                        // controller still tie it to its TMX id (else finishes on it are lost).
+                        var path = Path.Combine("_RandomizerAny", "event", $"event_tmx{map.TrackId}_.Challenge.Gbx");
                         await client.WriteFileAsync(path, file.Data, budget.Token);
                         var info = await client.GetChallengeInfoAsync(path, budget.Token);
                         if (!string.IsNullOrWhiteSpace(info.Name))
@@ -1007,6 +1010,18 @@ internal sealed partial class RandomizerGame
     }
 
     // background box, title bar, icon, title and the fold button - Records Eyepiece's widget header
+    // A dark layer under a NavButton box. A plain rectangle showed its square corners outside the
+    // box's rounded ones, and a second NavButton on top added no darkness at all - so the layer is
+    // three rectangles with the corners cut off, which stay inside the rounding.
+    private static void AppendShade(StringBuilder b, double width, double height, string color)
+    {
+        const double edge = 0.25;
+        const double cut = 0.7;
+        b.Append($"<quad posn=\"{Inv(edge)} {Inv(-cut)} -0.01\" sizen=\"{Inv(width - 2 * edge)} {Inv(height - 2 * cut)}\" bgcolor=\"{color}\"/>");
+        b.Append($"<quad posn=\"{Inv(cut)} {Inv(-edge)} -0.01\" sizen=\"{Inv(width - 2 * cut)} {Inv(cut - edge)}\" bgcolor=\"{color}\"/>");
+        b.Append($"<quad posn=\"{Inv(cut)} {Inv(-(height - cut))} -0.01\" sizen=\"{Inv(width - 2 * cut)} {Inv(cut - edge)}\" bgcolor=\"{color}\"/>");
+    }
+
     private static void AppendWidgetFrame(StringBuilder b, double width, double height, string iconStyle, string iconSubstyle, string title, int? collapseAction, bool collapsed)
     {
         AppendBox(b, width, height);
@@ -1050,12 +1065,9 @@ internal sealed partial class RandomizerGame
     // NavButton alone lets a bright track shine through; a light dark quad just inside its rounded
     // edge makes the text readable without turning the boxes black. Tiles get less of it, so
     // they match the game's own boxes (the "previous / best" panel top right).
-    private static void AppendBox(StringBuilder b, double width, double height, string? attributes = null, bool darker = true)
+    private static void AppendBox(StringBuilder b, double width, double height, string? attributes = null, string shade = "0005")
     {
-        if (darker)
-        {
-            b.Append($"<quad posn=\"0 0 -0.01\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\"/>");
-        }
+        AppendShade(b, width, height, shade);
 
         b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\" {attributes ?? string.Empty}/>");
     }
@@ -1214,7 +1226,7 @@ internal sealed partial class RandomizerGame
         foreach (var (w, draw, attributes) in tiles)
         {
             sb.Append($"<frame posn=\"{Inv(x)} 0 0\">");
-            AppendBox(sb, w, height, attributes, darker: false);
+            AppendBox(sb, w, height, attributes, shade: "0003");
             draw(sb, w);
             sb.Append("</frame>");
             x += w + gap;
@@ -1300,7 +1312,7 @@ internal sealed partial class RandomizerGame
     {
         b.Append($"<label posn=\"2.6 {Inv(y)} 0.02\" sizen=\"2.4 2\" halign=\"right\" textsize=\"1\" scale=\"0.9\" text=\"{position}.\"/>");
         b.Append($"<label posn=\"2.9 {Inv(y)} 0.02\" sizen=\"3.4 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"{countColor}\" text=\"{count}\"/>");
-        b.Append($"<label posn=\"6.4 {Inv(y)} 0.02\" sizen=\"{Inv((width - 7) / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(nickname)}\"/>");
+        b.Append($"<label posn=\"6.4 {Inv(y)} 0.02\" sizen=\"{Inv((width - 7) / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(Fit(nickname, width - 7, CharWidth1 * 0.9))}\"/>");
     }
 
     private string BuildEventPanel(string login, bool collapsed)
