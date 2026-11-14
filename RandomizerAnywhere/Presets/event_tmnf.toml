@@ -13,3 +13,6 @@ SourceFromEventList = true
 # /votemap only takes the event list's open maps while this preset runs (the map vote window
 # lists them). Every other preset leaves it at "any".
 MapVoteScope = "event"
+
+# Nobody can vote the event away; an admin can still switch with /preset.
+LockPreset = true

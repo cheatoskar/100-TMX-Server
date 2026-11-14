@@ -28,6 +28,9 @@ internal sealed class PresetConfig
     // "any" (default) or "event": /votemap only takes the event list's open maps
     public string MapVoteScope { get; set; } = "any";
 
+    // while this preset runs, players can't vote another preset (admins still use /preset)
+    public bool LockPreset { get; set; }
+
     // an empty Games list means "any game"
     public bool SupportsGame(GameTitle game) =>
         Games.Length == 0 || Games.Any(g => string.Equals(g, game.ToString(), StringComparison.OrdinalIgnoreCase));
@@ -61,5 +64,6 @@ internal sealed class PresetConfig
         config.SourceFromImpossibleList = SourceFromImpossibleList;
         config.SourceFromEventList = SourceFromEventList;
         config.MapVoteScope = string.IsNullOrWhiteSpace(MapVoteScope) ? "any" : MapVoteScope.Trim().ToLowerInvariant();
+        config.PresetLocked = LockPreset;
     }
 }

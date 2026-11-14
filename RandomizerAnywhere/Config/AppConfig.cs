@@ -45,6 +45,9 @@ internal sealed class AppConfig
     // who may be voted for with /votemap: "any" TMX map, or only the event list's open maps
     // ("event"). Set by the preset, so the event preset can restrict it and every other one doesn't.
     public string MapVoteScope { get; set; } = "any";
+
+    // set by a preset with LockPreset = true (the event): no preset votes until an admin switches
+    public bool PresetLocked { get; set; }
     public required bool AutoStart { get; init; }
     public required IReadOnlySet<string> AdminLogins { get; init; }
     public required string PublicHost { get; init; }

@@ -2667,6 +2667,12 @@ internal sealed partial class RandomizerGame
             return;
         }
 
+        if (config.PresetLocked)
+        {
+            await SendMessageAsync(login, "$F00The preset is locked right now (event) - an admin can switch it with /preset.", cancellationToken);
+            return;
+        }
+
         if (votePresetName is not null || voteMapTrackId is not null)
         {
             await SendMessageAsync(login, $"$F00A vote for {DescribeActiveVote()} is already in progress.", cancellationToken);
@@ -4003,11 +4009,7 @@ internal sealed partial class RandomizerGame
 
         var b = new System.Text.StringBuilder();
         b.Append($"<manialink id=\"{PresetListManialinkId}\"><frame posn=\"{Inv(-width / 2)} {Inv(height / 2 + 4)} 20\">");
-        b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"BgWindow2\"/>");
-        b.Append($"<quad posn=\"0.4 -0.36 0.01\" sizen=\"{Inv(width - 0.8)} 2.6\" style=\"BgsPlayerCard\" substyle=\"BgRacePlayerName\"/>");
-        b.Append("<quad posn=\"0.7 0 0.02\" sizen=\"3 3\" style=\"Icons128x128_1\" substyle=\"Browse\"/>");
-        b.Append("<label posn=\"4.2 -0.75 0.02\" sizen=\"40 2\" textsize=\"2\" text=\"Choose a preset\"/>");
-        b.Append($"<quad posn=\"{Inv(width - 3.2)} -0.5 0.03\" sizen=\"2.4 2.4\" style=\"Icons64x64_1\" substyle=\"Close\" action=\"{ActionClosePresetList}\"/>");
+        AppendWindowHeader(b, width, height, config.PresetLocked ? "Presets $F33· locked during the event" : "Choose a preset", ActionClosePresetList, "Icons128x128_1", "Browse");
         b.Append("<label posn=\"1.2 -3.6 0.02\" sizen=\"60 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"CCCF\" text=\"Click a preset to start a vote. Everyone on the server can vote with Yes / No.\"/>");
 
         for (var i = 0; i < presets.Count; i++)
@@ -4042,33 +4044,28 @@ internal sealed partial class RandomizerGame
 
     private const double HistoryNameWidthBudget = 30.0;
 
-    private static string BuildHistoryManialink(IReadOnlyList<string> names)
+    // the /history window in the HUD's style - a click on a map shows its TMX link (as "/map -N")
+    private string BuildHistoryManialink(IReadOnlyList<string> names)
     {
-        static string Inv(double value) => value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        const double width = 44;
+        var height = 6.6 + Math.Max(names.Count, 1) * 2.2 + 1;
+        var b = new System.Text.StringBuilder();
+        b.Append($"<manialink id=\"{HistoryManialinkId}\"><frame posn=\"{Inv(-width / 2)} {Inv(height / 2 + 4)} 20\">");
+        AppendWindowHeader(b, width, height, "Last maps", ActionCloseHistory, "Icons128x128_1", "LoadTrack");
+        b.Append("<label posn=\"1.5 -3.9 0.02\" sizen=\"42 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"CCCF\" text=\"Click a map for its TMX link.\"/>");
 
-        var rows = new System.Text.StringBuilder();
-        var y = 18.0;
-
+        var y = -6.0;
         for (var i = 0; i < names.Count; i++)
         {
             var displayName = TruncateForDisplayWidth(names[i], HistoryNameWidthBudget);
-            var text = System.Security.SecurityElement.Escape($"-{i + 1}: {displayName}");
-            rows.AppendLine($"""<quad posn="-19 {Inv(y)} 5" sizen="38 3" halign="left" valign="center" bgcolor="0004" action="{ActionHistoryBase + i}"/>""");
-            rows.AppendLine($"""<label posn="0 {Inv(y)} 6" halign="center" valign="center" textsize="1.2" textcolor="FFF" text="{text}"/>""");
-            y -= 3.5;
+            b.Append($"<quad posn=\"0.8 {Inv(y)} 0.01\" sizen=\"{Inv(width - 1.6)} 2\" style=\"BgsPlayerCard\" substyle=\"ProgressBar\" action=\"{ActionHistoryBase + i}\"/>");
+            b.Append($"<label posn=\"4 {Inv(y - 0.35)} 0.02\" sizen=\"3 2\" halign=\"right\" textsize=\"1\" textcolor=\"FC0F\" text=\"-{i + 1}\"/>");
+            b.Append($"<label posn=\"5 {Inv(y - 0.35)} 0.02\" sizen=\"37 2\" textsize=\"1\" text=\"{Esc(displayName)}\"/>");
+            y -= 2.2;
         }
 
-        var boxHeight = 10 + (names.Count * 3.5);
-
-        return $"""
-            <manialink id="{HistoryManialinkId}" version="1">
-                <quad posn="-20 23 4" sizen="40 {Inv(boxHeight)}" halign="left" valign="top" bgcolor="000C"/>
-                <label posn="0 21.5 5" halign="center" valign="center" textsize="1.5" textcolor="FF0F" text="Click a map for its TMX link"/>
-                <quad posn="18.5 21.7 5" sizen="3 3" halign="center" valign="center" bgcolor="B00A" action="{ActionCloseHistory}"/>
-                <label posn="18.5 21.7 6" halign="center" valign="center" textsize="1.1" textcolor="FFF" text="X"/>
-                {rows}
-            </manialink>
-            """;
+        b.Append("</frame></manialink>");
+        return b.ToString();
     }
 
     // a flat character count doesn't track rendered width - a lot of TMF nicknames lean on wide
