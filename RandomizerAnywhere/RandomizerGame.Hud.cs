@@ -512,7 +512,7 @@ internal sealed partial class RandomizerGame
 
     private static void AppendWindowHeader(StringBuilder b, double width, double height, string title, int closeAction, string iconStyle = "Icons128x128_1", string iconSubstyle = "Challenge")
     {
-        b.Append($"<quad posn=\"0.3 -0.3 -0.01\" sizen=\"{Inv(width - 0.6)} {Inv(height - 0.6)}\" bgcolor=\"0005\"/>");
+        b.Append($"<quad posn=\"0 0 -0.01\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\"/>");
         b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\"/>");
         b.Append($"<quad posn=\"0.4 -0.36 0.01\" sizen=\"{Inv(width - 0.8)} 2.6\" style=\"BgsPlayerCard\" substyle=\"BgRacePlayerName\"/>");
         b.Append($"<quad posn=\"0.7 0 0.02\" sizen=\"3 3\" style=\"{iconStyle}\" substyle=\"{iconSubstyle}\"/>");
@@ -531,7 +531,7 @@ internal sealed partial class RandomizerGame
 
         var b = new StringBuilder();
         b.Append($"<manialink id=\"{EventResultsId}\"><frame posn=\"{Inv(-width / 2)} {Inv(height / 2 + 4)} 25\">");
-        b.Append($"<quad posn=\"0.3 -0.3 -0.01\" sizen=\"{Inv(width - 0.6)} {Inv(height - 0.6)}\" bgcolor=\"0005\"/>");
+        b.Append($"<quad posn=\"0 0 -0.01\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\"/>");
         b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\"/>");
         b.Append($"<quad posn=\"0.4 -0.36 0.01\" sizen=\"{Inv(width - 0.8)} 3\" style=\"BgsPlayerCard\" substyle=\"BgRacePlayerName\"/>");
         b.Append("<quad posn=\"0.7 0 0.02\" sizen=\"3.4 3.4\" style=\"Icons128x128_1\" substyle=\"Rankings\"/>");
@@ -1050,9 +1050,13 @@ internal sealed partial class RandomizerGame
     // NavButton alone lets a bright track shine through; a light dark quad just inside its rounded
     // edge makes the text readable without turning the boxes black. Tiles get less of it, so
     // they match the game's own boxes (the "previous / best" panel top right).
-    private static void AppendBox(StringBuilder b, double width, double height, string? attributes = null, string underlay = "0005")
+    private static void AppendBox(StringBuilder b, double width, double height, string? attributes = null, bool darker = true)
     {
-        b.Append($"<quad posn=\"0.25 -0.25 -0.01\" sizen=\"{Inv(width - 0.5)} {Inv(height - 0.5)}\" bgcolor=\"{underlay}\"/>");
+        if (darker)
+        {
+            b.Append($"<quad posn=\"0 0 -0.01\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\"/>");
+        }
+
         b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\" {attributes ?? string.Empty}/>");
     }
 
@@ -1210,7 +1214,7 @@ internal sealed partial class RandomizerGame
         foreach (var (w, draw, attributes) in tiles)
         {
             sb.Append($"<frame posn=\"{Inv(x)} 0 0\">");
-            AppendBox(sb, w, height, attributes, underlay: "0003");
+            AppendBox(sb, w, height, attributes, darker: false);
             draw(sb, w);
             sb.Append("</frame>");
             x += w + gap;
@@ -1234,7 +1238,7 @@ internal sealed partial class RandomizerGame
 
     private string BuildTopFinishers(string login, bool collapsed)
     {
-        const double width = 17.5;
+        const double width = 15.5;
         var top = leaderboard.GetTop(10);
         var own = leaderboard.GetRank(login);
         var ownInTop = own is { } o && o.Position <= top.Count;
@@ -1451,7 +1455,9 @@ internal sealed partial class RandomizerGame
         const double width = 9;
         const double height = 3.4;
         var aboveClock = hudSettings.Get(login).CpAboveClock;
-        var (x, y) = aboveClock ? (-width / 2, -39.2) : (-21.5, -44.6);
+        // Lower than this above the clock and the game's own timer panel covers the counter
+        // (seen at -39.2; -37.4 was visible).
+        var (x, y) = aboveClock ? (-width / 2, -37.8) : (-21.5, -44.6);
 
         var b = new StringBuilder($"<frame posn=\"{Inv(x)} {Inv(y)} 1\">");
         AppendBox(b, width, height);
@@ -1491,7 +1497,7 @@ internal sealed partial class RandomizerGame
 
         const double width = 14;
         // below the top finishers even with ten rows and the player's own row (those end near y=0)
-        var b = new StringBuilder($"<frame posn=\"{Inv(63.6 - width)} -24 1\">");
+        var b = new StringBuilder($"<frame posn=\"{Inv(63.6 - width)} -22 1\">");
 
         if (collapsed)
         {
