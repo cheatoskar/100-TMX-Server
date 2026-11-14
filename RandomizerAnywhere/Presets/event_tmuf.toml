@@ -1,0 +1,18 @@
+DisplayName = "Event"
+Description = "The event's open maps (event list on the left). Only works with the event module on."
+Games = ["TMUF"]
+
+TmxGame = "TMUF"
+AutoSkipMode = "Finished"
+
+# Draws from the event module's open maps (EventMode, event-maps.json) instead of a TMX query.
+# Needs EventEnabled = true in config.toml; a finished map leaves the rotation on every server
+# that shares the event state file.
+SourceFromEventList = true
+
+# /votemap only takes the event list's open maps while this preset runs (the map vote window
+# lists them). Every other preset leaves it at "any".
+MapVoteScope = "event"
+
+# Nobody can vote the event away; an admin can still switch with /preset.
+LockPreset = true

@@ -1,4 +1,5 @@
 DisplayName = "Lunatic"
+Description = "Only maps rated Lunatic on TMX. Hard, long, painful."
 Games = ["TMNF"]
 
 TmxGame = "TMNF"

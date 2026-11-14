@@ -82,6 +82,12 @@ pending=()
 declare -A DIR SVC PORT STREAK
 for entry in "${INSTANCES[@]}"; do
   IFS='|' read -r name dir svc port <<< "$entry"
+  # DEPLOY_ONLY="tmnf tmuf" limits a deploy to those instances (e.g. a HUD change the old ESWC
+  # server can't show anyway); unset = every instance on the machine
+  if [ -n "${DEPLOY_ONLY:-}" ] && [[ " $DEPLOY_ONLY " != *" $name "* ]]; then
+    log "skipping $name (not in DEPLOY_ONLY)"
+    continue
+  fi
   if $SSH "test -f $dir/RandomizerAnywhere.dll"; then
     pending+=("$name"); DIR[$name]=$dir; SVC[$name]=$svc; PORT[$name]=$port; STREAK[$name]=0
     log "found instance: $name ($dir)"

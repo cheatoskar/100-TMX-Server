@@ -1,4 +1,5 @@
 DisplayName = "Impossible Review"
+Description = "Re-check maps flagged as impossible. No auto-skip."
 Games = ["TMNF"]
 
 TmxGame = "TMNF"

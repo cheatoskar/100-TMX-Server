@@ -27,6 +27,27 @@ internal sealed class AppConfig
     public required string ServerComment { get; init; }
     public required string GameSettings { get; init; }
     public bool SourceFromImpossibleList { get; set; }
+
+    // the preset draws from the event list's open maps (see EventMode), not from TmxQuery
+    public bool SourceFromEventList { get; set; }
+
+    public bool EventEnabled { get; init; }
+    public string EventMapsFile { get; init; } = string.Empty;
+    public string EventStateFile { get; init; } = string.Empty;
+    public string EventServerLabel { get; init; } = string.Empty;
+    public bool EventUnlimiter { get; init; }
+    public bool EventMapsFromTmx { get; init; }
+    public string EventTitle { get; init; } = string.Empty;
+    public int EventTmxRefreshMinutes { get; init; } = 5;
+    public IReadOnlyDictionary<string, object> EventTmxQuery { get; init; } = new Dictionary<string, object>();
+    public string EventAfterPreset { get; init; } = string.Empty;
+
+    // who may be voted for with /votemap: "any" TMX map, or only the event list's open maps
+    // ("event"). Set by the preset, so the event preset can restrict it and every other one doesn't.
+    public string MapVoteScope { get; set; } = "any";
+
+    // set by a preset with LockPreset = true (the event): no preset votes until an admin switches
+    public bool PresetLocked { get; set; }
     public required bool AutoStart { get; init; }
     public required IReadOnlySet<string> AdminLogins { get; init; }
     public required string PublicHost { get; init; }

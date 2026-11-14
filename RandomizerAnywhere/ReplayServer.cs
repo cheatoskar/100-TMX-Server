@@ -51,6 +51,18 @@ internal sealed class ReplayServer
 
         app.MapGet("/", () => Results.Content(indexHtml, "text/html"));
 
+        // the HUD boxes' rounded dark layer, rendered per box size (see ShadeImage)
+        app.MapGet("/shade/{file}", (string file, HttpContext context) =>
+        {
+            if (ShadeImage.TryGet(file) is not { } png)
+            {
+                return Results.NotFound();
+            }
+
+            context.Response.Headers.CacheControl = "public, max-age=31536000, immutable";
+            return Results.Bytes(png, "image/png");
+        });
+
         app.UseStaticFiles(new StaticFileOptions
         {
             FileProvider = new PhysicalFileProvider(replaysDir),

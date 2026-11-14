@@ -66,4 +66,22 @@ internal sealed class GlobalConfig
     // from a private host and is then executed; with a hash set, a changed file is refused.
     public Dictionary<string, string> DownloadSha256 { get; set; } = [];
     public Dictionary<string, object> TmxQuery { get; set; } = [];
+
+    // The event module (EventMode): off unless EventEnabled. Several servers on one machine run one
+    // event together by pointing EventMapsFile and EventStateFile at the same files.
+    public bool EventEnabled { get; set; }
+    public string EventMapsFile { get; set; } = string.Empty;
+    public string EventStateFile { get; set; } = string.Empty;
+    public string EventServerLabel { get; set; } = string.Empty;
+    public bool EventUnlimiter { get; set; }
+
+    // "file" (the hand-made EventMapsFile) or "tmx" (every map [EventTmxQuery] finds, refreshed
+    // every EventTmxRefreshMinutes so new uploads join the list)
+    public string EventMapsSource { get; set; } = string.Empty;
+    public string EventTitle { get; set; } = string.Empty;
+    public int EventTmxRefreshMinutes { get; set; }
+    public Dictionary<string, object> EventTmxQuery { get; set; } = [];
+
+    // the preset the servers switch to once every event map is finished; empty = stay
+    public string EventAfterPreset { get; set; } = string.Empty;
 }

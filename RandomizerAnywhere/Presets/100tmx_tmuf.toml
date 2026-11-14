@@ -1,4 +1,5 @@
 DisplayName = "100% TMX Project (TMUF)"
+Description = "Random TMX maps without a record replay yet - finish them to get TMX to 100 %."
 Games = ["TMUF"]
 
 TmxGame = "TMUF"

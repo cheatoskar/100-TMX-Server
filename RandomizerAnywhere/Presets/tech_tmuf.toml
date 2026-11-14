@@ -1,4 +1,5 @@
 DisplayName = "Tech"
+Description = "Tech and SpeedTech maps. Precise driving, lots of turns."
 Games = ["TMUF"]
 
 TmxGame = "TMUF"

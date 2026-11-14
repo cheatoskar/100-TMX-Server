@@ -1,4 +1,5 @@
 DisplayName = "100% TMX Project (TMUF Coast)"
+Description = "Like 100% TMX, Coast maps only."
 Games = ["TMUF"]
 
 TmxGame = "TMUF"
