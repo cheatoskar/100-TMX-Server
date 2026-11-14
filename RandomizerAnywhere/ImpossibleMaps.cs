@@ -15,6 +15,7 @@ internal sealed class ImpossibleMaps
         [GameTitle.TMNF] = "605781157",
         [GameTitle.TMUF] = "2132753700",
         [GameTitle.TMN] = "38022687",
+        [GameTitle.TM2] = "408235637",
     };
     private const int SheetTrackIdColumn = 1;
     private const int SheetFirstDataRow = 4;

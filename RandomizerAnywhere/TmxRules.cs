@@ -6,10 +6,12 @@ using System.Linq;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 
 namespace RandomizerAnywhere;
 
-internal sealed class TmxRules
+internal sealed partial class TmxRules
 {
     private const int MaxRecencyCheckedAttempts = 20;
     private const int MaxTotalAttempts = 100;
@@ -200,23 +202,112 @@ internal sealed class TmxRules
             b.Append(Uri.EscapeDataString(Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty));
         }
 
+        // TM2: only maps of the title this server runs (tm.mania.exchange names it without "@nadeo")
+        if (game == GameTitle.TM2 && !config.TmxQuery.Keys.Any(k => k.Equals("titlepack", StringComparison.OrdinalIgnoreCase)))
+        {
+            b.Append(first ? string.Empty : "&").Append("titlepack=").Append(Uri.EscapeDataString(config.TitlePack.Split('@')[0]));
+        }
+
         return b.ToString();
     }
 
     public string GetRandomTrackUrl() => $"https://{GetSiteUrl()}/trackrandom";
-    public string GetTrackGbxUrl(string trackId) => $"https://{GetSiteUrl()}/trackgbx/{trackId}";
+    public string GetTrackGbxUrl(string trackId) => IsMx ? $"https://{GetSiteUrl()}/mapgbx/{trackId}" : $"https://{GetSiteUrl()}/trackgbx/{trackId}";
 
-    private static readonly string[] DifficultyLabels = ["Beginner", "Intermediate", "Expert", "Lunatic"];
+    // the map's page and its first screenshot
+    public string TrackPageUrl(int trackId) => IsMx ? $"https://{GetSiteUrl()}/mapshow/{trackId}" : $"https://{GetSiteUrl()}/trackshow/{trackId}";
+    public string TrackImageUrl(int trackId) => IsMx ? $"https://{GetSiteUrl()}/mapimage/{trackId}/1" : $"https://{GetSiteUrl()}/trackshow/{trackId}/image/1";
+
+    // TM2 (tm.mania.exchange) and TM2020 (trackmania.exchange) run the Mania Exchange API: /api/maps
+    // with MapId, Name, AwardCount, Medals.Author, ReplayWR, tags as objects, and "inhasreplay"
+    // where TMX has "inhasrecord" (that one is silently ignored there - checked 2026-11-14). The
+    // code below speaks TMX; ApiUrl and ReadApiAsync translate both ways.
+    private bool IsMx => game is GameTitle.TM2 or GameTitle.TM2020;
+
+    private static readonly (string Tmx, string Mx)[] MxFieldNames =
+    [
+        ("TrackId", "MapId"), ("TrackName", "Name"), ("Awards", "AwardCount"), ("AuthorTime", "Medals.Author"),
+        ("WRReplay.ReplayId", "ReplayWR.ReplayId"),
+    ];
+
+    private string ApiUrl(string tmxUrl)
+    {
+        if (!IsMx)
+        {
+            return tmxUrl;
+        }
+
+        var url = tmxUrl.Replace("/api/tracks?", "/api/maps?", StringComparison.Ordinal);
+        return FieldsParameterRegex().Replace(url, m =>
+        {
+            var fields = m.Groups["fields"].Value.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                // MX has no replay time field; the WR time just stays unknown there
+                .Where(f => f != "WRReplay.ReplayTime")
+                .Select(f => MxFieldNames.FirstOrDefault(n => n.Tmx == f) is { Mx: { } mx } ? mx : f);
+            return $"fields={string.Join(',', fields)}";
+        });
+    }
+
+    // MX answers in TMX shape: MapId -> TrackId, Name -> TrackName, AwardCount -> Awards,
+    // Medals.Author -> AuthorTime, ReplayWR -> WRReplay, tag objects -> ids plus TagNames
+    private async Task<T?> ReadApiAsync<T>(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        if (!IsMx)
+        {
+            return await response.Content.ReadFromJsonAsync<T>(cancellationToken);
+        }
+
+        var root = await JsonNode.ParseAsync(await response.Content.ReadAsStreamAsync(cancellationToken), cancellationToken: cancellationToken);
+        if (root?["Results"] is JsonArray results)
+        {
+            foreach (var item in results.OfType<JsonObject>())
+            {
+                Rename(item, "MapId", "TrackId");
+                Rename(item, "Name", "TrackName");
+                Rename(item, "AwardCount", "Awards");
+                Rename(item, "ReplayWR", "WRReplay");
+                if (item["Medals"] is JsonObject medals && medals["Author"] is { } author)
+                {
+                    item["AuthorTime"] = author.DeepClone();
+                    item.Remove("Medals");
+                }
+
+                if (item["Tags"] is JsonArray tags)
+                {
+                    var tagObjects = tags.OfType<JsonObject>().ToList();
+                    item["TagNames"] = new JsonArray(tagObjects.Select(t => (JsonNode?)JsonValue.Create(t["Name"]?.GetValue<string>() ?? "?")).ToArray());
+                    item["Tags"] = new JsonArray(tagObjects.Select(t => (JsonNode?)JsonValue.Create(t["TagId"]?.GetValue<int>() ?? -1)).ToArray());
+                }
+            }
+        }
+
+        return root.Deserialize<T>();
+
+        static void Rename(JsonObject item, string from, string to)
+        {
+            if (item.Remove(from, out var value))
+            {
+                item[to] = value;
+            }
+        }
+    }
+
+    [GeneratedRegex("fields=(?<fields>[^&]*)")]
+    private static partial Regex FieldsParameterRegex();
+
+    private string[] DifficultyLabels => IsMx ? MxDifficultyLabels : TmxDifficultyLabels;
+    private static readonly string[] TmxDifficultyLabels = ["Beginner", "Intermediate", "Expert", "Lunatic"];
+    private static readonly string[] MxDifficultyLabels = ["Beginner", "Intermediate", "Advanced", "Expert", "Lunatic", "Impossible"];
 
     // 0=Beginner, 1=Intermediate, 2=Expert, 3=Lunatic - verified live against the real API
     // (tmnf.exchange/trackshow/<id> renders these exact labels for these exact values)
     public async Task<(string DifficultyLabel, int Awards)> GetTrackMetaAsync(int trackId, CancellationToken cancellationToken = default)
     {
-        var url = $"https://{GetSiteUrl()}/api/tracks?id={trackId}&fields=Difficulty,Awards";
+        var url = ApiUrl($"https://{GetSiteUrl()}/api/tracks?id={trackId}&fields=Difficulty,Awards");
         using var response = await http.GetAsync(url, cancellationToken);
         response.EnsureSuccessStatusCode();
 
-        var payload = await response.Content.ReadFromJsonAsync<TmxApiTracksResponse>(cancellationToken);
+        var payload = await ReadApiAsync<TmxApiTracksResponse>(response, cancellationToken);
         var result = payload?.Results?.FirstOrDefault();
 
         if (result is null)
@@ -233,11 +324,11 @@ internal sealed class TmxRules
 
     public async Task<string> GetTrackNameAsync(int trackId, CancellationToken cancellationToken = default)
     {
-        var url = $"https://{GetSiteUrl()}/api/tracks?id={trackId}&fields=TrackName";
+        var url = ApiUrl($"https://{GetSiteUrl()}/api/tracks?id={trackId}&fields=TrackName");
         using var response = await http.GetAsync(url, cancellationToken);
         response.EnsureSuccessStatusCode();
 
-        var payload = await response.Content.ReadFromJsonAsync<TmxApiTracksResponse>(cancellationToken);
+        var payload = await ReadApiAsync<TmxApiTracksResponse>(response, cancellationToken);
         var name = payload?.Results?.FirstOrDefault()?.TrackName;
 
         return string.IsNullOrWhiteSpace(name) ? $"Track {trackId}" : name;
@@ -266,11 +357,11 @@ internal sealed class TmxRules
     // "Author"/etc all 400 with "field does not exist", verified live against the real API
     public async Task<TrackDetails> GetTrackDetailsAsync(int trackId, CancellationToken cancellationToken = default)
     {
-        var url = $"https://{GetSiteUrl()}/api/tracks?id={trackId}&fields=TrackName,Uploader.Name,Difficulty,Awards,AuthorTime,Tags,WRReplay.ReplayTime";
+        var url = ApiUrl($"https://{GetSiteUrl()}/api/tracks?id={trackId}&fields=TrackName,Uploader.Name,Difficulty,Awards,AuthorTime,Tags,WRReplay.ReplayTime");
         using var response = await http.GetAsync(url, cancellationToken);
         response.EnsureSuccessStatusCode();
 
-        var payload = await response.Content.ReadFromJsonAsync<TmxApiTrackDetailsResponse>(cancellationToken);
+        var payload = await ReadApiAsync<TmxApiTrackDetailsResponse>(response, cancellationToken);
         var result = payload?.Results?.FirstOrDefault();
 
         if (result is null)
@@ -282,7 +373,7 @@ internal sealed class TmxRules
             ? DifficultyLabels[result.Difficulty]
             : $"Difficulty {result.Difficulty}";
 
-        var tagNames = (result.Tags ?? []).Select(id => TagNames.GetValueOrDefault(id, $"Tag {id}")).ToList();
+        var tagNames = result.TagNames ?? (result.Tags ?? []).Select(id => TagNames.GetValueOrDefault(id, $"Tag {id}")).ToList();
         var authorName = result.Uploader?.Name is { Length: > 0 } uploaderName ? uploaderName : "unknown";
         var trackName = result.TrackName is { Length: > 0 } name ? name : $"Track {trackId}";
 
@@ -297,11 +388,11 @@ internal sealed class TmxRules
 
         foreach (var chunk in trackIds.Distinct().Chunk(50))
         {
-            var url = $"https://{GetSiteUrl()}/api/tracks?id={string.Join(',', chunk)}&count={chunk.Length}&fields=TrackId,TrackName,Uploader.Name,Difficulty,Awards,AuthorTime,Tags,WRReplay.ReplayTime";
+            var url = ApiUrl($"https://{GetSiteUrl()}/api/tracks?id={string.Join(',', chunk)}&count={chunk.Length}&fields=TrackId,TrackName,Uploader.Name,Difficulty,Awards,AuthorTime,Tags,WRReplay.ReplayTime");
             using var response = await http.GetAsync(url, cancellationToken);
             response.EnsureSuccessStatusCode();
 
-            var payload = await response.Content.ReadFromJsonAsync<TmxApiTrackDetailsResponse>(cancellationToken);
+            var payload = await ReadApiAsync<TmxApiTrackDetailsResponse>(response, cancellationToken);
 
             foreach (var r in payload?.Results ?? [])
             {
@@ -311,7 +402,7 @@ internal sealed class TmxRules
                 }
 
                 var difficultyLabel = r.Difficulty >= 0 && r.Difficulty < DifficultyLabels.Length ? DifficultyLabels[r.Difficulty] : $"Difficulty {r.Difficulty}";
-                var tagNames = (r.Tags ?? []).Select(t => TagNames.GetValueOrDefault(t, $"Tag {t}")).ToList();
+                var tagNames = r.TagNames ?? (r.Tags ?? []).Select(t => TagNames.GetValueOrDefault(t, $"Tag {t}")).ToList();
                 result[id] = new TrackDetails(
                     r.TrackName is { Length: > 0 } n ? n : $"Track {id}",
                     r.Uploader?.Name is { Length: > 0 } a ? a : "unknown",
@@ -326,7 +417,7 @@ internal sealed class TmxRules
     // on the impossible or skip list - such a map is never started on purpose
     public bool IsExcludedFromRotation(int trackId) => impossibleMaps.Contains(trackId) || skippedMaps.Contains(trackId);
 
-    private sealed record TmxApiTrackDetailsResult(string? TrackName, TmxApiUploader? Uploader, int Difficulty, int Awards, int AuthorTime, List<int>? Tags, TmxApiWrReplay? WRReplay = null, int? TrackId = null);
+    private sealed record TmxApiTrackDetailsResult(string? TrackName, TmxApiUploader? Uploader, int Difficulty, int Awards, int AuthorTime, List<int>? Tags, TmxApiWrReplay? WRReplay = null, int? TrackId = null, List<string>? TagNames = null);
     private sealed record TmxApiWrReplay(int? ReplayTime);
     private sealed record TmxApiUploader(string? Name);
 
@@ -491,7 +582,7 @@ internal sealed class TmxRules
             using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             budget.CancelAfter(TimeSpan.FromSeconds(10));
 
-            var url = $"https://{GetSiteUrl()}/api/tracks?id={trackId.ToString(CultureInfo.InvariantCulture)}&fields=TrackId,WRReplay.ReplayId";
+            var url = ApiUrl($"https://{GetSiteUrl()}/api/tracks?id={trackId.ToString(CultureInfo.InvariantCulture)}&fields=TrackId,WRReplay.ReplayId");
             using var response = await http.GetAsync(url, budget.Token);
             response.EnsureSuccessStatusCode();
 
@@ -502,7 +593,8 @@ internal sealed class TmxRules
                 return null;
             }
 
-            return results[0].TryGetProperty("WRReplay", out var record) && record.ValueKind == JsonValueKind.Object;
+            return (results[0].TryGetProperty("WRReplay", out var record) || results[0].TryGetProperty("ReplayWR", out record))
+                && record.ValueKind == JsonValueKind.Object;
         }
         catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
         {
@@ -518,6 +610,8 @@ internal sealed class TmxRules
         GameTitle.TMN => "nations.tm-exchange.com",
         GameTitle.TMS => "sunrise.tm-exchange.com",
         GameTitle.TMO => "original.tm-exchange.com",
+        GameTitle.TM2 => "tm.mania.exchange",
+        GameTitle.TM2020 => "trackmania.exchange",
         _ => throw new Exception("Unknown game title"),
     };
 
@@ -729,13 +823,13 @@ internal sealed class TmxRules
 
         for (var page = 0; page < MaxPoolPages; page++)
         {
-            var url = $"https://{GetSiteUrl()}/api/tracks?{query}&fields=TrackId&count={PoolPageSize}"
-                + (after is { } a ? $"&after={a.ToString(CultureInfo.InvariantCulture)}" : string.Empty);
+            var url = ApiUrl($"https://{GetSiteUrl()}/api/tracks?{query}&fields=TrackId&count={PoolPageSize}"
+                + (after is { } a ? $"&after={a.ToString(CultureInfo.InvariantCulture)}" : string.Empty));
 
             using var response = await http.GetAsync(url, cancellationToken);
             response.EnsureSuccessStatusCode();
 
-            var payload = await response.Content.ReadFromJsonAsync<TmxApiTrackIdPage>(cancellationToken)
+            var payload = await ReadApiAsync<TmxApiTrackIdPage>(response, cancellationToken)
                 ?? throw new InvalidOperationException("TMX returned an empty page.");
 
             var results = payload.Results ?? [];
@@ -810,19 +904,9 @@ internal sealed class TmxRules
                     $"Gave up looking for a servable map after {searchWatch.Elapsed.TotalSeconds:0}s ({attempt - 1} attempts) - TMX is too slow or unreachable right now.");
             }
 
-            var tmxRandomUrl = $"{GetRandomTrackUrl()}?{query}";
-
-            using var request = new HttpRequestMessage(HttpMethod.Head, tmxRandomUrl);
-            using var response = await http.SendAsync(request, cancellationToken);
-
-            // TMX answers a random pick with a redirect to the track; anything else (an error
-            // page, a 5xx during an outage) says nothing about which map, so name the status
-            // instead of a bare "failed to get track relative path"
-            var trackRelativePath = response.Headers.Location?.OriginalString
-                ?? throw (IsOutageStatus(response.StatusCode)
-                    ? new TmxUnavailableException($"TMX's random pick answered HTTP {(int)response.StatusCode} {response.ReasonPhrase}.")
-                    : new InvalidOperationException($"TMX's random pick answered HTTP {(int)response.StatusCode} {response.ReasonPhrase} without a track."));
-            var trackIdString = trackRelativePath.Substring(trackRelativePath.LastIndexOf('/') + 1);
+            var trackIdString = IsMx
+                ? await MxRandomTrackIdAsync(query, cancellationToken)
+                : await TmxRandomTrackIdAsync(query, cancellationToken);
 
             if (!int.TryParse(trackIdString, out var trackId))
             {
@@ -858,6 +942,38 @@ internal sealed class TmxRules
         }
 
         throw new InvalidOperationException($"Could not find a servable map after {MaxTotalAttempts} attempts (all candidates were excluded).");
+    }
+
+    private async Task<string> TmxRandomTrackIdAsync(string query, CancellationToken cancellationToken)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Head, $"{GetRandomTrackUrl()}?{query}");
+        using var response = await http.SendAsync(request, cancellationToken);
+
+        // TMX answers a random pick with a redirect to the track; anything else (an error
+        // page, a 5xx during an outage) says nothing about which map, so name the status
+        // instead of a bare "failed to get track relative path"
+        var trackRelativePath = response.Headers.Location?.OriginalString
+            ?? throw (IsOutageStatus(response.StatusCode)
+                ? new TmxUnavailableException($"TMX's random pick answered HTTP {(int)response.StatusCode} {response.ReasonPhrase}.")
+                : new InvalidOperationException($"TMX's random pick answered HTTP {(int)response.StatusCode} {response.ReasonPhrase} without a track."));
+        return trackRelativePath[(trackRelativePath.LastIndexOf('/') + 1)..];
+    }
+
+    // MX: the search itself picks one at random (count must be 1)
+    private async Task<string> MxRandomTrackIdAsync(string query, CancellationToken cancellationToken)
+    {
+        using var response = await http.GetAsync(ApiUrl($"https://{GetSiteUrl()}/api/tracks?{query}&random=1&count=1&fields=TrackId"), cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw IsOutageStatus(response.StatusCode)
+                ? new TmxUnavailableException($"The exchange's random pick answered HTTP {(int)response.StatusCode} {response.ReasonPhrase}.")
+                : new InvalidOperationException($"The exchange's random pick answered HTTP {(int)response.StatusCode} {response.ReasonPhrase}.");
+        }
+
+        var page = await ReadApiAsync<TmxApiTrackIdPage>(response, cancellationToken);
+        return page?.Results is [{ } first, ..]
+            ? first.TrackId.ToString(CultureInfo.InvariantCulture)
+            : throw new InvalidOperationException("No map on the exchange matches this preset's query.");
     }
 
     private static string GetValidFileName(string fileName)

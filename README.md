@@ -156,6 +156,28 @@ Each folder has a `config.toml`, the systemd unit and a setup script, run on the
 
 `deploy/deploy-when-empty.sh <build folder>` (with `DEPLOY_HOST=<user>@<server>`) uploads a new build, waits until each instance has been empty for two minutes, swaps the files, restarts the service and puts the old files back if the new build does not come up healthy.
 
+### TM2 and TM2020
+
+The same controller runs a TM2 (ManiaPlanet) or a TM2020 server. In `config.toml`:
+
+| | TM2020 | TM2 |
+| --- | --- | --- |
+| `Game` / `TmxGame` | `"TM2020"` | `"TM2"` |
+| `Preset` | `100tmx_tm2020` | `100tmx_tm2` |
+| `TitlePack` | - | `"TMStadium@nadeo"`, `"TMCanyon@nadeo"`, `"TMValley@nadeo"` or `"TMLagoon@nadeo"` |
+| Maps from | trackmania.exchange | tm.mania.exchange (only maps of that title) |
+| Server account | trackmania.com (dedicated server login + password) | maniaplanet.com (login, password, validation key) |
+
+The first start downloads the server (`[DownloadUrls]` `ManiaPlanet` / `Trackmania`) and, for TM2, the title pack from maniaplanet.com. One TM2 server runs one title, so Stadium, Canyon, Valley and Lagoon each need their own folder, ports and server account. `Lan = true` runs it without an account for a local test.
+
+Differences from TMF, all handled in the controller (`RemoteClient`, `ManialinkV3`):
+- The record filter on the Mania Exchange sites is `inhasreplay = 0`; `inhasrecord` is silently ignored there.
+- TimeAttack is a game mode script without a time limit and drives every lap of a multilap map, so `/rounds` is not needed and says so.
+- Finishes and checkpoints come from the script (`Trackmania.Event.WayPoint`); the ranking is counted by the controller.
+- The HUD is converted to manialink version 3 on the way out (same screen position; plain backgrounds on TM2020). `RANDANY_DUMP_MANIALINKS=1` writes every converted page to `manialinks/` for a look without a game client.
+- There is no add-to-favourites link; the join link for other servers is `maniaplanet://` (TM2) or `trackmania://` (TM2020).
+- The impossible/cheated sheet has a TM2 tab (read) and no TM2020 tab.
+
 ### Command line options
 
 ```

@@ -1,5 +1,11 @@
 Game = "TMNF"
 TmxGame = "TMNF"
+
+# TM2 and TM2020: Game = "TM2" or "TM2020" (TmxGame the same), Preset "100tmx_tm2" / "100tmx_tm2020".
+# TM2 only: the title the server runs - "TMStadium@nadeo" (default), "TMCanyon@nadeo",
+# "TMValley@nadeo" or "TMLagoon@nadeo". Players need the same title; the title pack is downloaded
+# from maniaplanet.com on the first start. One server per title.
+# TitlePack = "TMStadium@nadeo"
 BindIP = ""
 XmlRpcPort = 5000
 AutoSkipMode = "AuthorMedal"
@@ -92,6 +98,8 @@ Type $FF0/info$FF0 to see what this server can do.
 [DownloadUrls]
 TMF = "http://files2.trackmaniaforever.com/TrackmaniaServer_2011-02-21.zip"
 TM = "http://slig.free.fr/TM/dedicated/TmDedicatedServer_2006-05-30.zip"
+ManiaPlanet = "http://files.v04.maniaplanet.com/server/ManiaplanetServer_Latest.zip"
+Trackmania = "http://files.v04.maniaplanet.com/server/TrackmaniaServer_Latest.zip"
 
 [TmxQuery]
 primarytype = 0

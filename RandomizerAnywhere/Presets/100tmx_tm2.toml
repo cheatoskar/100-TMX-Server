@@ -1,0 +1,13 @@
+DisplayName = "100% TMX Project (TM2)"
+Description = "Random tm.mania.exchange maps without a replay yet - finish them to get TMX to 100 %."
+Games = ["TM2"]
+
+TmxGame = "TM2"
+AutoSkipMode = "Finished"
+
+[TmxQuery]
+# tm.mania.exchange: "inhasreplay" is the record filter there. The title the server runs
+# (TitlePack in config.toml) is added as "titlepack" by the controller, so this one preset serves
+# Stadium, Canyon, Valley and Lagoon servers alike.
+inhasreplay = 0
+maptype = "Race"

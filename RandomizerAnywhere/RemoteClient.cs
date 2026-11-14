@@ -6,6 +6,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Linq;
+using System.Text.Json;
 
 namespace RandomizerAnywhere;
 
@@ -51,6 +52,11 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
     // flight recorder (see Diagnostics). Behaviour is unchanged: same call, same exceptions.
     public async Task<T> TracedCallAsync<T>(string method, object[] parameters, CancellationToken cancellationToken = default)
     {
+        if (Translate(ref method, ref parameters, out var localAnswer))
+        {
+            return (T)localAnswer!;
+        }
+
         var startedAt = Stopwatch.GetTimestamp();
         Diagnostics.Trace($"rpc> {method}");
 
@@ -82,6 +88,11 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
     // and lose the history a stall report needs. Slow or failed calls are still recorded.
     public async Task<T> PollCallAsync<T>(string method, object[] parameters, CancellationToken cancellationToken = default)
     {
+        if (Translate(ref method, ref parameters, out var localAnswer))
+        {
+            return (T)localAnswer!;
+        }
+
         var startedAt = Stopwatch.GetTimestamp();
 
         try
@@ -114,6 +125,11 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
 
     public async Task<object?> TracedCallAsync(string method, object[] parameters, CancellationToken cancellationToken = default)
     {
+        if (Translate(ref method, ref parameters, out var localAnswer))
+        {
+            return localAnswer;
+        }
+
         var startedAt = Stopwatch.GetTimestamp();
         Diagnostics.Trace($"rpc> {method}");
 
@@ -165,6 +181,114 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
         }
     }
 
+    // TM2 (ManiaPlanet) and TM2020 servers: the same protocol as TMF, but "Map" where TMF says
+    // "Challenge", and the game mode is a script (TimeAttack) steered through script settings.
+    // The game logic keeps speaking TMF; this is the one place that knows the difference.
+    // Checked on local servers of both on 2026-11-14 (system.listMethods, script settings).
+    public bool IsManiaPlanet => config.IsManiaPlanet;
+
+    private static readonly Dictionary<string, string> ManiaPlanetMethodNames = new()
+    {
+        ["ChallengeRestart"] = "RestartMap",
+        ["NextChallenge"] = "NextMap",
+        ["InsertChallenge"] = "InsertMap",
+        ["RemoveChallenge"] = "RemoveMap",
+        ["ChooseNextChallenge"] = "ChooseNextMap",
+        ["AddChallenge"] = "AddMap",
+        ["AddChallengeList"] = "AddMapList",
+        ["GetTracksDirectory"] = "GetMapsDirectory",
+        ["GetCurrentChallengeInfo"] = "GetCurrentMapInfo",
+        ["GetNextChallengeInfo"] = "GetNextMapInfo",
+        ["GetChallengeInfo"] = "GetMapInfo",
+        ["GetChallengeList"] = "GetMapList",
+        ["GetCurrentChallengeIndex"] = "GetCurrentMapIndex",
+    };
+
+    // the server's own name for a TMF method (also for CallVote payloads)
+    public string MethodName(string tmfName) =>
+        IsManiaPlanet && ManiaPlanetMethodNames.TryGetValue(tmfName, out var name) ? name : tmfName;
+
+    // true = answered here, without asking the server
+    private bool Translate(ref string method, ref object[] parameters, out object? localAnswer)
+    {
+        localAnswer = null;
+
+        if (!IsManiaPlanet)
+        {
+            return false;
+        }
+
+        switch (method)
+        {
+            // the mode is the TimeAttack script for good; TimeAttack there drives every lap of a
+            // multilap map, so the TMF Rounds switch (/rounds) has nothing to do
+            case "SetGameMode":
+            case "SetRoundForcedLaps":
+                localAnswer = true;
+                return true;
+            case "GetGameMode":
+                localAnswer = 1;
+                return true;
+            // script mode keeps no ranking the old way; the finishes seen on WayPoint stand in
+            case "GetCurrentRanking":
+                localAnswer = finishes.Ranking();
+                return true;
+            // 0 = no limit in TimeAttack on both (checked: no map end within 45 s; 5 s ends it)
+            case "SetTimeAttackLimit":
+                method = "SetModeScriptSettings";
+                parameters = [new Dictionary<string, object> { ["S_TimeLimit"] = MillisecondsToSeconds(parameters[0]) }];
+                return false;
+            case "SetChatTime":
+                method = "SetModeScriptSettings";
+                parameters = [new Dictionary<string, object> { ["S_ChatTime"] = MillisecondsToSeconds(parameters[0]) }];
+                return false;
+            default:
+                method = MethodName(method);
+                return false;
+        }
+    }
+
+    private static int MillisecondsToSeconds(object value) =>
+        Convert.ToInt32(value, CultureInfo.InvariantCulture) is var ms and > 0 ? Math.Max((ms + 999) / 1000, 1) : 0;
+
+    // Best time per login on the running map, from the script's WayPoint events (TM2/TM2020).
+    private readonly FinishTracker finishes = new();
+
+    private sealed class FinishTracker
+    {
+        private readonly Dictionary<string, int> best = [];
+        private readonly object gate = new();
+
+        public void Clear()
+        {
+            lock (gate)
+            {
+                best.Clear();
+            }
+        }
+
+        public void Add(string login, int time)
+        {
+            lock (gate)
+            {
+                if (time > 0 && (!best.TryGetValue(login, out var old) || time < old))
+                {
+                    best[login] = time;
+                }
+            }
+        }
+
+        public List<object> Ranking()
+        {
+            lock (gate)
+            {
+                return best.OrderBy(kv => kv.Value)
+                    .Select((kv, i) => (object)new Dictionary<string, object> { ["Login"] = kv.Key, ["BestTime"] = kv.Value, ["Rank"] = i + 1 })
+                    .ToList();
+            }
+        }
+    }
+
     private HashSet<string>? supportedMethods;
     private HashSet<string> SupportedMethods => supportedMethods ?? throw new InvalidOperationException("Client is not connected.");
 
@@ -182,6 +306,7 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
             await XmlRpcClient.ConnectAsync(IPAddress.Loopback, config.XmlRpcPort, cancellationToken: token), cancellationToken);
 
         supportedMethods = new(await raw.SystemListMethodsAsync(cancellationToken));
+        serverCallbacks = [];
     }
 
     public async Task AuthenticateAsync(CancellationToken cancellationToken = default)
@@ -230,6 +355,12 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
             return false;
         }
 
+        // the callback shapes the adapters below expect (ManiaPlanet.PlayerChat etc.)
+        if (IsManiaPlanet)
+        {
+            await TracedCallAsync("SetApiVersion", [ManiaPlanetApiVersion], cancellationToken);
+        }
+
         var result = await TracedCallAsync<bool>("EnableCallbacks", [true], cancellationToken);
 
         if (!result)
@@ -237,8 +368,16 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
             throw new InvalidOperationException("Failed to enable callbacks.");
         }
 
+        // finishes, checkpoints and map starts only come as script callbacks there
+        if (IsManiaPlanet)
+        {
+            await TracedCallAsync("TriggerModeScriptEventArray", ["XmlRpc.EnableCallbacks", new[] { "true" }], cancellationToken);
+        }
+
         return result;
     }
+
+    private const string ManiaPlanetApiVersion = "2013-04-16";
 
     public bool SupportsWriteFile() => SupportedMethods.Contains("WriteFile");
 
@@ -326,6 +465,12 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
 
     public async Task RegisterChatCommandsAsync(IEnumerable<string> commands, CancellationToken cancellationToken = default)
     {
+        if (!SupportedMethods.Contains("AddChatCommand"))
+        {
+            chatCommands = [];
+            return;
+        }
+
         chatCommands = commands.ToList();
         await SystemMulticallAsync(chatCommands.Select(cmd => new XmlRpcCall("AddChatCommand", [cmd])), cancellationToken);
     }
@@ -360,9 +505,13 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
         var playerList = await TracedCallAsync<List<object>>("GetPlayerList", [200, 0], cancellationToken);
         return playerList.OfType<Dictionary<string, object>>()
             .Where(p => p.TryGetValue("Login", out var login) && !string.IsNullOrEmpty(login as string))
+            .Where(p => !IsServerEntry(p))
             .Select(p => new PlayerSummary((string)p["Login"], (string)p["NickName"]))
             .ToList();
     }
+
+    public static bool IsServerEntry(Dictionary<string, object> player) =>
+        player.TryGetValue("Flags", out var flags) && flags is int value && value / 100000 % 10 == 1;
 
     public async Task<ChallengeSummary> GetChallengeInfoAsync(string fileName, CancellationToken cancellationToken = default)
     {
@@ -381,7 +530,7 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
 
     // Whether the connected dedicated server knows this XML-RPC method (system.listMethods at connect).
     // The 2006 TM server (ESWC) lacks manialinks, ghost replays, ForceSpectator and more.
-    public bool Supports(string method) => SupportedMethods.Contains(method);
+    public bool Supports(string method) => SupportedMethods.Contains(MethodName(method));
 
     // Manialinks (widgets, menus, popups) only exist from TMF on. On the old TM server every widget
     // call is a silent no-op, so the game logic around them needs no special case; everything a
@@ -395,7 +544,7 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
             return;
         }
 
-        await TracedCallAsync("SendDisplayManialinkPage", [manialink, timeoutSeconds, hideOnClick], cancellationToken);
+        await TracedCallAsync("SendDisplayManialinkPage", [Manialink(manialink), timeoutSeconds, hideOnClick], cancellationToken);
     }
 
     public async Task SendManialinkPageToLoginAsync(string login, string manialink, int timeoutSeconds = 0, bool hideOnClick = false, CancellationToken cancellationToken = default)
@@ -405,7 +554,36 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
             return;
         }
 
-        await TracedCallAsync("SendDisplayManialinkPageToLogin", [login, manialink, timeoutSeconds, hideOnClick], cancellationToken);
+        await TracedCallAsync("SendDisplayManialinkPageToLogin", [login, Manialink(manialink), timeoutSeconds, hideOnClick], cancellationToken);
+    }
+
+    private string Manialink(string tmfManialink)
+    {
+        if (!IsManiaPlanet)
+        {
+            return tmfManialink;
+        }
+
+        var page = ManialinkV3.Convert(tmfManialink, config.Game == GameTitle.TM2020);
+
+        // RANDANY_DUMP_MANIALINKS=1: every converted page goes to manialinks/ next to the program,
+        // to check the TM2/TM2020 HUD without a game client (one file per manialink id)
+        if (Environment.GetEnvironmentVariable("RANDANY_DUMP_MANIALINKS") == "1")
+        {
+            try
+            {
+                var dir = Path.Combine(AppContext.BaseDirectory, "manialinks");
+                Directory.CreateDirectory(dir);
+                var id = System.Text.RegularExpressions.Regex.Match(page, "<manialink[^>]*id=\"([^\"]*)\"").Groups[1].Value;
+                File.WriteAllText(Path.Combine(dir, $"{(id.Length > 0 ? id : "page")}.xml"), page);
+            }
+            catch (IOException)
+            {
+                // diagnostics only
+            }
+        }
+
+        return page;
     }
 
     public async Task HideAllManialinksAsync(CancellationToken cancellationToken = default)
@@ -482,6 +660,142 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
         Attach(methodName, handler);
     }
 
+    // Handlers per callback name the SERVER sends, for this connection. On TM2/TM2020 several TMF
+    // callbacks come out of one server callback (ManiaPlanet.ModeScriptCallbackArray), so the
+    // server callback is registered once and fans out.
+    private Dictionary<string, List<Func<object[], CancellationToken, Task>>> serverCallbacks = [];
+
+    private void Attach(string methodName, Func<object[], CancellationToken, Task> handler)
+    {
+        var (serverName, adapted) = IsManiaPlanet ? AdaptManiaPlanetCallback(methodName, handler) : (methodName, handler);
+        var guarded = Guard(methodName, adapted);
+
+        if (!serverCallbacks.TryGetValue(serverName, out var handlers))
+        {
+            serverCallbacks[serverName] = handlers = [];
+            Raw.On(serverName, async (parameters, cancellationToken) =>
+            {
+                CallbacksReceived++;
+                LastCallbackAt = DateTimeOffset.UtcNow;
+
+                foreach (var h in handlers.ToArray())
+                {
+                    await h(parameters, cancellationToken);
+                }
+            });
+        }
+
+        handlers.Add(guarded);
+    }
+
+    // TMF callback name -> the TM2/TM2020 callback it comes from, with its parameters in TMF shape
+    private (string ServerName, Func<object[], CancellationToken, Task> Handler) AdaptManiaPlanetCallback(
+        string tmfName, Func<object[], CancellationToken, Task> handler)
+    {
+        const string script = "ManiaPlanet.ModeScriptCallbackArray";
+
+        return tmfName switch
+        {
+            // a line starting with "/" is a command there (no AddChatCommand)
+            "TrackMania.PlayerChat" => ("ManiaPlanet.PlayerChat", (p, ct) =>
+                handler([p[0], p[1], p[2], p[2] is string text && text.StartsWith('/')], ct)),
+            // actions are strings there; the controller's are numbers
+            "TrackMania.PlayerManialinkPageAnswer" => ("ManiaPlanet.PlayerManialinkPageAnswer", (p, ct) =>
+                p.Length > 2 && int.TryParse(p[2] as string, NumberStyles.Integer, CultureInfo.InvariantCulture, out var action)
+                    ? handler([p[0], p[1], action], ct)
+                    : Task.CompletedTask),
+            // ManiaPlanet.BeginMap does not come on RestartMap (TM2020); StartMap_Start always does
+            "TrackMania.BeginRace" => (script, async (p, ct) =>
+            {
+                if (ScriptCallback(p, "Maniaplanet.StartMap_Start", out _))
+                {
+                    finishes.Clear();
+                    var mapInfo = await TracedCallAsync<Dictionary<string, object>>("GetCurrentChallengeInfo", [], ct);
+                    await handler([mapInfo], ct);
+                }
+            }),
+            "TrackMania.EndRace" => (script, (p, ct) =>
+                ScriptCallback(p, "Maniaplanet.EndMap_Start", out _) ? handler([], ct) : Task.CompletedTask),
+            "TrackMania.EndRound" => (script, (p, ct) =>
+                ScriptCallback(p, "Maniaplanet.EndRound_Start", out _) ? handler([], ct) : Task.CompletedTask),
+            "TrackMania.PlayerFinish" => (script, (p, ct) =>
+            {
+                if (WayPoint(p) is { IsEndRace: true } w)
+                {
+                    finishes.Add(w.Login, w.RaceTime);
+                    return handler([0, w.Login, w.RaceTime], ct);
+                }
+
+                return Task.CompletedTask;
+            }),
+            "TrackMania.PlayerCheckpoint" => (script, (p, ct) =>
+                WayPoint(p) is { IsEndRace: false } w
+                    ? handler([0, w.Login, w.RaceTime, w.Lap, w.CheckpointInRace], ct)
+                    : Task.CompletedTask),
+            _ when tmfName.StartsWith("TrackMania.", StringComparison.Ordinal) =>
+                ("ManiaPlanet." + tmfName["TrackMania.".Length..], handler),
+            _ => (tmfName, handler),
+        };
+    }
+
+    private sealed record WayPointEvent(string Login, int RaceTime, int Lap, int CheckpointInRace, bool IsEndRace);
+
+    // Trackmania.Event.WayPoint: every checkpoint and the finish, with "isendrace" on the finish
+    private static WayPointEvent? WayPoint(object[] parameters)
+    {
+        if (!ScriptCallback(parameters, "Trackmania.Event.WayPoint", out var data) || data.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        var login = data.TryGetProperty("login", out var l) ? l.GetString() : null;
+        if (string.IsNullOrEmpty(login))
+        {
+            return null;
+        }
+
+        static int Int(JsonElement e, string name) =>
+            e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetInt32() : 0;
+
+        var isEndRace = data.TryGetProperty("isendrace", out var end) && end.ValueKind == JsonValueKind.True;
+        // TMF's CurLap is not used by any handler; the race checkpoint index is what counts
+        return new WayPointEvent(login, Int(data, "racetime"), 0, Int(data, "checkpointinrace"), isEndRace);
+    }
+
+    private static bool ScriptCallback(object[] parameters, string name, out JsonElement data)
+    {
+        data = default;
+
+        if (parameters.Length == 0 || parameters[0] is not string callbackName || callbackName != name)
+        {
+            return false;
+        }
+
+        var json = parameters.Length > 1
+            ? parameters[1] switch
+            {
+                string single => single,
+                IEnumerable<object> list => list.FirstOrDefault() as string,
+                _ => null,
+            }
+            : null;
+
+        if (!string.IsNullOrWhiteSpace(json))
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(json);
+                data = document.RootElement.Clone();
+            }
+            catch (JsonException)
+            {
+                // a payload we can't read still counts as the event happening
+            }
+        }
+
+        return true;
+    }
+
     // ManiaAPI dispatches callbacks from a single loop: it reads one message off an unbounded
     // channel, awaits every handler registered for it, and only then reads the next. So a handler
     // that blocks does not delay its own event - it silently freezes the whole stream. Chat
@@ -500,13 +814,10 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
     // below the cutoff, so the log names the culprit before it becomes an outage.
     private static readonly TimeSpan SlowHandlerWarning = TimeSpan.FromSeconds(15);
 
-    private void Attach(string methodName, Func<object[], CancellationToken, Task> handler)
+    private Func<object[], CancellationToken, Task> Guard(string methodName, Func<object[], CancellationToken, Task> handler)
     {
-        Raw.On(methodName, async (parameters, cancellationToken) =>
+        return async (parameters, cancellationToken) =>
         {
-            CallbacksReceived++;
-            LastCallbackAt = DateTimeOffset.UtcNow;
-
             using var handlerTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             handlerTimeout.CancelAfter(HandlerTimeout);
 
@@ -540,7 +851,7 @@ internal sealed class RemoteClient : IAsyncDisposable, IDisposable
                     Console.WriteLine($"[diag] slow handler: {methodName} took {elapsed.TotalSeconds:0.0}s");
                 }
             }
-        });
+        };
     }
 
     // Rebuilds the connection in place, keeping the process - and everyone racing on it - alive.

@@ -646,7 +646,7 @@ internal sealed partial class RandomizerGame
                 await BroadcastHudAsync(HudSection.All, cancellationToken);
 
                 // on HUD servers the map panel carries the Rounds button instead
-                if (info.LapRace && !HudAvailable)
+                if (info.LapRace && !HudAvailable && !client.IsManiaPlanet)
                 {
                     await client.SendManialinkPageAsync(BuildRoundsPromptManialink(info.NbLaps), cancellationToken: cancellationToken);
                 }
@@ -1643,8 +1643,8 @@ internal sealed partial class RandomizerGame
             CurrentMapName = mapName,
             CurrentMapCheckpoints = nbCheckpoints,
             CurrentMapTrackId = displayedTrackId,
-            CurrentMapUrl = displayedTrackId is { } id ? $"https://{tmxRules.GetSiteUrl()}/trackshow/{id}" : null,
-            CurrentMapImageUrl = displayedTrackId is { } imgId ? $"https://{tmxRules.GetSiteUrl()}/trackshow/{imgId}/image/1" : null,
+            CurrentMapUrl = displayedTrackId is { } id ? tmxRules.TrackPageUrl(id) : null,
+            CurrentMapImageUrl = displayedTrackId is { } imgId ? tmxRules.TrackImageUrl(imgId) : null,
             Players = racers,
             // 25 rather than 5: the website scrolls this list, and the in-game
             // /top10 command takes its own slice, so nothing in chat gets longer.
@@ -1951,13 +1951,20 @@ internal sealed partial class RandomizerGame
     // /map, the TMX link and the status page preview all pointing at a map from 15 minutes back.
     // The map name is capped: the game server refuses to write a path that ends up too long
     // ("couldn't write file"), and the map is found by its _tmx<id>_ marker anyway.
-    private static string InsertedChallengePath(InMemoryFile map)
+    private string InsertedChallengePath(InMemoryFile map)
     {
-        const string extension = ".Challenge.Gbx";
         const int maxNameLength = 40;
-        var name = map.FileName.EndsWith(extension, StringComparison.OrdinalIgnoreCase)
-            ? map.FileName[..^extension.Length]
-            : map.FileName;
+        var name = map.FileName;
+        foreach (var known in (string[])[".Challenge.Gbx", ".Map.Gbx", ".Gbx"])
+        {
+            if (name.EndsWith(known, StringComparison.OrdinalIgnoreCase))
+            {
+                name = name[..^known.Length];
+                break;
+            }
+        }
+
+        var extension = config.MapFileExtension;
 
         if (name.Length > maxNameLength)
         {
@@ -2065,7 +2072,7 @@ internal sealed partial class RandomizerGame
             return;
         }
 
-        var tmxUrl = $"https://{tmxRules.GetSiteUrl()}/trackshow/{id}";
+        var tmxUrl = tmxRules.TrackPageUrl(id);
 
         // A report skips the map once and goes to Discord; it no longer keeps the map out. Whether
         // a map is really impossible is decided in the review (the shared sheet, see ImpossibleMaps):
@@ -2184,7 +2191,7 @@ internal sealed partial class RandomizerGame
             return;
         }
 
-        var tmxUrl = $"https://{tmxRules.GetSiteUrl()}/trackshow/{id}";
+        var tmxUrl = tmxRules.TrackPageUrl(id);
 
         await SendMessageAsync($"$FF0Map {id} flagged as hard by {GetNicknameOrLogin(login)} for review.", cancellationToken);
 
@@ -2245,7 +2252,7 @@ internal sealed partial class RandomizerGame
 
         // "http://" not "https://" - TMF's chat "$l[...]" link syntax prepends its own "http://"
         // on top of anything that isn't already that exact scheme, breaking the link (see /source)
-        var tmxUrl = $"http://{tmxRules.GetSiteUrl()}/trackshow/{id}";
+        var tmxUrl = tmxRules.TrackPageUrl(id).Replace("https://", "http://", StringComparison.Ordinal);
         var cpSuffix = string.Empty;
 
         // live checkpoint/lap info is only meaningful for the map that's actually loaded right
@@ -2262,7 +2269,9 @@ internal sealed partial class RandomizerGame
                 }
                 if (info.LapRace)
                 {
-                    cpSuffix += $" $F80[Multilap, {info.NbLaps} laps - $FFF/rounds$F80 for a valid replay]";
+                    cpSuffix += client.IsManiaPlanet
+                        ? $" $F80[Multilap, {info.NbLaps} laps]"
+                        : $" $F80[Multilap, {info.NbLaps} laps - $FFF/rounds$F80 for a valid replay]";
                 }
             }
             catch (Exception)
@@ -2341,6 +2350,12 @@ internal sealed partial class RandomizerGame
     // SetGameMode(1) call, which already runs unconditionally on every map fetch
     private async Task RoundsAsync(int playerUid, string login, string[] args, CancellationToken cancellationToken)
     {
+        if (client.IsManiaPlanet)
+        {
+            await SendMessageAsync(login, "$FF0No need here - TimeAttack on this server already counts every lap of a multilap map.", cancellationToken);
+            return;
+        }
+
         if (!SessionActive)
         {
             await SendMessageAsync(login, "$F00No session is active.", cancellationToken);
@@ -3367,7 +3382,9 @@ internal sealed partial class RandomizerGame
             var host = string.IsNullOrWhiteSpace(config.PublicHost) ? "localhost" : config.PublicHost;
             var url = $"http://{host}:{config.ReplayServerPort}/replays/{Uri.EscapeDataString(fileName)}";
 
-            await SendMessageAsync(login, $"$FF0Your TMX-valid replay: $FFF$l[{url}]{url}$l", cancellationToken);
+            await SendMessageAsync(login, client.IsManiaPlanet
+                ? $"$FF0Server copy of your run: $FFF$l[{url}]{url}$l"
+                : $"$FF0Your TMX-valid replay: $FFF$l[{url}]{url}$l", cancellationToken);
         }
         catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
         {
@@ -3683,7 +3700,7 @@ internal sealed partial class RandomizerGame
                 }
                 else
                 {
-                    await CallWithTransitionRetryAsync("CallVote", [XmlRpcClient.GenerateXmlPayload("NextChallenge", [])], token);
+                    await CallWithTransitionRetryAsync("CallVote", [XmlRpcClient.GenerateXmlPayload(client.MethodName("NextChallenge"), [])], token);
 
                     // Say it out loud. With two or more players /skip does not skip - it opens a
                     // vote - and players who did not know that read the silence as a broken command.
@@ -4099,7 +4116,7 @@ internal sealed partial class RandomizerGame
             if (i < trackIds.Count)
             {
                 // straight to the map's TMX page, no chat link needed
-                b.Append($"<quad posn=\"{Inv(width - 6.3)} {Inv(y)} 0.01\" sizen=\"5.5 2\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\" url=\"{tmxRules.GetSiteUrl()}/trackshow/{trackIds[i]}\"/>");
+                b.Append($"<quad posn=\"{Inv(width - 6.3)} {Inv(y)} 0.01\" sizen=\"5.5 2\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\" url=\"{TrackPageLink(trackIds[i])}\"/>");
                 b.Append($"<quad posn=\"{Inv(width - 5.8)} {Inv(y - 0.1)} 0.02\" sizen=\"4.4 1.8\" image=\"{AssetBaseUrl}/tmx-logo.png\"/>");
             }
             y -= 2.2;
@@ -4235,6 +4252,19 @@ internal sealed partial class RandomizerGame
     // TMF prepends "http://" to a quad's url attribute itself, so it must be given without a scheme
     private const string DiscordInviteUrlNoScheme = "discord.gg/HRShWnzpK3";
     private string FavoriteServerUrl => $"tmtp://#addfavourite={config.FavoriteLogin}";
+
+    // a quad's url: TMF adds "http://" itself, TM2/TM2020 need the full address
+    private string TrackPageLink(int trackId) => client.IsManiaPlanet
+        ? tmxRules.TrackPageUrl(trackId)
+        : tmxRules.TrackPageUrl(trackId).Replace("https://", string.Empty, StringComparison.Ordinal);
+
+    // the link that joins a server of the same game (TM2 needs the title too)
+    private string JoinUrl(string login) => config.Game switch
+    {
+        GameTitle.TM2 => $"maniaplanet://#join={login}@{config.TitlePack}",
+        GameTitle.TM2020 => $"trackmania://#join={login}",
+        _ => $"tmtp://#join={login}",
+    };
 
     // plain-text nickname for destinations that don't understand TM's $-formatting codes (e.g. Discord)
     private string GetPlainNickname(string login)

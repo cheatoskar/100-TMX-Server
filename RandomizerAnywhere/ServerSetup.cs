@@ -33,6 +33,8 @@ internal sealed partial class ServerSetup
         {
             GameTitle.TMNF or GameTitle.TMUF => DedicatedServerType.TMF,
             GameTitle.TMN or GameTitle.TMS or GameTitle.TMO => DedicatedServerType.TM,
+            GameTitle.TM2 => DedicatedServerType.ManiaPlanet,
+            GameTitle.TM2020 => DedicatedServerType.Trackmania,
             _ => throw new InvalidOperationException($"Unsupported game: {config.Game}")
         };
         serverDir = Path.Combine(AppContext.BaseDirectory, "Servers", game.ToString());
@@ -47,12 +49,24 @@ internal sealed partial class ServerSetup
                 dedicatedServerDir = Path.Combine(serverDir, "TmDedicatedServer");
                 dedicatedExeFileName = OperatingSystem.IsWindows() ? "TrackManiaServer.exe" : "TrackManiaServer";
                 break;
+            case DedicatedServerType.ManiaPlanet:
+                dedicatedServerDir = serverDir;
+                dedicatedExeFileName = OperatingSystem.IsWindows() ? "ManiaPlanetServer.exe" : "ManiaPlanetServer";
+                break;
+            case DedicatedServerType.Trackmania:
+                dedicatedServerDir = serverDir;
+                dedicatedExeFileName = OperatingSystem.IsWindows() ? "TrackmaniaServer.exe" : "TrackmaniaServer";
+                break;
             default:
                 throw new InvalidOperationException($"Unsupported server type: {game}");
         }
     }
 
-    public string ReplaysDir => Path.Combine(dedicatedServerDir, "GameData", "Tracks", "Replays", config.ServerName);
+    public string ReplaysDir => config.IsManiaPlanet
+        ? Path.Combine(dedicatedServerDir, "UserData", "Replays", config.ServerName)
+        : Path.Combine(dedicatedServerDir, "GameData", "Tracks", "Replays", config.ServerName);
+
+    private bool ManiaPlanet => game is DedicatedServerType.ManiaPlanet or DedicatedServerType.Trackmania;
 
     public async Task<bool> TrySetupAsync(CancellationToken cancellationToken = default)
     {
@@ -62,6 +76,7 @@ internal sealed partial class ServerSetup
         }
 
         var firstTimeSetup = await SetupDedicatedServerAsync(cancellationToken);
+        await SetupTitlePackAsync(cancellationToken);
         await SetupDedicatedCfgAsync(cancellationToken);
         await SetupMatchSettingsAsync(cancellationToken);
         PruneConsoleLogs();
@@ -172,11 +187,59 @@ internal sealed partial class ServerSetup
         }
     }
 
+    // TM2: every environment is its own title, and the server zip ships none of them. The
+    // official ones are public on maniaplanet.com (webservices/titles/<uid> names the file).
+    private async Task SetupTitlePackAsync(CancellationToken cancellationToken)
+    {
+        if (game != DedicatedServerType.ManiaPlanet)
+        {
+            return;
+        }
+
+        var packPath = Path.Combine(dedicatedServerDir, "Packs", $"{config.TitlePack}.Title.Pack.Gbx");
+        if (File.Exists(packPath) && new FileInfo(packPath).Length > 0)
+        {
+            return;
+        }
+
+        Console.WriteLine($"Downloading the title pack {config.TitlePack}...");
+        using var info = await http.GetAsync($"https://www.maniaplanet.com/webservices/titles/{Uri.EscapeDataString(config.TitlePack)}", cancellationToken);
+        info.EnsureSuccessStatusCode();
+        using var document = await System.Text.Json.JsonDocument.ParseAsync(await info.Content.ReadAsStreamAsync(cancellationToken), cancellationToken: cancellationToken);
+        var downloadUrl = document.RootElement.TryGetProperty("download_url", out var u) ? u.GetString() : null;
+        if (string.IsNullOrWhiteSpace(downloadUrl))
+        {
+            throw new ConfigException($"maniaplanet.com has no download for the title {config.TitlePack} - check TitlePack in config.toml.");
+        }
+
+        using var pack = await http.GetAsync(downloadUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        pack.EnsureSuccessStatusCode();
+        Directory.CreateDirectory(Path.GetDirectoryName(packPath)!);
+        var temp = packPath + ".part";
+        await using (var file = File.Create(temp))
+        {
+            await DownloadWithProgressAsync(pack.Content, file, cancellationToken);
+        }
+
+        File.Move(temp, packPath, overwrite: true);
+    }
+
+    private string DedicatedCfgPath => game switch
+    {
+        DedicatedServerType.TM => Path.Combine(dedicatedServerDir, "dedicated.cfg"),
+        DedicatedServerType.ManiaPlanet or DedicatedServerType.Trackmania => Path.Combine(dedicatedServerDir, "UserData", "Config", "dedicated_cfg.txt"),
+        _ => Path.Combine(dedicatedServerDir, "GameData", "Config", "dedicated_cfg.txt"),
+    };
+
     private async Task SetupDedicatedCfgAsync(CancellationToken cancellationToken)
     {
-        var filePath = game == DedicatedServerType.TM
-            ? Path.Combine(dedicatedServerDir, "dedicated.cfg")
-            : Path.Combine(dedicatedServerDir, "GameData", "Config", "dedicated_cfg.txt");
+        var filePath = DedicatedCfgPath;
+
+        // TM2/TM2020 ship only dedicated_cfg.default.txt
+        if (ManiaPlanet && !File.Exists(filePath))
+        {
+            File.Copy(Path.Combine(Path.GetDirectoryName(filePath)!, "dedicated_cfg.default.txt"), filePath);
+        }
 
         var contents = await File.ReadAllTextAsync(filePath, cancellationToken);
 
@@ -236,9 +299,24 @@ internal sealed partial class ServerSetup
         // blockmixed starts behave differently than offline. Server-saved ghost replays don't need it.
         contents = ValidationSeedRegex().Replace(contents, "<use_changing_validation_seed>False</use_changing_validation_seed>");
 
-        if (game == DedicatedServerType.TMF && config.ConnectionUploadRate > 0)
+        if (game == DedicatedServerType.ManiaPlanet)
+        {
+            contents = TitleTagRegex().Replace(contents, _ => $"<title>{System.Security.SecurityElement.Escape(config.TitlePack)}</title>");
+        }
+
+        if (game != DedicatedServerType.TM && config.ConnectionUploadRate > 0)
         {
             contents = UploadRateRegex().Replace(contents, _ => $"<connection_uploadrate>{config.ConnectionUploadRate}</connection_uploadrate>");
+        }
+
+        // TM2/TM2020 want the name in the file too ("Server not started: no ServerName specified")
+        if (ManiaPlanet)
+        {
+            contents = ServerOptionsRegex().Replace(contents, block =>
+            {
+                var text = ServerOptionNameRegex().Replace(block.Value, _ => $"<name>{System.Security.SecurityElement.Escape(config.InGameServerName)}</name>", 1);
+                return ServerOptionCommentRegex().Replace(text, _ => $"<comment>{System.Security.SecurityElement.Escape(config.ServerComment)}</comment>", 1);
+            });
         }
 
         if (game == DedicatedServerType.TM)
@@ -269,12 +347,37 @@ internal sealed partial class ServerSetup
 
     private async Task SetupMatchSettingsAsync(CancellationToken cancellationToken)
     {
-        var matchSettingsFilePath = Path.Combine(dedicatedServerDir, "GameData", "Tracks", config.GameSettings);
+        var matchSettingsFilePath = Path.Combine(TracksDir, config.GameSettings);
+        Directory.CreateDirectory(Path.GetDirectoryName(matchSettingsFilePath)!);
         var warmupFileName = await PrepareWarmupChallengeAsync(cancellationToken);
 
         string matchSettingsXml;
 
-        if (game == DedicatedServerType.TM)
+        if (ManiaPlanet)
+        {
+            // TimeAttack without a time limit (0 = none, checked on both) and without chat time;
+            // the controller moves on itself. Script names as the 2026 server builds load them.
+            var script = game == DedicatedServerType.Trackmania
+                ? "Trackmania/TM_TimeAttack_Online.Script.txt"
+                : "TrackMania/TimeAttack.Script.txt";
+
+            matchSettingsXml = @$"<?xml version=""1.0"" encoding=""utf-8"" ?>
+<playlist>
+	<gameinfos>
+		<game_mode>0</game_mode>
+		<script_name>{script}</script_name>
+	</gameinfos>
+	<script_settings>
+		<setting name=""S_TimeLimit"" type=""integer"" value=""0""/>
+		<setting name=""S_ChatTime"" type=""integer"" value=""0""/>
+		<setting name=""S_WarmUpNb"" type=""integer"" value=""0""/>
+	</script_settings>
+	<startindex>0</startindex>
+	<map><file>{System.Security.SecurityElement.Escape(warmupFileName)}</file></map>
+</playlist>
+";
+        }
+        else if (game == DedicatedServerType.TM)
         {
             matchSettingsXml = @$"
 <?xml version=""1.0"" encoding=""utf-8"" ?>
@@ -371,7 +474,9 @@ internal sealed partial class ServerSetup
         await AtomicFile.WriteAllTextAsync(matchSettingsFilePath, matchSettingsXml);
     }
 
-    private string TracksDir => Path.Combine(dedicatedServerDir, "GameData", "Tracks");
+    private string TracksDir => ManiaPlanet
+        ? Path.Combine(dedicatedServerDir, "UserData", "Maps")
+        : Path.Combine(dedicatedServerDir, "GameData", "Tracks");
 
     // The map the dedicated server boots on. A fresh one from TMX when TMX answers; otherwise the
     // most recent map already on disk. Startup used to have no fallback at all: a slow or down
@@ -424,7 +529,7 @@ internal sealed partial class ServerSetup
     private string? FindRecentLocalChallenge()
     {
         IEnumerable<FileInfo> Candidates(string directory) => Directory.Exists(directory)
-            ? new DirectoryInfo(directory).EnumerateFiles("*.Challenge.Gbx")
+            ? new DirectoryInfo(directory).EnumerateFiles("*" + config.MapFileExtension)
             : [];
 
         // The newest file is often the map the server was on when it went down - which may be the
@@ -516,7 +621,17 @@ internal sealed partial class ServerSetup
             serverProcess.StartInfo.ArgumentList.Add($"/comment={config.ServerComment}");
         }
 
-        if (game == DedicatedServerType.TM)
+        if (ManiaPlanet)
+        {
+            serverProcess.StartInfo.ArgumentList.Add("/dedicated_cfg=dedicated_cfg.txt");
+            serverProcess.StartInfo.ArgumentList.Add("/nodaemon");
+
+            if (game == DedicatedServerType.ManiaPlanet)
+            {
+                serverProcess.StartInfo.ArgumentList.Add($"/title={config.TitlePack}");
+            }
+        }
+        else if (game == DedicatedServerType.TM)
         {
             var gameId = config.Game switch
             {
@@ -555,6 +670,13 @@ internal sealed partial class ServerSetup
         if (config.BindIP is not null)
         {
             serverProcess.StartInfo.ArgumentList.Add($"/bindip={config.BindIP}");
+        }
+
+        var executable = serverProcess.StartInfo.FileName;
+        if (!OperatingSystem.IsWindows() && File.Exists(executable))
+        {
+            File.SetUnixFileMode(executable, File.GetUnixFileMode(executable)
+                | UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute);
         }
 
         serverProcess.Start();
@@ -707,4 +829,7 @@ internal sealed partial class ServerSetup
 
     [GeneratedRegex(@"<connection_uploadrate>(\d+)<\/connection_uploadrate>", RegexOptions.IgnoreCase)]
     private static partial Regex UploadRateRegex();
+
+    [GeneratedRegex(@"<title>[^<]*</title>")]
+    private static partial Regex TitleTagRegex();
 }
