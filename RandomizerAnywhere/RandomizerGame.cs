@@ -412,7 +412,7 @@ internal sealed partial class RandomizerGame
     [
         "start", "stop", "end", "skip", "imp", "blockmap", "hard", "top", "rank", "map", "history",
         "rounds", "info", "help", "testhud", "votepreset", "yes", "no", "commands", "source",
-        "timelimit", "tl", "preset", "presets", "loadmap", "votemap", "afk", "hud",
+        "timelimit", "tl", "preset", "presets", "loadmap", "votemap", "afk", "hud", "event",
     ];
 
     private readonly EventMode eventMode;
@@ -459,7 +459,8 @@ internal sealed partial class RandomizerGame
             ["loadmap"] = LoadMapAsync,
             ["votemap"] = VoteMapAsync,
             ["afk"] = AfkAsync,
-            ["hud"] = HudAsync
+            ["hud"] = HudAsync,
+            ["event"] = EventAsync
         };
 
         if (!commandHandlers.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase).SetEquals(ChatCommandNames))
@@ -3006,6 +3007,11 @@ internal sealed partial class RandomizerGame
             return;
         }
 
+        if (await CheckEventMapVoteAsync(login, trackId, cancellationToken) is false)
+        {
+            return;
+        }
+
         if (votePresetName is not null || voteMapTrackId is not null)
         {
             await SendMessageAsync(login, $"$F00A vote for {DescribeActiveVote()} is already in progress.", cancellationToken);
@@ -3480,7 +3486,7 @@ internal sealed partial class RandomizerGame
         // server, asking TMX would only fail over and over - stay on the map and say so once.
         if (forcedNextMapTrackId is null && config.SourceFromEventList && eventMode.Enabled && eventMode.PickableIds().Count == 0)
         {
-            if (!eventDoneAnnounced)
+            if (!eventDoneAnnounced && eventMode.EndedAt is null)
             {
                 eventDoneAnnounced = true;
                 await SendMessageAsync("$FC0» Event: no open maps left for this server - GG everyone! An admin can switch the preset now.", cancellationToken);

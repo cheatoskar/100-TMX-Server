@@ -695,6 +695,15 @@ internal sealed class TmxRules
         }
     }
 
+    // The event list's TMX source (EventMapsSource = "tmx"): every map [EventTmxQuery] matches.
+    public async Task<(int[] Ids, bool Complete)> ListEventPoolAsync(CancellationToken cancellationToken)
+    {
+        var query = string.Join('&', config.EventTmxQuery
+            .Where(kv => !string.IsNullOrWhiteSpace(kv.Key))
+            .Select(kv => $"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(Convert.ToString(kv.Value, CultureInfo.InvariantCulture) ?? string.Empty)}"));
+        return await ListPoolAsync(query, cancellationToken);
+    }
+
     // Every map the query matches (up to MaxPoolPages pages); Complete=false when there are more.
     private async Task<(int[] Ids, bool Complete)> ListPoolAsync(string query, CancellationToken cancellationToken)
     {

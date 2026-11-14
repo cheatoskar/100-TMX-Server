@@ -10,6 +10,8 @@ internal sealed record EventFinish(string Login, string Nickname, int Time, Date
 
 internal sealed record EventServerInfo(string Label, string Login, int? TrackId, string? MapName, int Players, int MaxPlayers, DateTimeOffset Updated);
 
+internal sealed record EventStanding(string Login, string Nickname, int Maps, DateTimeOffset LastAt);
+
 // The event module: a hand-made list of maps to get through (event-maps.json), and the progress on
 // it (event-state.json) - which map was finished by whom, with what time, when and on which server,
 // plus which map every server is playing right now. Off unless EventEnabled is set; with it off,
@@ -33,6 +35,14 @@ internal sealed class EventMode
     private List<EventMap> maps = [];
     private Dictionary<int, EventFinish> finished = [];
     private Dictionary<string, EventServerInfo> servers = new(StringComparer.OrdinalIgnoreCase);
+
+    // with EventMapsSource = "tmx": the list as TMX last answered it (kept in the shared state file,
+    // so every server works from the same list), and when it was refreshed
+    private List<int> tmxPool = [];
+    private DateTimeOffset? tmxPoolUpdated;
+
+    // set once, by whichever server saw the last open map finished; the end of the event for all
+    private DateTimeOffset? endedAt;
 
     private DateTime? mapsWriteTimeUtc;
     private DateTime? stateWriteTimeUtc;
@@ -66,9 +76,131 @@ internal sealed class EventMode
         {
             lock (gate)
             {
-                return string.IsNullOrWhiteSpace(title) ? "Event" : title;
+                return !string.IsNullOrWhiteSpace(title) ? title
+                    : !string.IsNullOrWhiteSpace(config.EventTitle) ? config.EventTitle
+                    : "Event";
             }
         }
+    }
+
+    public bool UsesTmxSource => config.EventMapsFromTmx;
+
+    public DateTimeOffset? EndedAt
+    {
+        get
+        {
+            lock (gate)
+            {
+                return endedAt;
+            }
+        }
+    }
+
+    // who finished the most event maps first, then who got there earlier
+    public IReadOnlyList<EventStanding> Standings()
+    {
+        lock (gate)
+        {
+            var listed = maps.Select(m => m.TrackId).ToHashSet();
+            return [.. finished.Where(kv => listed.Contains(kv.Key) && !string.IsNullOrEmpty(kv.Value.Login))
+                .GroupBy(kv => kv.Value.Login, StringComparer.OrdinalIgnoreCase)
+                .Select(g => new EventStanding(g.Key, g.OrderByDescending(kv => kv.Value.At).First().Value.Nickname, g.Count(), g.Max(kv => kv.Value.At)))
+                .OrderByDescending(s => s.Maps)
+                .ThenBy(s => s.LastAt)];
+        }
+    }
+
+    // first and last finish on the list, for "30 maps in 2:14 h"
+    public (DateTimeOffset First, DateTimeOffset Last)? FinishSpan()
+    {
+        lock (gate)
+        {
+            var listed = maps.Select(m => m.TrackId).ToHashSet();
+            var times = finished.Where(kv => listed.Contains(kv.Key)).Select(kv => kv.Value.At).ToList();
+            return times.Count == 0 ? null : (times.Min(), times.Max());
+        }
+    }
+
+    public bool TmxRefreshDue
+    {
+        get
+        {
+            lock (gate)
+            {
+                return UsesTmxSource && (tmxPoolUpdated is null || DateTimeOffset.UtcNow - tmxPoolUpdated > TimeSpan.FromMinutes(config.EventTmxRefreshMinutes));
+            }
+        }
+    }
+
+    // Takes TMX's current answer for the event query (already without impossible/skip-listed maps).
+    // Maps stay in the list once in it - finished ones as done; one TMX no longer lists and nobody
+    // here finished (a record came from elsewhere) leaves it; new uploads are added at the end.
+    // A list cut short (complete = false) only adds, it never removes.
+    public async Task MergeTmxPoolAsync(IReadOnlyList<int> fetched, bool complete)
+    {
+        if (!Enabled || !UsesTmxSource)
+        {
+            return;
+        }
+
+        var changed = false;
+
+        await UpdateStateAsync(() =>
+        {
+            // another server refreshed it while this one asked TMX
+            if (tmxPoolUpdated is { } updated && DateTimeOffset.UtcNow - updated < TimeSpan.FromMinutes(config.EventTmxRefreshMinutes) / 2)
+            {
+                return;
+            }
+
+            var fresh = fetched.ToHashSet();
+            var kept = tmxPool.Where(id => finished.ContainsKey(id) || fresh.Contains(id) || !complete).ToList();
+            var added = fetched.Where(id => !kept.Contains(id)).ToList();
+            var merged = kept.Concat(added).ToList();
+
+            changed = !merged.SequenceEqual(tmxPool);
+            if (changed)
+            {
+                Console.WriteLine($"Event: TMX list refreshed - {merged.Count} map(s), {added.Count} new, {tmxPool.Count - kept.Count} gone (record from elsewhere).");
+            }
+
+            tmxPool = merged;
+            tmxPoolUpdated = DateTimeOffset.UtcNow;
+            maps = [.. tmxPool.Select(id => new EventMap(id, false))];
+        });
+
+        if (changed)
+        {
+            RaiseChanged();
+        }
+    }
+
+    // Ends the event when no open map is left. True for the one call that ended it.
+    public async Task<bool> TryEndAsync()
+    {
+        if (!Enabled)
+        {
+            return false;
+        }
+
+        var ended = false;
+
+        await UpdateStateAsync(() =>
+        {
+            if (endedAt is null && maps.Count > 0 && maps.All(m => finished.ContainsKey(m.TrackId)))
+            {
+                endedAt = DateTimeOffset.UtcNow;
+                ended = true;
+            }
+        });
+
+        if (ended)
+        {
+            Console.WriteLine($"Event: '{Title}' finished - every map on the list is done.");
+            RaiseChanged();
+        }
+
+        return ended;
     }
 
     public IReadOnlyList<EventMap> AllMaps
@@ -185,7 +317,7 @@ internal sealed class EventMode
 
         lock (gate)
         {
-            Console.WriteLine($"Event: '{Title}' - {maps.Count} map(s) in {MapsFile}, {maps.Count(m => finished.ContainsKey(m.TrackId))} finished (progress in {StateFile}), this server is '{ServerLabel}'{(config.EventUnlimiter ? " (Unlimiter maps)" : string.Empty)}.");
+            Console.WriteLine($"Event: '{Title}' - {maps.Count} map(s) {(UsesTmxSource ? "from TMX (refreshed every " + config.EventTmxRefreshMinutes + " min)" : "in " + MapsFile)}, {maps.Count(m => finished.ContainsKey(m.TrackId))} finished (progress in {StateFile}), this server is '{ServerLabel}'{(config.EventUnlimiter ? " (Unlimiter maps)" : string.Empty)}{(endedAt is not null ? " - already finished" : string.Empty)}.");
         }
 
         await Task.CompletedTask;
@@ -262,6 +394,11 @@ internal sealed class EventMode
 
     private bool ReloadMapsIfChanged(bool force)
     {
+        if (UsesTmxSource)
+        {
+            return false;
+        }
+
         var path = MapsFile;
         DateTime? writeTime = File.Exists(path) ? File.GetLastWriteTimeUtc(path) : null;
 
@@ -356,6 +493,9 @@ internal sealed class EventMode
     {
         public Dictionary<string, EventFinish> Finished { get; set; } = [];
         public Dictionary<string, EventServerInfo> Servers { get; set; } = [];
+        public List<int> TmxPool { get; set; } = [];
+        public DateTimeOffset? TmxPoolUpdated { get; set; }
+        public DateTimeOffset? EndedAt { get; set; }
     }
 
     private bool ReloadStateIfChanged(bool force)
@@ -378,6 +518,14 @@ internal sealed class EventMode
                     .Where(kv => int.TryParse(kv.Key, out _))
                     .ToDictionary(kv => int.Parse(kv.Key), kv => kv.Value);
                 servers = new Dictionary<string, EventServerInfo>(model.Servers, StringComparer.OrdinalIgnoreCase);
+                tmxPool = model.TmxPool;
+                tmxPoolUpdated = model.TmxPoolUpdated;
+                endedAt = model.EndedAt;
+
+                if (UsesTmxSource)
+                {
+                    maps = [.. tmxPool.Select(id => new EventMap(id, false))];
+                }
             }
 
             stateWriteTimeUtc = writeTime;
@@ -406,6 +554,9 @@ internal sealed class EventMode
             {
                 Finished = finished.ToDictionary(kv => kv.Key.ToString(), kv => kv.Value),
                 Servers = new Dictionary<string, EventServerInfo>(servers),
+                TmxPool = [.. tmxPool],
+                TmxPoolUpdated = tmxPoolUpdated,
+                EndedAt = endedAt,
             };
         }
 

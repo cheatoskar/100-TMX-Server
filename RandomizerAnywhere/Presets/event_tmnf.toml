@@ -9,3 +9,7 @@ AutoSkipMode = "Finished"
 # Needs EventEnabled = true in config.toml; a finished map leaves the rotation on every server
 # that shares the event state file.
 SourceFromEventList = true
+
+# /votemap only takes the event list's open maps while this preset runs (the map vote window
+# lists them). Every other preset leaves it at "any".
+MapVoteScope = "event"

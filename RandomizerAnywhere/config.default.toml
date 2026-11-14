@@ -54,6 +54,15 @@ EventMapsFile = ""
 EventStateFile = ""
 EventServerLabel = ""
 EventUnlimiter = false
+# EventMapsSource = "tmx": the list is every map [EventTmxQuery] finds on TMX (default: no record
+# yet, no Unlimiter), minus the impossible and skip lists, refreshed every EventTmxRefreshMinutes -
+# new uploads join, maps that got a record elsewhere leave. "file" (default) = EventMapsFile.
+EventMapsSource = "file"
+EventTitle = ""
+EventTmxRefreshMinutes = 5
+# Once every map on the list is finished, every server shows the results (winner = most maps
+# finished first) and switches to this preset, e.g. "100tmx_tmnf". Empty = stay on the event.
+EventAfterPreset = ""
 
 WelcomeMessage = '''
 Built on $FF0Randomizer Anywhere$FF0 (modified) - type $FF0/source$FF0 for the code.

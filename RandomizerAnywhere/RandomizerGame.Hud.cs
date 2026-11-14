@@ -79,6 +79,17 @@ internal sealed partial class RandomizerGame
     private readonly ConcurrentDictionary<string, int[]> eventRowsShown = new(StringComparer.OrdinalIgnoreCase);
 
     private int mapsStartedCount;
+    private DateTimeOffset? handledEventEnd;
+    private const string EventResultsId = "event_results";
+    private const int ActionEventResultsClose = 1030;
+    private const string MapVoteWindowId = "map_vote_window";
+    private const int ActionMapVoteClose = 1040;
+    private const int ActionMapVotePrev = 1041;
+    private const int ActionMapVoteNext = 1042;
+    private const int ActionMapVoteRowBase = 1300;
+    private const int MapVoteRowsPerPage = 14;
+    private readonly ConcurrentDictionary<string, int> mapVotePage = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, int[]> mapVoteRowsShown = new(StringComparer.OrdinalIgnoreCase);
     private bool eventDoneAnnounced;
     private int? cachedMaxPlayers;
 
@@ -175,12 +186,18 @@ internal sealed partial class RandomizerGame
 
         RecordMapFinishTime(login, time);
 
-        if (eventMode.Enabled && currentMapTrackId is { } trackId && eventMode.IsListed(trackId))
+        if (eventMode.Enabled && eventMode.EndedAt is null && currentMapTrackId is { } trackId && eventMode.IsListed(trackId))
         {
             if (await eventMode.RecordFinishAsync(trackId, login, GetRawNickname(login), time))
             {
                 var name = eventMapDetails.TryGetValue(trackId, out var d) ? d.Name : $"#{trackId}";
-                await SendMessageAsync($"$FC0» Event: {GetNicknameOrLogin(login)}$z$FC0 finished {name} first ({FormatTime(time)}) - {eventMode.OpenMaps.Count} map(s) left.", cancellationToken);
+                var left = eventMode.OpenMaps.Count;
+                await SendMessageAsync($"$FC0» Event: {GetNicknameOrLogin(login)}$z$FC0 finished {name} first ({FormatTime(time)}) - {left} map(s) left.", cancellationToken);
+
+                if (left == 0)
+                {
+                    await eventMode.TryEndAsync();
+                }
             }
         }
 
@@ -256,14 +273,267 @@ internal sealed partial class RandomizerGame
         });
     }
 
-    // the event list changed (hand edit, a finish here or on another server)
+    // the event list changed (hand edit, TMX refresh, a finish here or on another server)
     private void OnEventChanged()
     {
         RunInBackground("refreshing the event list", async () =>
         {
             await LoadEventMapDetailsAsync(appToken);
             await BroadcastHudAsync(HudSection.Event | HudSection.Toolbar, appToken);
+
+            if (eventMode.EndedAt is { } ended && handledEventEnd != ended)
+            {
+                handledEventEnd = ended;
+                await RunEventEndAsync(appToken);
+                return;
+            }
+
+            await SkipMapFinishedElsewhereAsync();
         });
+    }
+
+    // Two servers can end up on the same event map (a vote, or nothing else left). Once the other
+    // one finishes it, it is done for the event - this server moves on instead of playing it on.
+    private async Task SkipMapFinishedElsewhereAsync()
+    {
+        if (!config.SourceFromEventList || !SessionActive || currentMapTrackId is not { } trackId
+            || eventMode.GetFinish(trackId) is not { } finish
+            || string.Equals(finish.Server, eventMode.ServerLabel, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        var generation = mapGeneration;
+        await RunUnderGameLockAsync($"skipping event map {trackId} finished on {finish.Server}", async token =>
+        {
+            if (mapGeneration != generation || currentMapTrackId != trackId || SwitchAlreadyClaimed || isAdvancingToNextMap)
+            {
+                return;
+            }
+
+            await SendMessageAsync($"$FC0» {finish.Nickname}$z$FC0 just finished this map on {finish.Server} ({FormatTime(finish.Time)}) - it's done, moving on.", token);
+            await NextRandomMapAsync(goalReached: false, token);
+        });
+    }
+
+    // /votemap with the event: never a map another server is playing right now, and with the
+    // preset's MapVoteScope = "event" only the list's open maps. False = refused (and said why).
+    private async Task<bool> CheckEventMapVoteAsync(string login, int trackId, CancellationToken cancellationToken)
+    {
+        if (!eventMode.Enabled)
+        {
+            return true;
+        }
+
+        if (eventMode.OtherServers().FirstOrDefault(s => s.TrackId == trackId) is { } other)
+        {
+            await SendMessageAsync(login, $"$F00That map is running on {other.Label} right now - join it there (event list, OTHER SERVERS).", cancellationToken);
+            return false;
+        }
+
+        if (config.MapVoteScope == "event" && !eventMode.OpenMapsForThisServer.Any(m => m.TrackId == trackId))
+        {
+            await SendMessageAsync(login, eventMode.GetFinish(trackId) is { } done
+                ? $"$F00That map is already done ({done.Nickname}$z$F00, {FormatTime(done.Time)})."
+                : "$F00During the event only open maps from the event list can be voted - click one in the list.", cancellationToken);
+            return false;
+        }
+
+        return true;
+    }
+
+    // Every event map is finished: the results for everyone, then (EventAfterPreset) back to
+    // normal play. Runs once per server, when it first sees the shared end mark.
+    private async Task RunEventEndAsync(CancellationToken cancellationToken)
+    {
+        var standings = eventMode.Standings();
+        var span = eventMode.FinishSpan();
+        var duration = span is { } s ? s.Last - s.First : TimeSpan.Zero;
+
+        await client.SendManialinkPageAsync(BuildEventResultsWindow(), cancellationToken: cancellationToken);
+        await SendMessageAsync(
+        [
+            $"$FC0» {eventMode.Title} is finished! {eventMode.AllMaps.Count} maps in {(int)duration.TotalHours}:{duration.Minutes:00} h.",
+            standings.Count > 0
+                ? $"$FC0» Winner: {standings[0].Nickname}$z$FC0 with {standings[0].Maps} map(s). GG everyone!"
+                : "$FC0» GG everyone!",
+        ], cancellationToken);
+
+        if (string.IsNullOrWhiteSpace(config.EventAfterPreset) || !config.SourceFromEventList)
+        {
+            return;
+        }
+
+        // a moment to look at the results before the next map loads
+        await Task.Delay(TimeSpan.FromSeconds(15), cancellationToken);
+
+        await RunUnderGameLockAsync("switching to the preset after the event", async token =>
+        {
+            var name = ResolvePresetName(config.EventAfterPreset);
+            var (preset, error) = LoadPresetForThisGame(name);
+            if (preset is null)
+            {
+                Console.WriteLine($"Warning: EventAfterPreset '{config.EventAfterPreset}' can't be used - {error}. Staying on the event preset.");
+                return;
+            }
+
+            var wasActive = SessionActive;
+            if (wasActive)
+            {
+                ResetSessionStateForPresetSwitch();
+            }
+
+            var displayName = ApplyPreset(name, preset);
+            await SendMessageAsync($"$FC0» Back to normal play: preset $FF0{ShortenPresetDisplayName(displayName)}$FC0.", token);
+
+            if (wasActive)
+            {
+                await StartSessionAsync(token);
+            }
+        });
+    }
+
+    private async Task EventAsync(int playerUid, string login, string[] args, CancellationToken cancellationToken)
+    {
+        if (!eventMode.Enabled)
+        {
+            await SendMessageAsync(login, "No event is running on this server.", cancellationToken);
+            return;
+        }
+
+        if (eventMode.EndedAt is not null && HudAvailable)
+        {
+            await client.SendManialinkPageToLoginAsync(login, BuildEventResultsWindow(), cancellationToken: cancellationToken);
+            return;
+        }
+
+        var standings = eventMode.Standings();
+        var mine = standings.Select((st, i) => (st, i)).FirstOrDefault(x => x.st.Login.Equals(login, StringComparison.OrdinalIgnoreCase));
+        await SendMessageAsync(login,
+        [
+            $"$FC0{eventMode.Title}$FFF: {eventMode.FinishedCount}/{eventMode.AllMaps.Count} maps done, {eventMode.OpenMaps.Count} open.",
+            standings.Count == 0 ? "Nobody has finished an event map yet."
+                : $"Leading: {standings[0].Nickname}$z$FFF ({standings[0].Maps})" + (mine.st is not null ? $" · you: #{mine.i + 1} ({mine.st.Maps})" : string.Empty),
+        ], cancellationToken);
+    }
+
+    // The map vote window ("Map vote" in the map panel). With the event: the open maps this server
+    // can play, with author, difficulty and AT, a click starts the vote; a map running on another
+    // server is shown but not clickable. Without the event: how /votemap works.
+    private string BuildMapVoteWindow(string login)
+    {
+        const double width = 64;
+        var b = new StringBuilder();
+        var maps = eventMode.Enabled && eventMode.EndedAt is null ? eventMode.OpenMapsForThisServer : [];
+
+        if (maps.Count == 0)
+        {
+            const double h = 12;
+            b.Append($"<manialink id=\"{MapVoteWindowId}\"><frame posn=\"{Inv(-width / 2)} {Inv(h / 2 + 4)} 20\">");
+            AppendWindowHeader(b, width, h, "Vote for a map", ActionMapVoteClose);
+            b.Append("<label posn=\"1.5 -4.5 0.02\" sizen=\"60 2\" textsize=\"1\" text=\"Type $FF0/votemap <TMX id>$FFF in the chat - the id is the number in the map's TMX link.\"/>");
+            b.Append("<label posn=\"1.5 -6.8 0.02\" sizen=\"60 2\" textsize=\"1\" textcolor=\"CCCF\" text=\"The others then vote with Yes / No. The map loads right after a passed vote.\"/>");
+            b.Append("</frame></manialink>");
+            return b.ToString();
+        }
+
+        var pages = Math.Max(1, (maps.Count + MapVoteRowsPerPage - 1) / MapVoteRowsPerPage);
+        var page = Math.Clamp(mapVotePage.GetValueOrDefault(login, 0), 0, pages - 1);
+        mapVotePage[login] = page;
+        var shown = maps.Skip(page * MapVoteRowsPerPage).Take(MapVoteRowsPerPage).ToArray();
+        mapVoteRowsShown[login] = [.. shown.Select(m => m.TrackId)];
+        var elsewhere = eventMode.OtherServers().Where(s => s.TrackId is not null).ToDictionary(s => s.TrackId!.Value, s => s.Label);
+
+        var height = 8.5 + shown.Length * 2.2 + 3;
+        b.Append($"<manialink id=\"{MapVoteWindowId}\"><frame posn=\"{Inv(-width / 2)} {Inv(height / 2 + 4)} 20\">");
+        AppendWindowHeader(b, width, height, $"Vote for a map $AAA· {maps.Count} open", ActionMapVoteClose);
+        b.Append("<label posn=\"1.5 -3.9 0.02\" sizen=\"60 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"CCCF\" text=\"Click a map to start a vote for it. Everyone votes Yes / No.\"/>");
+
+        // column heads
+        b.Append("<label posn=\"4.5 -6 0.02\" sizen=\"20 2\" textsize=\"1\" scale=\"0.75\" textcolor=\"FC0F\" text=\"MAP\"/>");
+        b.Append("<label posn=\"30 -6 0.02\" sizen=\"14 2\" textsize=\"1\" scale=\"0.75\" textcolor=\"FC0F\" text=\"AUTHOR\"/>");
+        b.Append("<label posn=\"45 -6 0.02\" sizen=\"10 2\" textsize=\"1\" scale=\"0.75\" textcolor=\"FC0F\" text=\"DIFFICULTY\"/>");
+        b.Append($"<label posn=\"{Inv(width - 1.5)} -6 0.02\" sizen=\"8 2\" halign=\"right\" textsize=\"1\" scale=\"0.75\" textcolor=\"FC0F\" text=\"AT\"/>");
+
+        var y = -7.6;
+        for (var i = 0; i < shown.Length; i++)
+        {
+            var map = shown[i];
+            var d = eventMapDetails.GetValueOrDefault(map.TrackId);
+            var busy = elsewhere.TryGetValue(map.TrackId, out var label);
+            var here = map.TrackId == currentMapTrackId;
+
+            b.Append($"<quad posn=\"0.8 {Inv(y)} 0.01\" sizen=\"{Inv(width - 1.6)} 2\" style=\"BgsPlayerCard\" substyle=\"{(here ? "BgCardSystem" : "ProgressBar")}\"{(busy || here ? string.Empty : $" action=\"{ActionMapVoteRowBase + i}\"")}/>");
+            b.Append($"<label posn=\"3.6 {Inv(y - 0.35)} 0.02\" sizen=\"3 2\" halign=\"right\" textsize=\"1\" scale=\"0.9\" text=\"{page * MapVoteRowsPerPage + i + 1}.\"/>");
+            b.Append($"<label posn=\"4.5 {Inv(y - 0.35)} 0.02\" sizen=\"{Inv(25 / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(d?.Name ?? $"TMX #{map.TrackId}")}\"/>");
+            b.Append($"<label posn=\"30 {Inv(y - 0.35)} 0.02\" sizen=\"{Inv(14 / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"DDDF\" text=\"{Esc(d?.Author ?? "")}\"/>");
+            var status = here ? "$0F0playing here" : busy ? $"$FC0on {label}" : d is null ? string.Empty : DifficultyColorCode(d.DifficultyLabel) + d.DifficultyLabel;
+            b.Append($"<label posn=\"45 {Inv(y - 0.35)} 0.02\" sizen=\"{Inv(11 / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(status)}\"/>");
+            b.Append($"<label posn=\"{Inv(width - 1.5)} {Inv(y - 0.35)} 0.02\" sizen=\"8 2\" halign=\"right\" textsize=\"1\" scale=\"0.9\" textcolor=\"3F5F\" text=\"{(d is null ? "" : FormatTime(d.AuthorTimeMs))}\"/>");
+            y -= 2.2;
+        }
+
+        y -= 0.4;
+        b.Append($"<quad posn=\"1 {Inv(y)} 0.02\" sizen=\"2.4 2.4\" style=\"Icons64x64_1\" substyle=\"ArrowPrev\" action=\"{ActionMapVotePrev}\"/>");
+        b.Append($"<label posn=\"{Inv(width / 2)} {Inv(y - 0.5)} 0.02\" sizen=\"20 2\" halign=\"center\" textsize=\"1\" textcolor=\"CCCF\" text=\"page {page + 1}/{pages}\"/>");
+        b.Append($"<quad posn=\"{Inv(width - 3.4)} {Inv(y)} 0.02\" sizen=\"2.4 2.4\" style=\"Icons64x64_1\" substyle=\"ArrowNext\" action=\"{ActionMapVoteNext}\"/>");
+        b.Append("</frame></manialink>");
+        return b.ToString();
+    }
+
+    private static void AppendWindowHeader(StringBuilder b, double width, double height, string title, int closeAction)
+    {
+        b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"BgWindow2\"/>");
+        b.Append($"<quad posn=\"0.4 -0.36 0.01\" sizen=\"{Inv(width - 0.8)} 2.6\" style=\"BgsPlayerCard\" substyle=\"BgRacePlayerName\"/>");
+        b.Append("<quad posn=\"0.7 0 0.02\" sizen=\"3 3\" style=\"Icons128x128_1\" substyle=\"Challenge\"/>");
+        b.Append($"<label posn=\"4.2 -0.75 0.02\" sizen=\"{Inv(width - 9)} 2\" textsize=\"2\" text=\"{Esc(title)}\"/>");
+        b.Append($"<quad posn=\"{Inv(width - 3.2)} -0.5 0.03\" sizen=\"2.4 2.4\" style=\"Icons64x64_1\" substyle=\"Close\" action=\"{closeAction}\"/>");
+    }
+
+    private string BuildEventResultsWindow()
+    {
+        var standings = eventMode.Standings();
+        var span = eventMode.FinishSpan();
+        var duration = span is { } s ? s.Last - s.First : TimeSpan.Zero;
+        const double width = 56;
+        var rest = standings.Skip(3).Take(7).ToList();
+        var height = 21 + rest.Count * LineHeight + 2;
+
+        var b = new StringBuilder();
+        b.Append($"<manialink id=\"{EventResultsId}\"><frame posn=\"{Inv(-width / 2)} {Inv(height / 2 + 4)} 25\">");
+        b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"BgWindow2\"/>");
+        b.Append($"<quad posn=\"0.4 -0.36 0.01\" sizen=\"{Inv(width - 0.8)} 3\" style=\"BgsPlayerCard\" substyle=\"BgRacePlayerName\"/>");
+        b.Append("<quad posn=\"0.7 0 0.02\" sizen=\"3.4 3.4\" style=\"Icons128x128_1\" substyle=\"Rankings\"/>");
+        b.Append($"<label posn=\"4.6 -0.8 0.02\" sizen=\"44 2\" textsize=\"3\" text=\"{Esc($"$o{eventMode.Title} finished!")}\"/>");
+        b.Append($"<quad posn=\"{Inv(width - 3.4)} -0.6 0.03\" sizen=\"2.6 2.6\" style=\"Icons64x64_1\" substyle=\"Close\" action=\"{ActionEventResultsClose}\"/>");
+        b.Append($"<label posn=\"{Inv(width / 2)} -4.4 0.02\" sizen=\"50 2\" halign=\"center\" textsize=\"1\" textcolor=\"DDDF\" text=\"{Esc($"{eventMode.AllMaps.Count} maps done in {(int)duration.TotalHours}:{duration.Minutes:00} h - thanks for playing!")}\"/>");
+
+        // podium: 2nd left, 1st middle (raised), 3rd right
+        (int Rank, double X, double Y, string Medal)[] podium = [(1, width / 2, -7, "MedalGold"), (2, width / 2 - 17, -8.5, "MedalSilver"), (3, width / 2 + 17, -9.5, "MedalBronze")];
+        foreach (var (rank, x, y, medal) in podium)
+        {
+            if (standings.Count < rank)
+            {
+                continue;
+            }
+
+            var st = standings[rank - 1];
+            b.Append($"<quad posn=\"{Inv(x - 2.5)} {Inv(y)} 0.02\" sizen=\"5 5\" style=\"MedalsBig\" substyle=\"{medal}\"/>");
+            b.Append($"<label posn=\"{Inv(x)} {Inv(y - 5.6)} 0.02\" sizen=\"16 2\" halign=\"center\" textsize=\"2\" text=\"{Esc(st.Nickname)}\"/>");
+            b.Append($"<label posn=\"{Inv(x)} {Inv(y - 8)} 0.02\" sizen=\"16 2\" halign=\"center\" textsize=\"1\" textcolor=\"FC0F\" text=\"{st.Maps} map{(st.Maps == 1 ? "" : "s")}\"/>");
+        }
+
+        var ry = -20.0;
+        for (var i = 0; i < rest.Count; i++)
+        {
+            b.Append($"<label posn=\"{Inv(width / 2 - 12)} {Inv(ry)} 0.02\" sizen=\"3 2\" halign=\"right\" textsize=\"1\" text=\"{i + 4}.\"/>");
+            b.Append($"<label posn=\"{Inv(width / 2 - 11)} {Inv(ry)} 0.02\" sizen=\"18 2\" textsize=\"1\" text=\"{Esc(rest[i].Nickname)}\"/>");
+            b.Append($"<label posn=\"{Inv(width / 2 + 12)} {Inv(ry)} 0.02\" sizen=\"6 2\" halign=\"right\" textsize=\"1\" textcolor=\"FC0F\" text=\"{rest[i].Maps}\"/>");
+            ry -= LineHeight;
+        }
+
+        b.Append("</frame></manialink>");
+        return b.ToString();
     }
 
     private async Task LoadEventMapDetailsAsync(CancellationToken cancellationToken)
@@ -296,6 +566,7 @@ internal sealed partial class RandomizerGame
     {
         if (eventMode.Enabled)
         {
+            handledEventEnd = eventMode.EndedAt;
             eventMode.Changed += OnEventChanged;
             await LoadEventMapDetailsAsync(cancellationToken);
         }
@@ -304,6 +575,21 @@ internal sealed partial class RandomizerGame
         {
             try
             {
+                if (eventMode.Enabled && eventMode.TmxRefreshDue && eventMode.EndedAt is null)
+                {
+                    try
+                    {
+                        using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                        budget.CancelAfter(TimeSpan.FromSeconds(40));
+                        var (ids, complete) = await tmxRules.ListEventPoolAsync(budget.Token);
+                        await eventMode.MergeTmxPoolAsync([.. ids.Where(id => !tmxRules.IsExcludedFromRotation(id))], complete);
+                    }
+                    catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+                    {
+                        Console.WriteLine($"Warning: couldn't refresh the event list from TMX - {ex.Message}. Keeping the current list.");
+                    }
+                }
+
                 if (eventMode.Enabled)
                 {
                     await eventMode.PublishServerAsync(config.FavoriteLogin, currentMapTrackId, currentMapRawName is null ? null : StripTmCodes(currentMapRawName),
@@ -353,9 +639,16 @@ internal sealed partial class RandomizerGame
                 await SkipAsync(playerUid, login, [], cancellationToken);
                 return;
             case ActionHudMapVoteHint:
-                await SendMessageAsync(login, eventMode.Enabled && eventMode.AllMaps.Count > 0
-                    ? "Click a map in the event list to vote for it, or type $FF0/votemap <TMX id>$FFF."
-                    : "Type $FF0/votemap <TMX id>$FFF in chat to vote for a map (the id is in the map's TMX link).", cancellationToken);
+                await client.SendManialinkPageToLoginAsync(login, BuildMapVoteWindow(login), cancellationToken: cancellationToken);
+                return;
+            case ActionMapVoteClose:
+                await client.SendManialinkPageToLoginAsync(login, $"<manialink id=\"{MapVoteWindowId}\"></manialink>", cancellationToken: cancellationToken);
+                return;
+            case ActionMapVotePrev:
+            case ActionMapVoteNext:
+                mapVotePage.AddOrUpdate(login, _ => answer == ActionMapVoteNext ? 1 : 0,
+                    (_, page) => Math.Max(0, page + (answer == ActionMapVoteNext ? 1 : -1)));
+                await client.SendManialinkPageToLoginAsync(login, BuildMapVoteWindow(login), cancellationToken: cancellationToken);
                 return;
             case ActionHudPresets:
                 await PresetsAsync(playerUid, login, [], cancellationToken);
@@ -392,6 +685,9 @@ internal sealed partial class RandomizerGame
             case ActionHudCollapseEvent:
                 await ToggleCollapsedAsync(login, HudPart.Event, HudSection.Event, cancellationToken);
                 return;
+            case ActionEventResultsClose:
+                await client.SendManialinkPageToLoginAsync(login, $"<manialink id=\"{EventResultsId}\"></manialink>", cancellationToken: cancellationToken);
+                return;
             case ActionEventPagePrev:
             case ActionEventPageNext:
                 eventPage.AddOrUpdate(login, _ => answer == ActionEventPageNext ? 1 : 0,
@@ -413,6 +709,14 @@ internal sealed partial class RandomizerGame
             });
             await SendHudAsync(login, HudSection.All, cancellationToken);
             await client.SendManialinkPageToLoginAsync(login, BuildHudMenu(login), cancellationToken: cancellationToken);
+            return;
+        }
+
+        var voteRow = answer - ActionMapVoteRowBase;
+        if (voteRow >= 0 && voteRow < MapVoteRowsPerPage && mapVoteRowsShown.TryGetValue(login, out var voteIds) && voteRow < voteIds.Length)
+        {
+            await client.SendManialinkPageToLoginAsync(login, $"<manialink id=\"{MapVoteWindowId}\"></manialink>", cancellationToken: cancellationToken);
+            await VoteMapAsync(playerUid, login, [voteIds[voteRow].ToString(CultureInfo.InvariantCulture)], cancellationToken);
             return;
         }
 
@@ -836,7 +1140,10 @@ internal sealed partial class RandomizerGame
         const double width = 23;
         var all = eventMode.AllMaps;
         var open = eventMode.OpenMaps;
-        var title = $"{eventMode.Title} $AAA· {all.Count - open.Count}/{all.Count} done";
+        var winner = eventMode.EndedAt is not null ? eventMode.Standings().FirstOrDefault() : null;
+        var title = winner is not null
+            ? $"{eventMode.Title} $AAA· winner $z{winner.Nickname}"
+            : $"{eventMode.Title} $AAA· {all.Count - open.Count}/{all.Count} done";
 
         var b = new StringBuilder();
         b.Append("<frame posn=\"-63.6 23.5 1\">");

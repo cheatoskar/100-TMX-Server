@@ -25,6 +25,9 @@ internal sealed class PresetConfig
     // when true, ignore TmxQuery and draw from the event list's open maps (EventMode)
     public bool SourceFromEventList { get; set; }
 
+    // "any" (default) or "event": /votemap only takes the event list's open maps
+    public string MapVoteScope { get; set; } = "any";
+
     // an empty Games list means "any game"
     public bool SupportsGame(GameTitle game) =>
         Games.Length == 0 || Games.Any(g => string.Equals(g, game.ToString(), StringComparison.OrdinalIgnoreCase));
@@ -57,5 +60,6 @@ internal sealed class PresetConfig
         config.TmxQuery = TmxQuery;
         config.SourceFromImpossibleList = SourceFromImpossibleList;
         config.SourceFromEventList = SourceFromEventList;
+        config.MapVoteScope = string.IsNullOrWhiteSpace(MapVoteScope) ? "any" : MapVoteScope.Trim().ToLowerInvariant();
     }
 }

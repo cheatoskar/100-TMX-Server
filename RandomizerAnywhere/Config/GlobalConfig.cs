@@ -74,4 +74,14 @@ internal sealed class GlobalConfig
     public string EventStateFile { get; set; } = string.Empty;
     public string EventServerLabel { get; set; } = string.Empty;
     public bool EventUnlimiter { get; set; }
+
+    // "file" (the hand-made EventMapsFile) or "tmx" (every map [EventTmxQuery] finds, refreshed
+    // every EventTmxRefreshMinutes so new uploads join the list)
+    public string EventMapsSource { get; set; } = string.Empty;
+    public string EventTitle { get; set; } = string.Empty;
+    public int EventTmxRefreshMinutes { get; set; }
+    public Dictionary<string, object> EventTmxQuery { get; set; } = [];
+
+    // the preset the servers switch to once every event map is finished; empty = stay
+    public string EventAfterPreset { get; set; } = string.Empty;
 }

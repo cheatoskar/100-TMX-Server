@@ -36,6 +36,15 @@ internal sealed class AppConfig
     public string EventStateFile { get; init; } = string.Empty;
     public string EventServerLabel { get; init; } = string.Empty;
     public bool EventUnlimiter { get; init; }
+    public bool EventMapsFromTmx { get; init; }
+    public string EventTitle { get; init; } = string.Empty;
+    public int EventTmxRefreshMinutes { get; init; } = 5;
+    public IReadOnlyDictionary<string, object> EventTmxQuery { get; init; } = new Dictionary<string, object>();
+    public string EventAfterPreset { get; init; } = string.Empty;
+
+    // who may be voted for with /votemap: "any" TMX map, or only the event list's open maps
+    // ("event"). Set by the preset, so the event preset can restrict it and every other one doesn't.
+    public string MapVoteScope { get; set; } = "any";
     public required bool AutoStart { get; init; }
     public required IReadOnlySet<string> AdminLogins { get; init; }
     public required string PublicHost { get; init; }

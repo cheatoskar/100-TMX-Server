@@ -295,6 +295,13 @@ internal partial class AppServiceProvider
             EventStateFile = Configurator.GetString(globalConfig.EventStateFile, cmdValue: null, "RANDANY_EVENT_STATE_FILE"),
             EventServerLabel = Configurator.GetString(globalConfig.EventServerLabel, cmdValue: null, "RANDANY_EVENT_SERVER_LABEL"),
             EventUnlimiter = Configurator.GetBool(globalConfig.EventUnlimiter, cmdValue: null, "RANDANY_EVENT_UNLIMITER"),
+            EventMapsFromTmx = Configurator.GetString(globalConfig.EventMapsSource, cmdValue: null, "RANDANY_EVENT_MAPS_SOURCE").Trim().Equals("tmx", StringComparison.OrdinalIgnoreCase),
+            EventTitle = Configurator.GetString(globalConfig.EventTitle, cmdValue: null, "RANDANY_EVENT_TITLE"),
+            EventTmxRefreshMinutes = globalConfig.EventTmxRefreshMinutes > 0 ? globalConfig.EventTmxRefreshMinutes : 5,
+            EventTmxQuery = globalConfig.EventTmxQuery.Count > 0
+                ? globalConfig.EventTmxQuery
+                : new Dictionary<string, object> { ["inhasrecord"] = 0, ["inunlimiter"] = 0 },
+            EventAfterPreset = Configurator.GetString(globalConfig.EventAfterPreset, cmdValue: null, "RANDANY_EVENT_AFTER_PRESET"),
         };
 
         if (!string.IsNullOrWhiteSpace(globalConfig.Preset))
