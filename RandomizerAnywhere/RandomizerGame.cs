@@ -289,9 +289,14 @@ internal sealed partial class RandomizerGame
 
     // lap map: PlayerCheckpoint's index counts on across laps (see the checkpoint handler)
     private bool currentMapLapRace;
+    private int currentMapNbLaps;
     // Concurrent: written by checkpoint callbacks, enumerated by the status writer (which does
     // not take the game lock) - a plain Dictionary can throw "collection was modified" there.
     private readonly ConcurrentDictionary<string, int> playerCheckpointProgress = [];
+
+    // the raw checkpoint index of each player's last crossing (counts on across laps) - the HUD
+    // works out lap, checkpoints and the finish/lap line from it
+    private readonly ConcurrentDictionary<string, int> playerCheckpointIndex = [];
     // tie-breaks the live "who's leading" ranking on the status page: same checkpoint count ->
     // whoever reached it first is ahead
     private readonly ConcurrentDictionary<string, DateTimeOffset> playerCheckpointTimestamp = [];
@@ -525,6 +530,7 @@ internal sealed partial class RandomizerGame
                     BronzeTime: (int)mapInfo["BronzeTime"]
                 );
                 playerCheckpointProgress.Clear();
+                playerCheckpointIndex.Clear();
                 playerCheckpointTimestamp.Clear();
                 currentMapCheckpointTotal = null;
                 currentMapStartedAt = DateTimeOffset.UtcNow;
@@ -573,6 +579,7 @@ internal sealed partial class RandomizerGame
                 lastRunningTrackId = currentMapTrackId;
                 currentMapRawName = info.Name;
                 currentMapLapRace = info.LapRace;
+                currentMapNbLaps = info.NbLaps;
 
                 if (mapChanged)
                 {
@@ -619,7 +626,8 @@ internal sealed partial class RandomizerGame
                 // the whole HUD for everyone: new map panel, CP counter at 0, times reset
                 await BroadcastHudAsync(HudSection.All, cancellationToken);
 
-                if (info.LapRace)
+                // on HUD servers the map panel carries the Rounds button instead
+                if (info.LapRace && !HudAvailable)
                 {
                     await client.SendManialinkPageAsync(BuildRoundsPromptManialink(info.NbLaps), cancellationToken: cancellationToken);
                 }
@@ -656,6 +664,7 @@ internal sealed partial class RandomizerGame
                 randomEnqueuedMapFileName = null;
                 currentMapCheckpointTotal = null;
                 playerCheckpointProgress.Clear();
+                playerCheckpointIndex.Clear();
                 playerCheckpointTimestamp.Clear();
                 // not hiding the manialink here: SendHideManialinkPage has no per-widget id to target
                 // without also nuking the always-on top10 panel, and BeginRace overwrites the CP
@@ -688,6 +697,7 @@ internal sealed partial class RandomizerGame
                 var inLap = currentMapLapRace ? checkpointIndex % (total + 1) : checkpointIndex;
                 var current = Math.Min(inLap + 1, total);
                 playerCheckpointProgress[login] = current;
+                playerCheckpointIndex[login] = checkpointIndex;
                 playerCheckpointTimestamp[login] = DateTimeOffset.UtcNow;
 
                 await SendHudAsync(login, HudSection.Cp, cancellationToken);
@@ -3891,10 +3901,11 @@ internal sealed partial class RandomizerGame
         var info = await EnsureCurrentMapStateAsync(cancellationToken);
         currentMapRawName ??= info.Name;
         currentMapLapRace = info.LapRace;
+        currentMapNbLaps = info.NbLaps;
 
         await SendHudAsync(login, HudSection.All, cancellationToken);
 
-        if (info.LapRace)
+        if (info.LapRace && !HudAvailable)
         {
             await client.SendManialinkPageToLoginAsync(login, BuildRoundsPromptManialink(info.NbLaps), cancellationToken: cancellationToken);
         }

@@ -191,6 +191,12 @@ internal sealed partial class RandomizerGame
     {
         if (time <= 0)
         {
+            // a restart or give-up: the counter starts over at 0
+            if (playerCheckpointIndex.TryRemove(login, out _))
+            {
+                await SendHudAsync(login, HudSection.Cp, cancellationToken);
+            }
+
             return;
         }
 
@@ -1035,6 +1041,34 @@ internal sealed partial class RandomizerGame
         }
     }
 
+    // German time for the clock tile - the community plays from there. Manialinks can't run a
+    // clock themselves, so the tile shows the time of the last HUD refresh (every 15 seconds).
+    private static readonly TimeZoneInfo? ClockZone = FindClockZone();
+
+    private static TimeZoneInfo? FindClockZone()
+    {
+        try
+        {
+            return TimeZoneInfo.FindSystemTimeZoneById("Europe/Berlin");
+        }
+        catch (Exception ex) when (ex is TimeZoneNotFoundException or InvalidTimeZoneException)
+        {
+            return null;
+        }
+    }
+
+    private static (string Time, string Zone) ClockNow()
+    {
+        var utc = DateTimeOffset.UtcNow;
+        if (ClockZone is null)
+        {
+            return (utc.ToString("HH:mm", CultureInfo.InvariantCulture), "UTC");
+        }
+
+        var local = TimeZoneInfo.ConvertTime(utc, ClockZone);
+        return (local.ToString("HH:mm", CultureInfo.InvariantCulture), ClockZone.IsDaylightSavingTime(local) ? "CEST" : "CET");
+    }
+
     private string AssetBaseUrl => $"http://{(string.IsNullOrWhiteSpace(config.PublicHost) ? "localhost" : config.PublicHost)}:{config.ReplayServerPort}";
 
     private string ShortPresetName()
@@ -1148,7 +1182,8 @@ internal sealed partial class RandomizerGame
                     .. details.Tags.Take(1).Select(t => Fit(t, 8, CharWidth1 * 0.9)),
                 ], inner, CharWidth1 * 0.9);
 
-        var height = 2.9 + 2.7 + infoLines.Count * 1.9 + 1.9 + 2.7;
+        var lapRace = currentMapLapRace;
+        var height = 2.9 + 2.7 + infoLines.Count * 1.9 + 1.9 + (lapRace ? 2.5 : 0) + 2.7;
         AppendWidgetFrame(b, width, height, "Icons128x128_1", "NewTrack", title, ActionHudCollapseMap, collapsed: false);
 
         var y = -3.0;
@@ -1168,6 +1203,25 @@ internal sealed partial class RandomizerGame
         b.Append($"<quad posn=\"0.6 {Inv(y + 0.25)} 0.02\" sizen=\"2.1 2.1\" style=\"MedalsBig\" substyle=\"MedalNadeo\"/>");
         b.Append($"<label posn=\"2.9 {Inv(y)} 0.02\" sizen=\"{Inv((inner - 2.1) / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(timesLine)}\"/>");
         y -= 2.0;
+
+        // Multilap: TimeAttack replays of lap maps aren't valid on TMX, Rounds mode makes them so.
+        // The button runs /rounds (restarts the map in Rounds mode, back to TimeAttack next map).
+        if (lapRace)
+        {
+            var lapsText = currentMapNbLaps > 0 ? $"{currentMapNbLaps} laps" : "laps";
+            b.Append($"<label posn=\"0.8 {Inv(y - 0.2)} 0.02\" sizen=\"{Inv(10 / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc($"$F80Multilap $FFF· {lapsText}")}\"/>");
+            if (roundsModeActive)
+            {
+                b.Append($"<label posn=\"{Inv(width - 0.8)} {Inv(y - 0.2)} 0.02\" sizen=\"{Inv(9 / 0.9)} 2\" halign=\"right\" textsize=\"1\" scale=\"0.9\" text=\"$3F5Rounds mode on\"/>");
+            }
+            else
+            {
+                b.Append($"<quad posn=\"{Inv(width - 0.8 - 8.6)} {Inv(y)} 0.02\" sizen=\"8.6 2.2\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\" action=\"{ActionRoundsAccept}\"/>");
+                b.Append($"<label posn=\"{Inv(width - 0.8 - 4.3)} {Inv(y - 1.1)} 0.03\" sizen=\"8.6 2\" halign=\"center\" valign=\"center\" textsize=\"1\" scale=\"0.85\" text=\"$F80Rounds mode\"/>");
+            }
+
+            y -= 2.5;
+        }
 
         // buttons: TMX logo, Skip vote, Map vote - the panel is exactly as wide as they need
         var x = 0.8;
@@ -1211,6 +1265,7 @@ internal sealed partial class RandomizerGame
             (tile, (b, w) => TileText(b, w, cachedMaxPlayers is { } max ? $"{players}/{max}" : players.ToString(CultureInfo.InvariantCulture), "PLAYERS"), null),
             (tile, (b, w) => TileText(b, w, openEventMaps is { } open ? open.ToString(CultureInfo.InvariantCulture) : mapsStartedCount.ToString(CultureInfo.InvariantCulture), openEventMaps is null ? "MAPS" : "OPEN"), null),
             (tile, (b, w) => TileText(b, w, session is { } s ? $"{(int)s.TotalHours}:{s.Minutes:00}" : "--", "SESSION"), null),
+            (tile, (b, w) => TileText(b, w, ClockNow().Time, ClockNow().Zone), null),
             (wideTile, (b, w) => TileText(b, w, ShortPresetName(), config.PresetLocked ? "PRESET · LOCKED" : "PRESET · VOTE"), config.PresetLocked ? null : $"action=\"{ActionHudPresets}\""),
             (tile, (b, w) => TileIcon(b, w, "style=\"Icons128x128_1\" substyle=\"LoadTrack\"", "HISTORY"), $"action=\"{ActionHudHistory}\""),
             (tile, (b, w) => TileIcon(b, w, $"image=\"{assetBaseUrl}/discord.png\"", "DISCORD"), $"url=\"{DiscordInviteUrlNoScheme}\""),
@@ -1440,8 +1495,11 @@ internal sealed partial class RandomizerGame
         return b.ToString();
     }
 
-    // The checkpoint counter as in the sketches: one small pill "CP 3/7 -0.42" with up to ten
-    // progress bars under it. Left of the race clock by default, or centred above it (HUD menu).
+    // The checkpoint counter: "CP 3/6" (and "Lap 2/3" on a multilap map) with a bar under it. Up
+    // to ten blue segments for the checkpoints (more checkpoints share a segment evenly: 20 CPs = 2
+    // each, 12 CPs = 1 or 2) and one more for the finish or lap line, red until it is crossed,
+    // green after. On a multilap map the bar starts over with every lap. Left of the race clock
+    // by default, or centred above it (HUD menu).
     private string BuildCheckpointCounter(string login)
     {
         if (currentMapCheckpointTotal is not { } total || total <= 0)
@@ -1449,43 +1507,67 @@ internal sealed partial class RandomizerGame
             return string.Empty;
         }
 
-        int current;
+        int? index;
         int? split = null;
         lock (hudGate)
         {
-            current = playerCheckpointProgress.GetValueOrDefault(login, 0);
-            if (current > 0 && runCheckpoints.TryGetValue(login, out var run) && run.Count > 0)
+            index = playerCheckpointIndex.TryGetValue(login, out var i) ? i : null;
+            if (index is not null && runCheckpoints.TryGetValue(login, out var run) && run.Count > 0)
             {
                 split = CheckpointSplit(login, run.Count - 1);
             }
         }
 
-        current = Math.Min(current, total);
-        var splitText = split is { } s ? (s <= 0 ? $"  $3F5-{FormatSplit(-s)}" : $"  $F33+{FormatSplit(s)}") : string.Empty;
-        var text = $"$FC0CP $FFF{current}$AAA/{total}{splitText}";
+        var lapRace = currentMapLapRace;
+        var laps = Math.Max(currentMapNbLaps, 1);
 
-        const double width = 9;
+        // TMF counts the finish as a checkpoint on a normal map (NbCheckpoints includes it); on a
+        // lap map NbCheckpoints are the checkpoints of one lap and the lap line comes on top.
+        var checkpoints = lapRace ? total : Math.Max(total - 1, 0);
+        var crossingsPerLap = checkpoints + 1;
+
+        var lap = 1;
+        var passed = 0;
+        var lineCrossed = false;
+        if (index is { } idx)
+        {
+            lap = Math.Min(idx / crossingsPerLap + 1, laps);
+            var inLap = idx >= crossingsPerLap * laps ? crossingsPerLap - 1 : idx % crossingsPerLap;
+            passed = Math.Min(inLap + 1, checkpoints);
+            lineCrossed = inLap == checkpoints;
+        }
+
+        var splitText = split is { } s ? (s <= 0 ? $"  $3F5-{FormatSplit(-s)}" : $"  $F33+{FormatSplit(s)}") : string.Empty;
+        var cpText = checkpoints == 0 ? "$FC0No CPs" : $"$FC0CP $FFF{passed}$AAA/{checkpoints}";
+        var text = (lapRace && laps > 1 ? $"$FC0Lap $FFF{lap}$AAA/{laps}  " : string.Empty) + cpText + splitText;
+
+        var width = lapRace && laps > 1 ? 13.0 : 9.0;
         const double height = 3.4;
         var aboveClock = hudSettings.Get(login).CpAboveClock;
+
         // Lower than this above the clock and the game's own timer panel covers the counter
         // (seen at -39.2; -37.4 was visible).
-        var (x, y) = aboveClock ? (-width / 2, -37.8) : (-21.5, -44.6);
+        var (x, y) = aboveClock ? (-width / 2, -37.8) : (-12.5 - width, -44.6);
 
         var b = new StringBuilder($"<frame posn=\"{Inv(x)} {Inv(y)} 1\">");
         AppendBox(b, width, height);
         b.Append($"<label posn=\"{Inv(width / 2)} -1.25 0.01\" sizen=\"{Inv((width - 0.6) / 0.9)} 2\" halign=\"center\" valign=\"center\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(text)}\"/>");
 
-        // At most 10 bars; with more checkpoints each bar stands for an even share of them
-        // (20 CPs: 2 each; 12 CPs: 1 or 2) and lights up once all of its share is passed.
-        var bars = Math.Min(total, 10);
         const double gap = 0.15;
-        var barWidth = (width - 1.4 - gap * (bars - 1)) / bars;
+        const double lineGap = 0.45;
+        const double lineWidth = 0.9;
+        var bars = Math.Min(checkpoints, 10);
+        var barsWidth = width - 1.4 - (bars > 0 ? lineGap : 0) - lineWidth;
+        var barWidth = bars > 0 ? (barsWidth - gap * (bars - 1)) / bars : 0;
         for (var i = 0; i < bars; i++)
         {
-            var threshold = (int)Math.Round((i + 1) * (double)total / bars, MidpointRounding.AwayFromZero);
-            var lit = current >= threshold;
-            b.Append($"<quad posn=\"{Inv(0.7 + i * (barWidth + gap))} -2.35 0.01\" sizen=\"{Inv(barWidth)} 0.45\" bgcolor=\"{(lit ? "FC0F" : "FFF5")}\"/>");
+            var threshold = (int)Math.Round((i + 1) * (double)checkpoints / bars, MidpointRounding.AwayFromZero);
+            var lit = passed >= threshold;
+            b.Append($"<quad posn=\"{Inv(0.7 + i * (barWidth + gap))} -2.35 0.01\" sizen=\"{Inv(barWidth)} 0.45\" bgcolor=\"{(lit ? "39FF" : "FFF5")}\"/>");
         }
+
+        // finish / lap line
+        b.Append($"<quad posn=\"{Inv(width - 0.7 - lineWidth)} -2.35 0.01\" sizen=\"{Inv(lineWidth)} 0.45\" bgcolor=\"{(lineCrossed ? "3F5F" : "F33F")}\"/>");
 
         b.Append("</frame>");
         return b.ToString();
