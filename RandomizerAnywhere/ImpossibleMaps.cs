@@ -82,7 +82,7 @@ internal sealed class ImpossibleMaps
         try
         {
             var csv = await FetchFollowingRedirectsAsync(SheetCsvUrl, cancellationToken);
-            var addedFromSheet = 0;
+            var sheetIds = new HashSet<int>();
 
             using var reader = new StringReader(csv);
             for (var rowIndex = 1; reader.ReadLine() is { } line; rowIndex++)
@@ -99,16 +99,30 @@ internal sealed class ImpossibleMaps
                     continue;
                 }
 
-                lock (gate)
-                {
-                    if (excludedTrackIds.Add(trackId))
-                    {
-                        addedFromSheet++;
-                    }
-                }
+                sheetIds.Add(trackId);
             }
 
-            Console.WriteLine($"Impossible maps: loaded {addedFromSheet} new track id(s) from the sheet.");
+            // The sheet is the reviewed list, so the local copy follows it both ways. It used to
+            // only ever add: 18 maps taken off the sheet after review (8969700 among them) were
+            // still kept out on 2026-11-14. An empty result is a broken export, not an empty
+            // list - then the local copy stays as it is.
+            if (sheetIds.Count == 0)
+            {
+                Console.WriteLine("Warning: the impossible-maps sheet had no track ids - keeping the local list.");
+            }
+            else
+            {
+                int added, removed;
+                lock (gate)
+                {
+                    added = sheetIds.Count(id => !excludedTrackIds.Contains(id));
+                    removed = excludedTrackIds.Count(id => !sheetIds.Contains(id));
+                    excludedTrackIds.Clear();
+                    excludedTrackIds.UnionWith(sheetIds);
+                }
+
+                Console.WriteLine($"Impossible maps: {sheetIds.Count} on the sheet ({added} new, {removed} taken off the sheet and allowed again).");
+            }
         }
         catch (Exception ex)
         {

@@ -11,7 +11,7 @@ Licensed under [AGPLv3](LICENSE). Source of this fork: https://github.com/cheato
 For players:
 - Server-side leaderboard (`/top`, `/rank`)
 - After every finish a replay download link that TMX accepts (TMX only takes server-saved replays)
-- `/imp` and `/hard` reports with Discord webhook alerts, and a list of impossible maps that is refreshed periodically from a shared sheet
+- `/imp` and `/hard` reports with Discord webhook alerts, and a list of impossible maps that follows a shared, reviewed sheet (refreshed daily; maps taken off the sheet come back)
 - `/map` and `/history` (also `-1` ... `-10` for past maps), `/afk`, `/rounds` for multilap maps
 - Genre presets, switchable by an admin or by player vote (`/preset`, `/votepreset`); `/loadmap` and `/votemap` for a specific TMX map
 - Clickable widgets (preset picker, vote popup, map info, history, top finishers) and a live status web page
@@ -42,7 +42,7 @@ Chat commands (case does not matter). "Admin" means: restricted to `AdminLogins`
 | `/start` | Starts a new randomizer session and queues the first random map (admin). |
 | `/stop`, `/end` | Stops the active session and resets the current map (admin). |
 | `/skip` | Skips the current map for a new random one. |
-| `/imp` | Marks the current map as impossible so it won't appear again, and reports it to Discord for review. `/imp -1`, `/imp -2`, ... reports a past map instead (see `/history`). One report per player per minute; a map already reported during this run is not posted to Discord again. |
+| `/imp` | Skips the current map and reports it to Discord for review. It does not keep the map out: that happens only once the review puts it on the shared impossible-maps sheet. `/imp -1`, `/imp -2`, ... reports a past map instead (see `/history`). One report per player per minute; a map already reported during this run is not posted to Discord again. |
 | `/hard` | Flags the current map as hard for review, without excluding it. Reports to Discord. `/hard -1`, ... flags a past map. Same cooldown as `/imp`. |
 | `/rounds` | Switches the current map to Rounds mode if it is a genuine multilap map, so a full finish produces a TMX-valid replay. Reverts to TimeAttack when the map ends. Once per map, and not while the next map is already loading. |
 | `/top` | Shows the top finishers on this server. |
