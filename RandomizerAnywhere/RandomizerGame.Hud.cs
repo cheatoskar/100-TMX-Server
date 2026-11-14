@@ -518,7 +518,7 @@ internal sealed partial class RandomizerGame
 
     private static void AppendWindowHeader(StringBuilder b, double width, double height, string title, int closeAction, string iconStyle = "Icons128x128_1", string iconSubstyle = "Challenge")
     {
-        AppendShade(b, width, height, "0005");
+        AppendShade(b, width, height, 6);
         b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\"/>");
         b.Append($"<quad posn=\"0.4 -0.36 0.01\" sizen=\"{Inv(width - 0.8)} 2.6\" style=\"BgsPlayerCard\" substyle=\"BgRacePlayerName\"/>");
         b.Append($"<quad posn=\"0.7 0 0.02\" sizen=\"3 3\" style=\"{iconStyle}\" substyle=\"{iconSubstyle}\"/>");
@@ -537,7 +537,7 @@ internal sealed partial class RandomizerGame
 
         var b = new StringBuilder();
         b.Append($"<manialink id=\"{EventResultsId}\"><frame posn=\"{Inv(-width / 2)} {Inv(height / 2 + 4)} 25\">");
-        AppendShade(b, width, height, "0005");
+        AppendShade(b, width, height, 6);
         b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\"/>");
         b.Append($"<quad posn=\"0.4 -0.36 0.01\" sizen=\"{Inv(width - 0.8)} 3\" style=\"BgsPlayerCard\" substyle=\"BgRacePlayerName\"/>");
         b.Append("<quad posn=\"0.7 0 0.02\" sizen=\"3.4 3.4\" style=\"Icons128x128_1\" substyle=\"Rankings\"/>");
@@ -1019,13 +1019,28 @@ internal sealed partial class RandomizerGame
     // A dark layer under a NavButton box. A plain rectangle showed its square corners outside the
     // box's rounded ones, and a second NavButton on top added no darkness at all - so the layer is
     // three rectangles with the corners cut off, which stay inside the rounding.
-    private static void AppendShade(StringBuilder b, double width, double height, string color)
+    // Several very light layers, each starting a little further in, so the darkness fades in
+    // from the rounded edge instead of stopping at a hard line or showing cut corners. One hard
+    // rectangle showed square corners, one with the corners cut off showed steps. Each layer is
+    // 1/15 black: 6 layers make the middle about as dark as one 0005 quad, 3 about 0003.
+    private static void AppendShade(StringBuilder b, double width, double height, int layers)
     {
-        const double edge = 0.25;
-        const double cut = 0.7;
-        b.Append($"<quad posn=\"{Inv(edge)} {Inv(-cut)} -0.01\" sizen=\"{Inv(width - 2 * edge)} {Inv(height - 2 * cut)}\" bgcolor=\"{color}\"/>");
-        b.Append($"<quad posn=\"{Inv(cut)} {Inv(-edge)} -0.01\" sizen=\"{Inv(width - 2 * cut)} {Inv(cut - edge)}\" bgcolor=\"{color}\"/>");
-        b.Append($"<quad posn=\"{Inv(cut)} {Inv(-(height - cut))} -0.01\" sizen=\"{Inv(width - 2 * cut)} {Inv(cut - edge)}\" bgcolor=\"{color}\"/>");
+        var smaller = Math.Min(width, height);
+        const double firstEdge = 0.3;
+        var step = Math.Min(0.18, Math.Max(0.04, (smaller * 0.3 - firstEdge) / layers));
+        for (var k = 0; k < layers; k++)
+        {
+            var edge = firstEdge + k * step;
+            var cut = edge + 0.45;
+            if (height - 2 * cut <= 0 || width - 2 * cut <= 0)
+            {
+                break;
+            }
+
+            b.Append($"<quad posn=\"{Inv(edge)} {Inv(-cut)} -0.01\" sizen=\"{Inv(width - 2 * edge)} {Inv(height - 2 * cut)}\" bgcolor=\"0001\"/>");
+            b.Append($"<quad posn=\"{Inv(cut)} {Inv(-edge)} -0.01\" sizen=\"{Inv(width - 2 * cut)} {Inv(cut - edge)}\" bgcolor=\"0001\"/>");
+            b.Append($"<quad posn=\"{Inv(cut)} {Inv(-(height - cut))} -0.01\" sizen=\"{Inv(width - 2 * cut)} {Inv(cut - edge)}\" bgcolor=\"0001\"/>");
+        }
     }
 
     private static void AppendWidgetFrame(StringBuilder b, double width, double height, string iconStyle, string iconSubstyle, string title, int? collapseAction, bool collapsed)
@@ -1099,7 +1114,7 @@ internal sealed partial class RandomizerGame
     // NavButton alone lets a bright track shine through; a light dark quad just inside its rounded
     // edge makes the text readable without turning the boxes black. Tiles get less of it, so
     // they match the game's own boxes (the "previous / best" panel top right).
-    private static void AppendBox(StringBuilder b, double width, double height, string? attributes = null, string shade = "0005")
+    private static void AppendBox(StringBuilder b, double width, double height, string? attributes = null, int shade = 6)
     {
         AppendShade(b, width, height, shade);
 
@@ -1281,7 +1296,7 @@ internal sealed partial class RandomizerGame
         foreach (var (w, draw, attributes) in tiles)
         {
             sb.Append($"<frame posn=\"{Inv(x)} 0 0\">");
-            AppendBox(sb, w, height, attributes, shade: "0003");
+            AppendBox(sb, w, height, attributes, shade: 3);
             draw(sb, w);
             sb.Append("</frame>");
             x += w + gap;
