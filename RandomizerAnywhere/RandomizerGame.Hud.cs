@@ -1504,7 +1504,8 @@ internal sealed partial class RandomizerGame
     // by default, or centred above it (HUD menu).
     private string BuildCheckpointCounter(string login)
     {
-        if (currentMapCheckpointTotal is not { } total || total <= 0)
+        // a map with no checkpoints at all still gets the counter: "No CPs" and the finish segment
+        if (currentMapCheckpointTotal is not { } total || total < 0)
         {
             return string.Empty;
         }
@@ -1523,9 +1524,10 @@ internal sealed partial class RandomizerGame
         var lapRace = currentMapLapRace;
         var laps = Math.Max(currentMapNbLaps, 1);
 
-        // TMF counts the finish as a checkpoint on a normal map (NbCheckpoints includes it); on a
-        // lap map NbCheckpoints are the checkpoints of one lap and the lap line comes on top.
-        var checkpoints = lapRace ? total : Math.Max(total - 1, 0);
+        // currentMapCheckpointTotal is already without the finish (RemoteClient.ToChallengeSummary
+        // takes it off TMF's NbCheckpoints once, for everybody). Taking it off here again showed
+        // "CP x/1" on a map with 2 checkpoints (seen live 2026-11-14 on 8177322).
+        var checkpoints = total;
         var crossingsPerLap = checkpoints + 1;
 
         var lap = 1;

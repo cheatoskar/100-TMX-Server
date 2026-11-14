@@ -685,7 +685,7 @@ internal sealed partial class RandomizerGame
                 var time = (int)methodParams[2];
                 var checkpointIndex = (int)methodParams[4];
 
-                if (currentMapCheckpointTotal is not { } total || total <= 0)
+                if (currentMapCheckpointTotal is not { } total || total < 0)
                 {
                     return;
                 }
