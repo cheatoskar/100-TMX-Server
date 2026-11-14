@@ -565,8 +565,26 @@ internal sealed partial class RandomizerGame
                     stalledWatchStartedAt = DateTimeOffset.UtcNow;
                     playerConnectsOnCurrentMap = 0;
 
-                    // /rounds only ever applies to the map it was used on
+                    // /rounds only ever applies to the map it was used on. When the SERVER moved on by
+                    // itself (Rounds ends a map at its points limit), the controller's switch never
+                    // ran, so the new map started in Rounds too - and with the next map already
+                    // queued, nothing set TimeAttack again: on 2026-11-14 ESWC stayed in Rounds for
+                    // every following map until an admin stepped in.
+                    var wasRounds = roundsModeActive;
                     roundsModeActive = false;
+                    try
+                    {
+                        if (wasRounds || await client.TracedCallAsync<int>("GetGameMode", [], cancellationToken) != 1)
+                        {
+                            Console.WriteLine("Map started in Rounds mode without /rounds - back to TimeAttack (restarting the map).");
+                            await CallWithTransitionRetryAsync("SetGameMode", [1], cancellationToken);
+                            await CallWithTransitionRetryAsync("ChallengeRestart", [], cancellationToken);
+                        }
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        Console.WriteLine($"Warning: could not put the server back to TimeAttack - {ex.Message}");
+                    }
 
                     currentMapIsForced = currentMapTrackId is { } startedId && startedId == forcedMapQueuedTrackId;
                     currentForcedMapHasNoRecord = currentMapIsForced && forcedMapQueuedHasNoRecord;
@@ -3647,10 +3665,10 @@ internal sealed partial class RandomizerGame
                 randomEnqueuedMapFileName = mapPath;
                 pendingMapTrackId = nextMap.TrackId;
             }
-            else if (roundsModeActive)
+            else
             {
-                // /rounds was used and the next map was already queued, so the SetGameMode(1)
-                // above never ran - without this the next map would start in Rounds mode too
+                // the next map was already queued, so the SetGameMode(1) above never ran - set it
+                // anyway (cheap), or after a /rounds the next map would start in Rounds mode too
                 await CallWithTransitionRetryAsync("SetGameMode", [1], token);
                 roundsModeActive = false;
             }
