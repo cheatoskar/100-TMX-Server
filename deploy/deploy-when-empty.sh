@@ -63,6 +63,8 @@ INSTANCES=(
   "tmnf|/opt/randomizer-anywhere/publish|100tmx|8090"
   "tmuf|/opt/randomizer-anywhere-tmuf/publish|100tmx-tmuf|8091"
   "eswc|/opt/randomizer-anywhere-eswc/publish|100tmx-eswc|8092"
+  # second VM (DEPLOY_HOST=ubuntu@152.70.183.80), set up with setup-game-host.sh
+  "tmnf2|/opt/tmx-tmnf2/publish|100tmx-tmnf2|8090"
 )
 
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 $HOST"
