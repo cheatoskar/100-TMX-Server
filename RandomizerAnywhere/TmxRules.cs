@@ -704,6 +704,23 @@ internal sealed class TmxRules
         return await ListPoolAsync(query, cancellationToken);
     }
 
+    // The Unlimiter maps among the event query's: the same query, Unlimiter only. Null when the
+    // query already leaves them out (inunlimiter = 0) - then there are none to mark.
+    public async Task<HashSet<int>?> ListEventUnlimiterIdsAsync(CancellationToken cancellationToken)
+    {
+        if (config.EventTmxQuery.TryGetValue("inunlimiter", out var value) && Convert.ToString(value, CultureInfo.InvariantCulture) == "0")
+        {
+            return null;
+        }
+
+        var query = string.Join('&', config.EventTmxQuery
+            .Where(kv => !string.IsNullOrWhiteSpace(kv.Key) && !kv.Key.Equals("inunlimiter", StringComparison.OrdinalIgnoreCase))
+            .Select(kv => $"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(Convert.ToString(kv.Value, CultureInfo.InvariantCulture) ?? string.Empty)}")
+            .Append("inunlimiter=1"));
+        var (ids, _) = await ListPoolAsync(query, cancellationToken);
+        return [.. ids];
+    }
+
     // Every map the query matches (up to MaxPoolPages pages); Complete=false when there are more.
     private async Task<(int[] Ids, bool Complete)> ListPoolAsync(string query, CancellationToken cancellationToken)
     {
@@ -744,8 +761,12 @@ internal sealed class TmxRules
     private sealed record TmxApiTrackIdPage(bool More, List<TmxApiTrackIdResult>? Results);
     private sealed record TmxApiTrackIdResult(int TrackId);
 
+    // with the open-maps list on: not the map another server of the list is playing right now, and
+    // in everyday mode not one already finished that only waits for its replay on TMX
     private bool IsEligibleForPool(int trackId) =>
-        !impossibleMaps.Contains(trackId) && !IsSessionExcluded(trackId) && !skippedMaps.Contains(trackId);
+        !impossibleMaps.Contains(trackId) && !IsSessionExcluded(trackId) && !skippedMaps.Contains(trackId)
+        && !(eventMode.Enabled && eventMode.MapsRunningElsewhere().Contains(trackId))
+        && !(eventMode.Enabled && eventMode.Everyday && eventMode.GetFinish(trackId) is not null);
 
     private async Task<(HttpResponseMessage Response, int TrackId)> NextMapGbxResponseAsync(CancellationToken cancellationToken)
     {

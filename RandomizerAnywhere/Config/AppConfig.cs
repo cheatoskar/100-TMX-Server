@@ -42,6 +42,15 @@ internal sealed class AppConfig
     public IReadOnlyDictionary<string, object> EventTmxQuery { get; init; } = new Dictionary<string, object>();
     public string EventAfterPreset { get; init; } = string.Empty;
 
+    // "skip", "only" or "include" (see GlobalConfig.EventUnlimiterMaps)
+    public string EventUnlimiterMaps { get; init; } = "skip";
+    public bool EventEveryday { get; init; }
+
+    // see GlobalConfig.SyncHubUrl: set = this server uses the hub's event list and leaderboard
+    public string SyncHubUrl { get; init; } = string.Empty;
+    public string SyncToken { get; init; } = string.Empty;
+    public string SyncAllowedIps { get; init; } = string.Empty;
+
     // who may be voted for with /votemap: "any" TMX map, or only the event list's open maps
     // ("event"). Set by the preset, so the event preset can restrict it and every other one doesn't.
     public string MapVoteScope { get; set; } = "any";

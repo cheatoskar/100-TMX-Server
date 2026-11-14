@@ -63,6 +63,25 @@ EventTmxRefreshMinutes = 5
 # Once every map on the list is finished, every server shows the results (winner = most maps
 # finished first) and switches to this preset, e.g. "100tmx_tmnf". Empty = stay on the event.
 EventAfterPreset = ""
+# Which of the list's maps this server plays: "skip" the Unlimiter maps, "only" those, or
+# "include" both. Empty = "only" with EventUnlimiter = true, else "skip". With EventMapsSource =
+# "tmx" the Unlimiter maps are found on TMX (leave inunlimiter out of [EventTmxQuery] to list them).
+EventUnlimiterMaps = ""
+# The list as an everyday "open maps" panel instead of an event: it never ends, every server keeps
+# its own preset and pool (but never draws a map another server of the list is playing), a click
+# on a map starts a vote, and a map finished but still without a TMX record a day later (nobody
+# uploaded the replay) is open again. Use a fresh EventStateFile for it, not an old event's.
+EventEveryday = false
+
+# Servers on different machines share one leaderboard and the list through one of them, the hub,
+# over its status page port (/sync/). On the hub: SyncToken (24+ random characters) and
+# SyncAllowedIps (the other servers' addresses; empty = any address with the token). On every
+# other server: SyncHubUrl (e.g. "http://game.100tmx.com:8090") and the same SyncToken - its own
+# leaderboard.json then moves to the hub once (renamed *.moved-to-hub), and finishes the hub
+# doesn't take right away wait in leaderboard-pending.json.
+SyncHubUrl = ""
+SyncToken = ""
+SyncAllowedIps = ""
 
 WelcomeMessage = '''
 Built on $FF0Randomizer Anywhere$FF0 (modified) - type $FF0/source$FF0 for the code.

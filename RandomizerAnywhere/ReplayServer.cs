@@ -15,6 +15,9 @@ internal sealed class ReplayServer
 
     private WebApplication? app;
 
+    // more routes on the same port (the sync hub, see SyncHub)
+    public Action<WebApplication>? ExtraRoutes { get; init; }
+
     // <login>_<yyyyMMdd-HHmmss>_<16 hex>.Replay.Gbx, nothing else (no sub-folders)
     private static readonly System.Text.RegularExpressions.Regex SecureReplayName =
         new(@"^[^/\\]+_[0-9a-f]{16}\.Replay\.Gbx$", System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
@@ -54,6 +57,7 @@ internal sealed class ReplayServer
         app = builder.Build();
 
         app.MapGet("/", () => Results.Content(indexHtml, "text/html"));
+        ExtraRoutes?.Invoke(app);
 
         // the HUD boxes' rounded dark layer, rendered per box size (see ShadeImage)
         app.MapGet("/shade/{file}", (string file, HttpContext context) =>

@@ -208,7 +208,9 @@ internal sealed partial class RandomizerGame
             {
                 var name = eventMapDetails.TryGetValue(trackId, out var d) ? d.Name : $"#{trackId}";
                 var left = eventMode.OpenMaps.Count;
-                await SendMessageAsync($"$FC0» Event: {GetNicknameOrLogin(login)}$z$FC0 finished {name} first ({FormatTime(time)}) - {left} map(s) left.", cancellationToken);
+                await SendMessageAsync(eventMode.Everyday
+                    ? $"$FC0» {GetNicknameOrLogin(login)}$z$FC0 finished {name} ({FormatTime(time)}) - upload the replay to TMX! {left} open map(s) left."
+                    : $"$FC0» Event: {GetNicknameOrLogin(login)}$z$FC0 finished {name} first ({FormatTime(time)}) - {left} map(s) left.", cancellationToken);
 
                 if (left == 0)
                 {
@@ -344,6 +346,15 @@ internal sealed partial class RandomizerGame
         if (eventMode.OtherServers().FirstOrDefault(s => s.TrackId == trackId) is { } other)
         {
             await SendMessageAsync(login, $"$F00That map is running on {other.Label} right now - join it there (event list, OTHER SERVERS).", cancellationToken);
+            return false;
+        }
+
+        // an Unlimiter map on a server whose players may not have the mod (or the other way round)
+        if (eventMode.AllMaps.FirstOrDefault(m => m.TrackId == trackId) is { } listed && !eventMode.PlaysHere(listed))
+        {
+            await SendMessageAsync(login, listed.Unlimiter
+                ? "$F00That is an Unlimiter map - it runs on the Unlimiter server (list, OTHER SERVERS), not here."
+                : "$F00This server plays only Unlimiter maps from the list.", cancellationToken);
             return false;
         }
 
@@ -676,7 +687,8 @@ internal sealed partial class RandomizerGame
                         using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                         budget.CancelAfter(TimeSpan.FromSeconds(40));
                         var (ids, complete) = await tmxRules.ListEventPoolAsync(budget.Token);
-                        await eventMode.MergeTmxPoolAsync([.. ids.Where(id => !tmxRules.IsExcludedFromRotation(id))], complete);
+                        var unlimiter = await tmxRules.ListEventUnlimiterIdsAsync(budget.Token);
+                        await eventMode.MergeTmxPoolAsync([.. ids.Where(id => !tmxRules.IsExcludedFromRotation(id))], complete, unlimiter);
                     }
                     catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
                     {
@@ -1258,7 +1270,9 @@ internal sealed partial class RandomizerGame
         var host = string.IsNullOrWhiteSpace(config.PublicHost) ? "localhost" : config.PublicHost;
         var assetBaseUrl = $"http://{host}:{config.ReplayServerPort}";
 
-        var openEventMaps = eventMode.Enabled && eventMode.AllMaps.Count > 0 ? eventMode.OpenMaps.Count : (int?)null;
+        var openEventMaps = eventMode.Enabled && eventMode.AllMaps.Count > 0
+            ? (eventMode.Everyday ? eventMode.OpenMapsForThisServer : eventMode.OpenMaps).Count
+            : (int?)null;
         var players = lastPolledPlayers.Count;
         var session = sessionStopwatch is { } sw ? sw.Elapsed : (TimeSpan?)null;
 
@@ -1381,9 +1395,10 @@ internal sealed partial class RandomizerGame
 
         const double width = 17.5;
         var all = eventMode.AllMaps;
-        var open = eventMode.OpenMaps;
+        var open = eventMode.Everyday ? eventMode.OpenMapsForThisServer : eventMode.OpenMaps;
         var winner = eventMode.EndedAt is not null ? eventMode.Standings().FirstOrDefault() : null;
-        var title = winner is not null
+        var title = eventMode.Everyday ? $"Open maps $AAA· {open.Count}"
+            : winner is not null
             ? $"{Fit(eventMode.Title, 5, CharWidth1)} $AAA· $z{Fit(winner.Nickname, 5, CharWidth1)}"
             : $"{Fit(eventMode.Title, 6.5, CharWidth1)} $AAA· {all.Count - open.Count}/{all.Count}";
 
