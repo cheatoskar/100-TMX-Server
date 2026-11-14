@@ -74,6 +74,17 @@ internal sealed class AppConfig
     // or StatusChanged - so finishes are polled from the ranking instead (see RandomizerGame).
     public bool IsLegacyServer => Game is GameTitle.TMN or GameTitle.TMS or GameTitle.TMO;
 
+    // TM2 (ManiaPlanet) and TM2020: one server generation - maps instead of challenges, the game
+    // mode is a script, manialinks are version 3 (see RemoteClient, ManialinkV3)
+    public bool IsManiaPlanet => Game is GameTitle.TM2 or GameTitle.TM2020;
+
+    // TM2 only: the title the server runs - TMStadium@nadeo, TMCanyon@nadeo, TMValley@nadeo or
+    // TMLagoon@nadeo. Players need the same title to join.
+    public string TitlePack { get; init; } = "TMStadium@nadeo";
+
+    // map files: .Map.Gbx on TM2/TM2020, .Challenge.Gbx before
+    public string MapFileExtension => IsManiaPlanet ? ".Map.Gbx" : ".Challenge.Gbx";
+
     // leaderboard.json to use; empty = the one next to the program. The TMUF server points this at
     // the TMNF server's file, so both servers count into one leaderboard (see Leaderboard).
     public string LeaderboardFile { get; init; } = string.Empty;

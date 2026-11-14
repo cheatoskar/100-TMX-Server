@@ -72,7 +72,7 @@ try
 
         var statusDir = Path.Combine(AppContext.BaseDirectory, "WebStatus");
         var syncHub = new SyncHub(appConfig, leaderboard, eventMode);
-        var replayServer = new ReplayServer(serverSetup.ReplaysDir, statusDir, appConfig.ReplayServerPort, appConfig.ServerName, appConfig.FavoriteLogin)
+        var replayServer = new ReplayServer(serverSetup.ReplaysDir, statusDir, appConfig.ReplayServerPort, appConfig.ServerName, appConfig.IsManiaPlanet ? string.Empty : appConfig.FavoriteLogin)
         {
             ExtraRoutes = syncHub.Map,
         };
@@ -255,6 +255,7 @@ internal partial class AppServiceProvider
         {
             Game = Configurator.GetOrAskEnum(globalConfig.Game, cmdConfig.Game, "RANDANY_GAME", "a game"),
             TmxGame = Configurator.GetOptionalEnum(globalConfig.TmxGame, cmdConfig.TmxGame, "RANDANY_TMX_GAME"),
+            TitlePack = string.IsNullOrWhiteSpace(globalConfig.TitlePack) ? "TMStadium@nadeo" : globalConfig.TitlePack.Trim(),
             BindIP = Configurator.GetIP(globalConfig.BindIP, cmdConfig.BindIP, "RANDANY_BIND_IP"),
             XmlRpcPort = Configurator.GetNumber(globalConfig.XmlRpcPort, cmdConfig.XmlRpcPort, "RANDANY_XMLRPC_PORT"),
             AutoSkipMode = Configurator.GetEnum<AutoSkipMode>(globalConfig.AutoSkipMode, cmdValue: null, "RANDANY_AUTO_SKIP_MODE"),

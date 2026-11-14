@@ -638,7 +638,7 @@ internal sealed partial class RandomizerGame
                         // The game server remembers a map under the first path it saw, so when this
                         // map is played later it reports THIS file. The _tmx<id>_ marker lets the
                         // controller still tie it to its TMX id (else finishes on it are lost).
-                        var path = Path.Combine("_RandomizerAny", "event", $"event_tmx{map.TrackId}_.Challenge.Gbx");
+                        var path = Path.Combine("_RandomizerAny", "event", $"event_tmx{map.TrackId}_{config.MapFileExtension}");
                         await client.WriteFileAsync(path, file.Data, budget.Token);
                         var info = await client.GetChallengeInfoAsync(path, budget.Token);
                         if (!string.IsNullOrWhiteSpace(info.Name))
@@ -1228,7 +1228,8 @@ internal sealed partial class RandomizerGame
             {
                 b.Append($"<label posn=\"{Inv(width - 0.8)} {Inv(y - 0.2)} 0.02\" sizen=\"{Inv(9 / 0.9)} 2\" halign=\"right\" textsize=\"1\" scale=\"0.9\" text=\"$3F5Rounds mode on\"/>");
             }
-            else
+            // TM2/TM2020: TimeAttack already drives every lap, no Rounds switch
+            else if (!client.IsManiaPlanet)
             {
                 b.Append($"<quad posn=\"{Inv(width - 0.8 - 8.6)} {Inv(y)} 0.02\" sizen=\"8.6 2.2\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\" action=\"{ActionRoundsAccept}\"/>");
                 b.Append($"<label posn=\"{Inv(width - 0.8 - 4.3)} {Inv(y - 1.1)} 0.03\" sizen=\"8.6 2\" halign=\"center\" valign=\"center\" textsize=\"1\" scale=\"0.85\" text=\"$F80Rounds mode\"/>");
@@ -1248,7 +1249,7 @@ internal sealed partial class RandomizerGame
 
         if (trackId is { } tmxId)
         {
-            b.Append($"<quad posn=\"{Inv(x)} {Inv(y)} 0.02\" sizen=\"5.2 2.2\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\" url=\"{tmxRules.GetSiteUrl()}/trackshow/{tmxId}\"/>");
+            b.Append($"<quad posn=\"{Inv(x)} {Inv(y)} 0.02\" sizen=\"5.2 2.2\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\" url=\"{TrackPageLink(tmxId)}\"/>");
             b.Append($"<quad posn=\"{Inv(x + 0.5)} {Inv(y - 0.15)} 0.03\" sizen=\"4.2 1.9\" image=\"{AssetBaseUrl}/tmx-logo.png\"/>");
             x += 5.6;
         }
@@ -1288,6 +1289,12 @@ internal sealed partial class RandomizerGame
             (tile, (b, w) => TileIcon(b, w, $"image=\"{assetBaseUrl}/favorite.png\"", "FAVORITE"), $"manialink=\"{FavoriteServerUrl}\""),
             (tile, (b, w) => TileIcon(b, w, "style=\"Icons128x128_1\" substyle=\"Advanced\"", "HUD · F7"), $"action=\"{ActionHudHelp}\""),
         };
+
+        // TM2/TM2020 have no tmtp:// favourites link
+        if (client.IsManiaPlanet)
+        {
+            tiles.RemoveAll(t => t.Attributes?.Contains("addfavourite", StringComparison.Ordinal) == true);
+        }
 
         var total = tiles.Sum(t => t.Width) + gap * (tiles.Count - 1);
         var sb = new StringBuilder();
@@ -1479,7 +1486,7 @@ internal sealed partial class RandomizerGame
             foreach (var server in others)
             {
                 var mapName = server.TrackId is { } sid ? EventMapName(sid) : server.MapName ?? "-";
-                b.Append($"<quad posn=\"0.4 {Inv(y + 0.15)} 0.016\" sizen=\"{Inv(width - 0.8)} {Inv(LineHeight)}\" bgcolor=\"0000\" manialink=\"tmtp://#join={Esc(server.Login)}\"/>");
+                b.Append($"<quad posn=\"0.4 {Inv(y + 0.15)} 0.016\" sizen=\"{Inv(width - 0.8)} {Inv(LineHeight)}\" bgcolor=\"0000\" manialink=\"{Esc(JoinUrl(server.Login))}\"/>");
                 b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv(4 / 0.85)} 2\" textsize=\"1\" scale=\"0.85\" textcolor=\"FC0F\" text=\"{Esc(Fit(server.Label, 4, CharWidth1 * 0.85))}\"/>");
                 b.Append($"<label posn=\"5.2 {Inv(y)} 0.02\" sizen=\"{Inv(7.6 / 0.85)} 2\" textsize=\"1\" scale=\"0.85\" text=\"{Esc(Fit(mapName, 7.6, CharWidth1 * 0.85))}\"/>");
                 b.Append($"<label posn=\"{Inv(width - 0.8)} {Inv(y)} 0.02\" sizen=\"{Inv(3.6 / 0.8)} 2\" halign=\"right\" textsize=\"1\" scale=\"0.8\" text=\"{Esc($"{server.Players}/{server.MaxPlayers}")}\"/>");
