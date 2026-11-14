@@ -425,6 +425,7 @@ internal sealed partial class RandomizerGame
 
     public RandomizerGame(RemoteClient client, TmxRules tmxRules, AppConfig config, DiscordNotifier discordNotifier, Leaderboard leaderboard, SkippedMaps skippedMaps, EventMode eventMode, HudSettings hudSettings)
     {
+        shadeBaseUrl = $"http://{(string.IsNullOrWhiteSpace(config.PublicHost) ? "localhost" : config.PublicHost)}:{config.ReplayServerPort}";
         this.eventMode = eventMode;
         this.hudSettings = hudSettings;
         this.skippedMaps = skippedMaps;
