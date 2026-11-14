@@ -77,6 +77,14 @@ internal sealed partial class RandomizerGame
     private string? currentMapRawName;
 
     private readonly ConcurrentDictionary<int, TmxRules.TrackDetails> eventMapDetails = new();
+
+    // the event maps' names with their colours, as the map file has them (TMX only gives plain names)
+    private readonly ConcurrentDictionary<int, string> eventMapRawNames = new();
+
+    private string EventMapName(int trackId) =>
+        eventMapRawNames.TryGetValue(trackId, out var raw) ? raw
+        : eventMapDetails.TryGetValue(trackId, out var d) ? d.Name
+        : $"TMX #{trackId}";
     private readonly ConcurrentDictionary<string, int> eventPage = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, int[]> eventRowsShown = new(StringComparer.OrdinalIgnoreCase);
 
@@ -405,7 +413,7 @@ internal sealed partial class RandomizerGame
 
         if (eventMode.EndedAt is not null && HudAvailable)
         {
-            await client.SendManialinkPageToLoginAsync(login, BuildEventResultsWindow(), cancellationToken: cancellationToken);
+            await ShowWindowAsync(login, BuildEventResultsWindow(), cancellationToken);
             return;
         }
 
@@ -467,7 +475,7 @@ internal sealed partial class RandomizerGame
 
             b.Append($"<quad posn=\"0.8 {Inv(y)} 0.01\" sizen=\"{Inv(width - 1.6)} 2\" style=\"BgsPlayerCard\" substyle=\"{(here ? "BgCardSystem" : "ProgressBar")}\"{(busy || here ? string.Empty : $" action=\"{ActionMapVoteRowBase + i}\"")}/>");
             b.Append($"<label posn=\"3.6 {Inv(y - 0.35)} 0.02\" sizen=\"3 2\" halign=\"right\" textsize=\"1\" scale=\"0.9\" text=\"{page * MapVoteRowsPerPage + i + 1}.\"/>");
-            b.Append($"<label posn=\"4.5 {Inv(y - 0.35)} 0.02\" sizen=\"{Inv(25 / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(d?.Name ?? $"TMX #{map.TrackId}")}\"/>");
+            b.Append($"<label posn=\"4.5 {Inv(y - 0.35)} 0.02\" sizen=\"{Inv(25 / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(Fit(EventMapName(map.TrackId), 25, CharWidth1 * 0.9))}\"/>");
             b.Append($"<label posn=\"30 {Inv(y - 0.35)} 0.02\" sizen=\"{Inv(14 / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"DDDF\" text=\"{Esc(d?.Author ?? "")}\"/>");
             var status = here ? "$0F0playing here" : busy ? $"$FC0on {label}" : d is null ? string.Empty : DifficultyColorCode(d.DifficultyLabel) + d.DifficultyLabel;
             b.Append($"<label posn=\"45 {Inv(y - 0.35)} 0.02\" sizen=\"{Inv(11 / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(status)}\"/>");
@@ -483,9 +491,28 @@ internal sealed partial class RandomizerGame
         return b.ToString();
     }
 
+    // Only one window at a time: opening one (HUD menu, history, presets, map vote, results) clears
+    // the others, so they never stack with one hidden behind another.
+    private static readonly string[] WindowIds = [PresetListManialinkId, HistoryManialinkId, HudMenuId, MapVoteWindowId, EventResultsId];
+
+    private async Task ShowWindowAsync(string login, string windowManialink, CancellationToken cancellationToken)
+    {
+        var b = new StringBuilder("<?xml version=\"1.0\" encoding=\"UTF-8\"?><manialinks>");
+        foreach (var id in WindowIds)
+        {
+            if (!windowManialink.Contains($"id=\"{id}\"", StringComparison.Ordinal))
+            {
+                b.Append("<manialink id=\"").Append(id).Append("\"></manialink>");
+            }
+        }
+
+        b.Append(windowManialink).Append("</manialinks>");
+        await client.SendManialinkPageToLoginAsync(login, b.ToString(), cancellationToken: cancellationToken);
+    }
+
     private static void AppendWindowHeader(StringBuilder b, double width, double height, string title, int closeAction, string iconStyle = "Icons128x128_1", string iconSubstyle = "Challenge")
     {
-        b.Append($"<quad posn=\"0.3 -0.3 -0.01\" sizen=\"{Inv(width - 0.6)} {Inv(height - 0.6)}\" bgcolor=\"0009\"/>");
+        b.Append($"<quad posn=\"0.3 -0.3 -0.01\" sizen=\"{Inv(width - 0.6)} {Inv(height - 0.6)}\" bgcolor=\"0005\"/>");
         b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\"/>");
         b.Append($"<quad posn=\"0.4 -0.36 0.01\" sizen=\"{Inv(width - 0.8)} 2.6\" style=\"BgsPlayerCard\" substyle=\"BgRacePlayerName\"/>");
         b.Append($"<quad posn=\"0.7 0 0.02\" sizen=\"3 3\" style=\"{iconStyle}\" substyle=\"{iconSubstyle}\"/>");
@@ -504,7 +531,7 @@ internal sealed partial class RandomizerGame
 
         var b = new StringBuilder();
         b.Append($"<manialink id=\"{EventResultsId}\"><frame posn=\"{Inv(-width / 2)} {Inv(height / 2 + 4)} 25\">");
-        b.Append($"<quad posn=\"0.3 -0.3 -0.01\" sizen=\"{Inv(width - 0.6)} {Inv(height - 0.6)}\" bgcolor=\"0009\"/>");
+        b.Append($"<quad posn=\"0.3 -0.3 -0.01\" sizen=\"{Inv(width - 0.6)} {Inv(height - 0.6)}\" bgcolor=\"0005\"/>");
         b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\"/>");
         b.Append($"<quad posn=\"0.4 -0.36 0.01\" sizen=\"{Inv(width - 0.8)} 3\" style=\"BgsPlayerCard\" substyle=\"BgRacePlayerName\"/>");
         b.Append("<quad posn=\"0.7 0 0.02\" sizen=\"3.4 3.4\" style=\"Icons128x128_1\" substyle=\"Rankings\"/>");
@@ -562,6 +589,60 @@ internal sealed partial class RandomizerGame
         {
             Console.WriteLine($"Warning: couldn't load the event maps' names from TMX - {ex.Message}. Showing ids until the next try.");
         }
+
+        LoadEventMapRawNamesInBackground();
+    }
+
+    private int eventRawNamesLoading;
+
+    // TMX's API only has plain names. The coloured one is in the map file: each event map is
+    // downloaded once (it is needed on the event anyway), written next to the played maps and its
+    // name read back through the game server. One map at a time, in the background; a failure
+    // just leaves that map's plain name.
+    private void LoadEventMapRawNamesInBackground()
+    {
+        if (!HudAvailable || Interlocked.Exchange(ref eventRawNamesLoading, 1) == 1)
+        {
+            return;
+        }
+
+        RunInBackground("reading the event maps' coloured names", async () =>
+        {
+            try
+            {
+                var changed = false;
+                foreach (var map in eventMode.AllMaps.Where(m => !eventMapRawNames.ContainsKey(m.TrackId)).ToList())
+                {
+                    try
+                    {
+                        using var budget = CancellationTokenSource.CreateLinkedTokenSource(appToken);
+                        budget.CancelAfter(TimeSpan.FromSeconds(30));
+                        var file = await tmxRules.GetMapGbxByIdAsync(map.TrackId, budget.Token);
+                        var path = Path.Combine("_RandomizerAny", "event", $"tmx{map.TrackId}.Challenge.Gbx");
+                        await client.WriteFileAsync(path, file.Data, budget.Token);
+                        var info = await client.GetChallengeInfoAsync(path, budget.Token);
+                        if (!string.IsNullOrWhiteSpace(info.Name))
+                        {
+                            eventMapRawNames[map.TrackId] = TmLinkCodeRegex().Replace(info.Name, string.Empty);
+                            changed = true;
+                        }
+                    }
+                    catch (Exception ex) when (!appToken.IsCancellationRequested)
+                    {
+                        Diagnostics.Trace($"coloured name of event map {map.TrackId}: {ex.Message}");
+                    }
+                }
+
+                if (changed)
+                {
+                    await BroadcastHudAsync(HudSection.Event, appToken);
+                }
+            }
+            finally
+            {
+                Interlocked.Exchange(ref eventRawNamesLoading, 0);
+            }
+        });
     }
 
     // every 15 s: tiles (players, session time), the event list (other servers' maps) and, with the
@@ -643,7 +724,7 @@ internal sealed partial class RandomizerGame
                 await SkipAsync(playerUid, login, [], cancellationToken);
                 return;
             case ActionHudMapVoteHint:
-                await client.SendManialinkPageToLoginAsync(login, BuildMapVoteWindow(login), cancellationToken: cancellationToken);
+                await ShowWindowAsync(login, BuildMapVoteWindow(login), cancellationToken);
                 return;
             case ActionMapVoteClose:
                 await client.SendManialinkPageToLoginAsync(login, $"<manialink id=\"{MapVoteWindowId}\"></manialink>", cancellationToken: cancellationToken);
@@ -652,7 +733,7 @@ internal sealed partial class RandomizerGame
             case ActionMapVoteNext:
                 mapVotePage.AddOrUpdate(login, _ => answer == ActionMapVoteNext ? 1 : 0,
                     (_, page) => Math.Max(0, page + (answer == ActionMapVoteNext ? 1 : -1)));
-                await client.SendManialinkPageToLoginAsync(login, BuildMapVoteWindow(login), cancellationToken: cancellationToken);
+                await ShowWindowAsync(login, BuildMapVoteWindow(login), cancellationToken);
                 return;
             case ActionHudPresets:
                 await PresetsAsync(playerUid, login, [], cancellationToken);
@@ -665,7 +746,7 @@ internal sealed partial class RandomizerGame
                 await SendHudAsync(login, HudSection.All, cancellationToken);
                 return;
             case ActionHudHelp:
-                await client.SendManialinkPageToLoginAsync(login, BuildHudMenu(login), cancellationToken: cancellationToken);
+                await ShowWindowAsync(login, BuildHudMenu(login), cancellationToken);
                 return;
             case ActionHudMenuClose:
                 await client.SendManialinkPageToLoginAsync(login, $"<manialink id=\"{HudMenuId}\"></manialink>", cancellationToken: cancellationToken);
@@ -679,7 +760,7 @@ internal sealed partial class RandomizerGame
                     p.CpAboveClock = false;
                 });
                 await SendHudAsync(login, HudSection.All, cancellationToken);
-                await client.SendManialinkPageToLoginAsync(login, BuildHudMenu(login), cancellationToken: cancellationToken);
+                await ShowWindowAsync(login, BuildHudMenu(login), cancellationToken);
                 return;
             case ActionHudCollapseMap:
                 await ToggleCollapsedAsync(login, HudPart.Map, HudSection.Map, cancellationToken);
@@ -696,7 +777,7 @@ internal sealed partial class RandomizerGame
             case ActionHudCpPosition:
                 await hudSettings.UpdateAsync(login, p => p.CpAboveClock = !p.CpAboveClock);
                 await SendHudAsync(login, HudSection.Cp, cancellationToken);
-                await client.SendManialinkPageToLoginAsync(login, BuildHudMenu(login), cancellationToken: cancellationToken);
+                await ShowWindowAsync(login, BuildHudMenu(login), cancellationToken);
                 return;
             case ActionEventResultsClose:
                 await client.SendManialinkPageToLoginAsync(login, $"<manialink id=\"{EventResultsId}\"></manialink>", cancellationToken: cancellationToken);
@@ -721,7 +802,7 @@ internal sealed partial class RandomizerGame
                 }
             });
             await SendHudAsync(login, HudSection.All, cancellationToken);
-            await client.SendManialinkPageToLoginAsync(login, BuildHudMenu(login), cancellationToken: cancellationToken);
+            await ShowWindowAsync(login, BuildHudMenu(login), cancellationToken);
             return;
         }
 
@@ -1065,9 +1146,11 @@ internal sealed partial class RandomizerGame
         }
 
         var authorTime = currentMap?.AuthorTime ?? details?.AuthorTimeMs ?? 0;
-        var timesLine = $"$0F0AT {FormatTime(authorTime)}"
+        // the game's own author medal in front of the author time
+        var timesLine = $"$FFF{FormatTime(authorTime)}"
             + (details?.WrTimeMs is { } wr ? $"$z   $AAATMX WR $8DF{FormatTime(wr)}" : details is not null ? "$z   $AAANo TMX record yet" : string.Empty);
-        b.Append($"<label posn=\"0.8 {Inv(y)} 0.02\" sizen=\"{Inv(inner / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(timesLine)}\"/>");
+        b.Append($"<quad posn=\"0.6 {Inv(y + 0.25)} 0.02\" sizen=\"2.1 2.1\" style=\"MedalsBig\" substyle=\"MedalNadeo\"/>");
+        b.Append($"<label posn=\"2.9 {Inv(y)} 0.02\" sizen=\"{Inv((inner - 2.1) / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(timesLine)}\"/>");
         y -= 2.0;
 
         // buttons: TMX logo, Skip vote, Map vote - the panel is exactly as wide as they need
@@ -1223,13 +1306,13 @@ internal sealed partial class RandomizerGame
             return string.Empty;
         }
 
-        const double width = MapPanelWidth;
+        const double width = 17.5;
         var all = eventMode.AllMaps;
         var open = eventMode.OpenMaps;
         var winner = eventMode.EndedAt is not null ? eventMode.Standings().FirstOrDefault() : null;
         var title = winner is not null
-            ? $"{Fit(eventMode.Title, 7, CharWidth1)} $AAA· winner $z{Fit(winner.Nickname, 7, CharWidth1)}"
-            : $"{Fit(eventMode.Title, 9, CharWidth1)} $AAA· {all.Count - open.Count}/{all.Count} done";
+            ? $"{Fit(eventMode.Title, 5, CharWidth1)} $AAA· $z{Fit(winner.Nickname, 5, CharWidth1)}"
+            : $"{Fit(eventMode.Title, 6.5, CharWidth1)} $AAA· {all.Count - open.Count}/{all.Count}";
 
         var b = new StringBuilder();
         b.Append("<frame posn=\"-63.6 23.5 1\">");
@@ -1254,7 +1337,7 @@ internal sealed partial class RandomizerGame
 
         var rowsHeight = Math.Max(shown.Length, 1) * LineHeight;
         var serversHeight = others.Count > 0 ? 2.2 + others.Count * LineHeight : 0;
-        var recentHeight = recent.Count > 0 ? 2.2 + recent.Count * LineHeight : 0;
+        var recentHeight = recent.Count > 0 ? 2.2 + recent.Count * 2 * LineHeight : 0;
         var height = 3.3 + rowsHeight + 2.4 + serversHeight + recentHeight + 0.3;
 
         AppendWidgetFrame(b, width, height, "Icons128x128_1", "Challenge", title, ActionHudCollapseEvent, collapsed: false);
@@ -1274,7 +1357,8 @@ internal sealed partial class RandomizerGame
         {
             var map = shown[i];
             var number = page * EventRowsPerPage + i + 1;
-            var name = eventMapDetails.TryGetValue(map.TrackId, out var d) ? d.Name : $"TMX #{map.TrackId}";
+            eventMapDetails.TryGetValue(map.TrackId, out var d);
+            var name = EventMapName(map.TrackId);
             var tag = map.TrackId == runningHere ? "$0F0here"
                 : runningElsewhere.TryGetValue(map.TrackId, out var label) ? $"$FC0{Fit(label, tagWidth, CharWidth1 * 0.8)}"
                 : map.Unlimiter ? "$F80Unlim."
@@ -1296,21 +1380,21 @@ internal sealed partial class RandomizerGame
         // pages
         y -= 0.3;
         b.Append($"<quad posn=\"0.8 {Inv(y + 0.1)} 0.02\" sizen=\"2 2\" style=\"Icons64x64_1\" substyle=\"ArrowPrev\" action=\"{ActionEventPagePrev}\"/>");
-        b.Append($"<label posn=\"{Inv(width / 2)} {Inv(y - 0.2)} 0.02\" sizen=\"{Inv((width - 6) / 0.8)} 2\" halign=\"center\" textsize=\"1\" scale=\"0.8\" textcolor=\"CCCF\" text=\"{Esc($"{page + 1}/{pages} · {open.Count} open · click to vote")}\"/>");
+        b.Append($"<label posn=\"{Inv(width / 2)} {Inv(y - 0.2)} 0.02\" sizen=\"{Inv((width - 6) / 0.8)} 2\" halign=\"center\" textsize=\"1\" scale=\"0.8\" textcolor=\"CCCF\" text=\"{Esc($"{page + 1}/{pages} · {open.Count} open · click = vote")}\"/>");
         b.Append($"<quad posn=\"{Inv(width - 2.8)} {Inv(y + 0.1)} 0.02\" sizen=\"2 2\" style=\"Icons64x64_1\" substyle=\"ArrowNext\" action=\"{ActionEventPageNext}\"/>");
         y -= 2.1;
 
         if (others.Count > 0)
         {
-            b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv((width - 2) / 0.8)} 2\" textsize=\"1\" scale=\"0.8\" textcolor=\"FC0F\" text=\"ON OTHER SERVERS $AAA· click to join\"/>");
+            b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv((width - 2) / 0.8)} 2\" textsize=\"1\" scale=\"0.8\" textcolor=\"FC0F\" text=\"OTHER SERVERS $AAA· click = join\"/>");
             y -= 1.9;
             foreach (var server in others)
             {
-                var mapName = server.TrackId is { } sid && eventMapDetails.TryGetValue(sid, out var sd) ? sd.Name : server.MapName ?? "-";
+                var mapName = server.TrackId is { } sid ? EventMapName(sid) : server.MapName ?? "-";
                 b.Append($"<quad posn=\"0.4 {Inv(y + 0.15)} 0.016\" sizen=\"{Inv(width - 0.8)} {Inv(LineHeight)}\" bgcolor=\"0000\" manialink=\"tmtp://#join={Esc(server.Login)}\"/>");
-                b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv(5 / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"FC0F\" text=\"{Esc(Fit(server.Label, 5, CharWidth1 * 0.9))}\"/>");
-                b.Append($"<label posn=\"6.2 {Inv(y)} 0.02\" sizen=\"{Inv(9 / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(Fit(mapName, 9, CharWidth1 * 0.9))}\"/>");
-                b.Append($"<label posn=\"{Inv(width - 0.8)} {Inv(y)} 0.02\" sizen=\"{Inv(5 / 0.8)} 2\" halign=\"right\" textsize=\"1\" scale=\"0.8\" text=\"{Esc($"{server.Players}/{server.MaxPlayers} $0F0join")}\"/>");
+                b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv(4 / 0.85)} 2\" textsize=\"1\" scale=\"0.85\" textcolor=\"FC0F\" text=\"{Esc(Fit(server.Label, 4, CharWidth1 * 0.85))}\"/>");
+                b.Append($"<label posn=\"5.2 {Inv(y)} 0.02\" sizen=\"{Inv(7.6 / 0.85)} 2\" textsize=\"1\" scale=\"0.85\" text=\"{Esc(Fit(mapName, 7.6, CharWidth1 * 0.85))}\"/>");
+                b.Append($"<label posn=\"{Inv(width - 0.8)} {Inv(y)} 0.02\" sizen=\"{Inv(3.6 / 0.8)} 2\" halign=\"right\" textsize=\"1\" scale=\"0.8\" text=\"{Esc($"{server.Players}/{server.MaxPlayers}")}\"/>");
                 y -= LineHeight;
             }
         }
@@ -1318,16 +1402,20 @@ internal sealed partial class RandomizerGame
         if (recent.Count > 0)
         {
             y -= 0.3;
-            b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv((width - 2) / 0.8)} 2\" textsize=\"1\" scale=\"0.8\" textcolor=\"FC0F\" text=\"JUST FINISHED $AAA· first finisher, time\"/>");
+            b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv((width - 2) / 0.8)} 2\" textsize=\"1\" scale=\"0.8\" textcolor=\"FC0F\" text=\"JUST FINISHED\"/>");
             y -= 1.9;
             foreach (var (trackId, finish) in recent)
             {
-                var mapName = eventMapDetails.TryGetValue(trackId, out var fd) ? fd.Name : $"#{trackId}";
+                var mapName = EventMapName(trackId);
                 var ago = DateTimeOffset.UtcNow - finish.At;
-                var agoText = ago.TotalMinutes < 1 ? "now" : ago.TotalHours < 1 ? $"{(int)ago.TotalMinutes}m" : $"{(int)ago.TotalHours}h";
-                b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv(7.6 / 0.85)} 2\" textsize=\"1\" scale=\"0.85\" text=\"{Esc(Fit(mapName, 7.6, CharWidth1 * 0.85))}\"/>");
-                b.Append($"<label posn=\"8.9 {Inv(y)} 0.02\" sizen=\"{Inv(5.4 / 0.85)} 2\" textsize=\"1\" scale=\"0.85\" text=\"{Esc(Fit(finish.Nickname, 5.4, CharWidth1 * 0.85))}\"/>");
-                b.Append($"<label posn=\"{Inv(width - 0.8)} {Inv(y)} 0.02\" sizen=\"{Inv(5.6 / 0.8)} 2\" halign=\"right\" textsize=\"1\" scale=\"0.8\" text=\"{Esc($"$3F5{FormatTime(finish.Time)} $AAA{agoText}")}\"/>");
+                var agoText = ago.TotalMinutes < 1 ? "now" : ago.TotalHours < 1 ? $"{(int)ago.TotalMinutes}m ago" : $"{(int)ago.TotalHours}h ago";
+
+                // first line the map and when, second line who and in what time
+                b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv(11.4 / 0.85)} 2\" textsize=\"1\" scale=\"0.85\" text=\"{Esc(Fit(mapName, 11.4, CharWidth1 * 0.85))}\"/>");
+                b.Append($"<label posn=\"{Inv(width - 0.8)} {Inv(y)} 0.02\" sizen=\"{Inv(4.4 / 0.75)} 2\" halign=\"right\" textsize=\"1\" scale=\"0.75\" textcolor=\"AAAF\" text=\"{Esc(agoText)}\"/>");
+                y -= LineHeight;
+                b.Append($"<label posn=\"2 {Inv(y)} 0.02\" sizen=\"{Inv(9.4 / 0.8)} 2\" textsize=\"1\" scale=\"0.8\" text=\"{Esc(Fit(finish.Nickname, 9.4, CharWidth1 * 0.8))}\"/>");
+                b.Append($"<label posn=\"{Inv(width - 0.8)} {Inv(y)} 0.02\" sizen=\"{Inv(5 / 0.8)} 2\" halign=\"right\" textsize=\"1\" scale=\"0.8\" text=\"{Esc($"$3F5{FormatTime(finish.Time)}")}\"/>");
                 y -= LineHeight;
             }
         }
@@ -1363,7 +1451,7 @@ internal sealed partial class RandomizerGame
         const double width = 9;
         const double height = 3.4;
         var aboveClock = hudSettings.Get(login).CpAboveClock;
-        var (x, y) = aboveClock ? (-width / 2, -37.4) : (-31.0, -43.8);
+        var (x, y) = aboveClock ? (-width / 2, -39.2) : (-21.5, -44.6);
 
         var b = new StringBuilder($"<frame posn=\"{Inv(x)} {Inv(y)} 1\">");
         AppendBox(b, width, height);
@@ -1402,20 +1490,21 @@ internal sealed partial class RandomizerGame
         }
 
         const double width = 14;
-        var b = new StringBuilder($"<frame posn=\"{Inv(63.6 - width)} -13 1\">");
+        // below the top finishers even with ten rows and the player's own row (those end near y=0)
+        var b = new StringBuilder($"<frame posn=\"{Inv(63.6 - width)} -24 1\">");
 
         if (collapsed)
         {
-            AppendWidgetFrame(b, width, 2.8, "Icons64x64_1", "StarGold", "Times", ActionHudCollapseTimes, collapsed: true);
+            AppendWidgetFrame(b, width, 2.8, "Icons128x128_1", "Race", "Times", ActionHudCollapseTimes, collapsed: true);
             b.Append("</frame>");
             return b.ToString();
         }
 
-        AppendWidgetFrame(b, width, 9.3, "Icons64x64_1", "StarGold", "Times", ActionHudCollapseTimes, collapsed: false);
+        AppendWidgetFrame(b, width, 9.3, "Icons128x128_1", "Race", "Times", ActionHudCollapseTimes, collapsed: false);
 
         (string Icon, string Label, string Value)[] rows =
         [
-            ("style=\"Icons64x64_1\" substyle=\"StarGold\"", "Your best", own is { } o ? "$3F5" + FormatTime(o) : "$AAA--"),
+            ("style=\"MedalsBig\" substyle=\"MedalGold\"", "Your best", own is { } o ? "$3F5" + FormatTime(o) : "$AAA--"),
             ("style=\"Icons128x128_1\" substyle=\"Rankings\"", "Server", best is { } sb ? "$FF0" + FormatTime(sb) : "$AAA--"),
             ($"image=\"{AssetBaseUrl}/tmx-logo.png\"", string.Empty, wr is { } w ? "$8DF" + FormatTime(w) : "$AAA--"),
         ];

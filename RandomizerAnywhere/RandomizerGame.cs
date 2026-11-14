@@ -2301,7 +2301,7 @@ internal sealed partial class RandomizerGame
         await SendMessageAsync(login, lines, cancellationToken);
 
         lastShownHistoryTrackIds = shownTrackIds;
-        await client.SendManialinkPageToLoginAsync(login, BuildHistoryManialink(shownNames), cancellationToken: cancellationToken);
+        await ShowWindowAsync(login, BuildHistoryManialink(shownNames, shownTrackIds), cancellationToken);
     }
 
     // switches the CURRENT map to Rounds mode so a multilap track can be finished properly - plain
@@ -3121,7 +3121,7 @@ internal sealed partial class RandomizerGame
         await SendMessageAsync(login, [$"Presets: {string.Join(", ", coloredNames)}", "Click one in the window to start a vote, or type $FF0/votepreset <name>$FFF."], cancellationToken);
 
         lastShownPresetNames = rawPresetNames;
-        await client.SendManialinkPageToLoginAsync(login, BuildPresetWindow(presets), cancellationToken: cancellationToken);
+        await ShowWindowAsync(login, BuildPresetWindow(presets), cancellationToken);
     }
 
     // (login, time) of the finishes already handled on the map of handledFinishesGeneration.
@@ -3313,7 +3313,11 @@ internal sealed partial class RandomizerGame
     {
         try
         {
-            var fileName = $"{SanitizeFileNamePart(login)}_{DateTimeOffset.UtcNow:yyyyMMdd-HHmmss}.Replay.Gbx";
+            // The web server hands out any file in the replays folder to whoever asks for its name.
+            // Login and second alone were guessable (try every second of a day), so the name gets
+            // 64 random bits: only the player who got the link can fetch the replay.
+            var token = Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(8)).ToLowerInvariant();
+            var fileName = $"{SanitizeFileNamePart(login)}_{DateTimeOffset.UtcNow:yyyyMMdd-HHmmss}_{token}.Replay.Gbx";
             var relativeFileName = $"{config.ServerName}/{fileName}";
 
             if (!client.Supports("SaveBestGhostsReplay"))
@@ -4045,22 +4049,28 @@ internal sealed partial class RandomizerGame
     private const double HistoryNameWidthBudget = 30.0;
 
     // the /history window in the HUD's style - a click on a map shows its TMX link (as "/map -N")
-    private string BuildHistoryManialink(IReadOnlyList<string> names)
+    private string BuildHistoryManialink(IReadOnlyList<string> names, IReadOnlyList<int> trackIds)
     {
-        const double width = 44;
+        const double width = 46;
         var height = 6.6 + Math.Max(names.Count, 1) * 2.2 + 1;
         var b = new System.Text.StringBuilder();
         b.Append($"<manialink id=\"{HistoryManialinkId}\"><frame posn=\"{Inv(-width / 2)} {Inv(height / 2 + 4)} 20\">");
         AppendWindowHeader(b, width, height, "Last maps", ActionCloseHistory, "Icons128x128_1", "LoadTrack");
-        b.Append("<label posn=\"1.5 -3.9 0.02\" sizen=\"42 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"CCCF\" text=\"Click a map for its TMX link.\"/>");
+        b.Append("<label posn=\"1.5 -3.9 0.02\" sizen=\"42 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"CCCF\" text=\"Click a map for its TMX link in the chat, or the TMX logo to open its page.\"/>");
 
         var y = -6.0;
         for (var i = 0; i < names.Count; i++)
         {
             var displayName = TruncateForDisplayWidth(names[i], HistoryNameWidthBudget);
-            b.Append($"<quad posn=\"0.8 {Inv(y)} 0.01\" sizen=\"{Inv(width - 1.6)} 2\" style=\"BgsPlayerCard\" substyle=\"ProgressBar\" action=\"{ActionHistoryBase + i}\"/>");
+            b.Append($"<quad posn=\"0.8 {Inv(y)} 0.01\" sizen=\"{Inv(width - 7.4)} 2\" style=\"BgsPlayerCard\" substyle=\"ProgressBar\" action=\"{ActionHistoryBase + i}\"/>");
             b.Append($"<label posn=\"4 {Inv(y - 0.35)} 0.02\" sizen=\"3 2\" halign=\"right\" textsize=\"1\" textcolor=\"FC0F\" text=\"-{i + 1}\"/>");
-            b.Append($"<label posn=\"5 {Inv(y - 0.35)} 0.02\" sizen=\"37 2\" textsize=\"1\" text=\"{Esc(displayName)}\"/>");
+            b.Append($"<label posn=\"5 {Inv(y - 0.35)} 0.02\" sizen=\"31 2\" textsize=\"1\" text=\"{Esc(displayName)}\"/>");
+            if (i < trackIds.Count)
+            {
+                // straight to the map's TMX page, no chat link needed
+                b.Append($"<quad posn=\"{Inv(width - 6.3)} {Inv(y)} 0.01\" sizen=\"5.5 2\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\" url=\"{tmxRules.GetSiteUrl()}/trackshow/{trackIds[i]}\"/>");
+                b.Append($"<quad posn=\"{Inv(width - 5.8)} {Inv(y - 0.1)} 0.02\" sizen=\"4.4 1.8\" image=\"{AssetBaseUrl}/tmx-logo.png\"/>");
+            }
             y -= 2.2;
         }
 
