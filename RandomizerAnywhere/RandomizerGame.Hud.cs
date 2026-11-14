@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Globalization;
 using System.Security;
 using System.Text;
@@ -55,6 +55,8 @@ internal sealed partial class RandomizerGame
     private const int ActionHudCollapseMap = 1010;
     private const int ActionHudCollapseTop = 1011;
     private const int ActionHudCollapseEvent = 1012;
+    private const int ActionHudCollapseTimes = 1013;
+    private const int ActionHudCpPosition = 1014;
     private const int ActionEventPagePrev = 1020;
     private const int ActionEventPageNext = 1021;
     private const int ActionEventRowBase = 1100;
@@ -483,7 +485,7 @@ internal sealed partial class RandomizerGame
 
     private static void AppendWindowHeader(StringBuilder b, double width, double height, string title, int closeAction, string iconStyle = "Icons128x128_1", string iconSubstyle = "Challenge")
     {
-        b.Append($"<quad posn=\"0.3 -0.3 -0.01\" sizen=\"{Inv(width - 0.6)} {Inv(height - 0.6)}\" bgcolor=\"000D\"/>");
+        b.Append($"<quad posn=\"0.3 -0.3 -0.01\" sizen=\"{Inv(width - 0.6)} {Inv(height - 0.6)}\" bgcolor=\"0009\"/>");
         b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\"/>");
         b.Append($"<quad posn=\"0.4 -0.36 0.01\" sizen=\"{Inv(width - 0.8)} 2.6\" style=\"BgsPlayerCard\" substyle=\"BgRacePlayerName\"/>");
         b.Append($"<quad posn=\"0.7 0 0.02\" sizen=\"3 3\" style=\"{iconStyle}\" substyle=\"{iconSubstyle}\"/>");
@@ -502,7 +504,7 @@ internal sealed partial class RandomizerGame
 
         var b = new StringBuilder();
         b.Append($"<manialink id=\"{EventResultsId}\"><frame posn=\"{Inv(-width / 2)} {Inv(height / 2 + 4)} 25\">");
-        b.Append($"<quad posn=\"0.3 -0.3 -0.01\" sizen=\"{Inv(width - 0.6)} {Inv(height - 0.6)}\" bgcolor=\"000D\"/>");
+        b.Append($"<quad posn=\"0.3 -0.3 -0.01\" sizen=\"{Inv(width - 0.6)} {Inv(height - 0.6)}\" bgcolor=\"0009\"/>");
         b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\"/>");
         b.Append($"<quad posn=\"0.4 -0.36 0.01\" sizen=\"{Inv(width - 0.8)} 3\" style=\"BgsPlayerCard\" substyle=\"BgRacePlayerName\"/>");
         b.Append("<quad posn=\"0.7 0 0.02\" sizen=\"3.4 3.4\" style=\"Icons128x128_1\" substyle=\"Rankings\"/>");
@@ -674,6 +676,7 @@ internal sealed partial class RandomizerGame
                     p.AllHidden = false;
                     p.Hidden.Clear();
                     p.Collapsed.Clear();
+                    p.CpAboveClock = false;
                 });
                 await SendHudAsync(login, HudSection.All, cancellationToken);
                 await client.SendManialinkPageToLoginAsync(login, BuildHudMenu(login), cancellationToken: cancellationToken);
@@ -686,6 +689,14 @@ internal sealed partial class RandomizerGame
                 return;
             case ActionHudCollapseEvent:
                 await ToggleCollapsedAsync(login, HudPart.Event, HudSection.Event, cancellationToken);
+                return;
+            case ActionHudCollapseTimes:
+                await ToggleCollapsedAsync(login, HudPart.Times, HudSection.Times, cancellationToken);
+                return;
+            case ActionHudCpPosition:
+                await hudSettings.UpdateAsync(login, p => p.CpAboveClock = !p.CpAboveClock);
+                await SendHudAsync(login, HudSection.Cp, cancellationToken);
+                await client.SendManialinkPageToLoginAsync(login, BuildHudMenu(login), cancellationToken: cancellationToken);
                 return;
             case ActionEventResultsClose:
                 await client.SendManialinkPageToLoginAsync(login, $"<manialink id=\"{EventResultsId}\"></manialink>", cancellationToken: cancellationToken);
@@ -783,6 +794,7 @@ internal sealed partial class RandomizerGame
                 p.AllHidden = false;
                 p.Hidden.Clear();
                 p.Collapsed.Clear();
+                p.CpAboveClock = false;
             });
         }
         else if (HudPartNames.TryGetValue(first, out var part))
@@ -838,7 +850,7 @@ internal sealed partial class RandomizerGame
         ];
 
         const double width = 40;
-        var height = 6.6 + parts.Length * 2.6 + 3.2;
+        var height = 6.6 + parts.Length * 2.6 + 2.6 + 3.2;
 
         var b = new StringBuilder();
         b.Append($"<manialink id=\"{HudMenuId}\"><frame posn=\"{Inv(-width / 2)} {Inv(height / 2 + 2)} 20\">");
@@ -856,6 +868,13 @@ internal sealed partial class RandomizerGame
             b.Append($"<label posn=\"{Inv(width - 4.3)} {Inv(y - 1.15)} 0.03\" sizen=\"5.6 2\" halign=\"center\" valign=\"center\" textsize=\"1\" text=\"{(on ? "$3F5ON" : "$F33OFF")}\"/>");
             y -= 2.6;
         }
+
+        // where the checkpoint counter sits
+        b.Append($"<quad posn=\"0.8 {Inv(y)} 0.01\" sizen=\"{Inv(width - 1.6)} 2.3\" style=\"BgsPlayerCard\" substyle=\"ProgressBar\"/>");
+        b.Append($"<label posn=\"1.6 {Inv(y - 0.4)} 0.02\" sizen=\"20 2\" textsize=\"1\" text=\"Checkpoint counter position\"/>");
+        b.Append($"<quad posn=\"{Inv(width - 13.2)} {Inv(y - 0.25)} 0.02\" sizen=\"11.8 1.8\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\" action=\"{ActionHudCpPosition}\"/>");
+        b.Append($"<label posn=\"{Inv(width - 7.3)} {Inv(y - 1.15)} 0.03\" sizen=\"11.6 2\" halign=\"center\" valign=\"center\" textsize=\"1\" text=\"{(prefs.CpAboveClock ? "$FC0above the timer" : "$FC0left of the timer")}\"/>");
+        y -= 2.6;
 
         y -= 0.4;
         b.Append($"<quad posn=\"0.8 {Inv(y)} 0.02\" sizen=\"12 2.2\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\" action=\"{ActionHudToggleAll}\"/>");
@@ -890,7 +909,7 @@ internal sealed partial class RandomizerGame
         Part(HudSection.Top, HudPart.Top, HudTopId, () => BuildTopFinishers(login, prefs.Collapsed.Contains(HudPart.Top)));
         Part(HudSection.Event, HudPart.Event, HudEventId, () => BuildEventPanel(login, prefs.Collapsed.Contains(HudPart.Event)));
         Part(HudSection.Cp, HudPart.Cp, HudCpId, () => BuildCheckpointCounter(login));
-        Part(HudSection.Times, HudPart.Times, HudTimesId, () => BuildTimesBlock(login));
+        Part(HudSection.Times, HudPart.Times, HudTimesId, () => BuildTimesBlock(login, prefs.Collapsed.Contains(HudPart.Times)));
 
         if (sections.HasFlag(HudSection.Keys))
         {
@@ -907,14 +926,6 @@ internal sealed partial class RandomizerGame
     }
 
     // background box, title bar, icon, title and the fold button - Records Eyepiece's widget header
-    // NavButton alone is too see-through on a bright track; a dark quad just inside its rounded
-    // edge gives the boxes the denser look of the Records Eyepiece screenshots
-    private static void AppendBox(StringBuilder b, double width, double height, string? attributes = null)
-    {
-        b.Append($"<quad posn=\"0.25 -0.25 -0.01\" sizen=\"{Inv(width - 0.5)} {Inv(height - 0.5)}\" bgcolor=\"000A\"/>");
-        b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\" {attributes ?? string.Empty}/>");
-    }
-
     private static void AppendWidgetFrame(StringBuilder b, double width, double height, string iconStyle, string iconSubstyle, string title, int? collapseAction, bool collapsed)
     {
         AppendBox(b, width, height);
@@ -955,9 +966,56 @@ internal sealed partial class RandomizerGame
         _ => "$FFF",
     };
 
+    // NavButton alone lets a bright track shine through; a light dark quad just inside its rounded
+    // edge makes the text readable without turning the boxes black. Tiles get less of it, so
+    // they match the game's own boxes (the "previous / best" panel top right).
+    private static void AppendBox(StringBuilder b, double width, double height, string? attributes = null, string underlay = "0005")
+    {
+        b.Append($"<quad posn=\"0.25 -0.25 -0.01\" sizen=\"{Inv(width - 0.5)} {Inv(height - 0.5)}\" bgcolor=\"{underlay}\"/>");
+        b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\" {attributes ?? string.Empty}/>");
+    }
+
+    // Rendered width of text, in manialink units per plain character, measured on screenshots:
+    // textsize 1 at scale 1 is about 0.5 units per character, textsize 2 about 0.75.
+    private const double CharWidth1 = 0.5;
+    private const double CharWidth2 = 0.75;
+
+    // cut to fit the width, with "…" - a label never wraps or runs over the box edge
+    private static string Fit(string text, double units, double unitsPerChar) => TruncateForDisplayWidth(text, units / unitsPerChar);
+
+    // the pieces joined with " · ", wrapped onto as many lines as needed (each piece stays whole)
+    private static List<string> WrapPieces(IReadOnlyList<string> pieces, double units, double unitsPerChar)
+    {
+        var lines = new List<string>();
+        var current = string.Empty;
+        foreach (var piece in pieces)
+        {
+            var candidate = current.Length == 0 ? piece : current + "$z$FFF · " + piece;
+            if (current.Length > 0 && MeasureDisplayWidth(StripTmCodes(candidate), int.MaxValue, out _) * unitsPerChar > units)
+            {
+                lines.Add(current);
+                current = piece;
+            }
+            else
+            {
+                current = candidate;
+            }
+        }
+
+        if (current.Length > 0)
+        {
+            lines.Add(current);
+        }
+
+        return lines;
+    }
+
+    private const double MapPanelWidth = 20.8;
+
     private string BuildMapPanel(bool collapsed)
     {
-        const double width = 24;
+        const double width = MapPanelWidth;
+        const double inner = width - 1.6;
         var b = new StringBuilder();
         b.Append("<frame posn=\"-63.6 47.6 1\">");
 
@@ -970,8 +1028,6 @@ internal sealed partial class RandomizerGame
             return b.ToString();
         }
 
-        AppendWidgetFrame(b, width, 12.2, "Icons128x128_1", "NewTrack", title, ActionHudCollapseMap, collapsed: false);
-
         TmxRules.TrackDetails? details;
         string? rawName;
         int? trackId;
@@ -982,34 +1038,51 @@ internal sealed partial class RandomizerGame
             trackId = currentMapTrackId;
         }
 
-        var name = rawName ?? details?.Name ?? "Loading...";
-        b.Append($"<label posn=\"1 -3 0.02\" sizen=\"21 2.6\" textsize=\"2\" text=\"{Esc(name)}\"/>");
+        // the name is one line, cut with "…"; the details wrap onto a further line when an author
+        // name or a tag is long
+        var name = Fit(rawName ?? details?.Name ?? "Loading...", inner, CharWidth2);
+        var infoLines = details is null
+            ? [trackId is { } id ? $"TMX #{id}" : "not a TMX map"]
+            : WrapPieces(
+                [
+                    $"by {Fit(details.Author, 12, CharWidth1 * 0.9)}",
+                    $"{DifficultyColorCode(details.DifficultyLabel)}{details.DifficultyLabel}",
+                    $"$FC0{details.Awards} award{(details.Awards == 1 ? "" : "s")}",
+                    .. details.Tags.Take(1).Select(t => Fit(t, 8, CharWidth1 * 0.9)),
+                ], inner, CharWidth1 * 0.9);
 
-        var line2 = details is null
-            ? (trackId is { } id ? $"TMX #{id}" : "not a TMX map")
-            : $"by {details.Author}$z · {DifficultyColorCode(details.DifficultyLabel)}{details.DifficultyLabel}$z · $FC0{details.Awards} award{(details.Awards == 1 ? "" : "s")}"
-              + (details.Tags.Count > 0 ? $"$z · {details.Tags[0]}" : string.Empty);
-        b.Append($"<label posn=\"1 -5.7 0.02\" sizen=\"21 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(line2)}\"/>");
+        var height = 2.9 + 2.7 + infoLines.Count * 1.9 + 1.9 + 2.7;
+        AppendWidgetFrame(b, width, height, "Icons128x128_1", "NewTrack", title, ActionHudCollapseMap, collapsed: false);
+
+        var y = -3.0;
+        b.Append($"<label posn=\"0.8 {Inv(y)} 0.02\" sizen=\"{Inv(inner)} 2.6\" textsize=\"2\" text=\"{Esc(name)}\"/>");
+        y -= 2.7;
+
+        foreach (var line in infoLines)
+        {
+            b.Append($"<label posn=\"0.8 {Inv(y)} 0.02\" sizen=\"{Inv(inner / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(line)}\"/>");
+            y -= 1.9;
+        }
 
         var authorTime = currentMap?.AuthorTime ?? details?.AuthorTimeMs ?? 0;
-        var line3 = $"$0F0AT {FormatTime(authorTime)}"
+        var timesLine = $"$0F0AT {FormatTime(authorTime)}"
             + (details?.WrTimeMs is { } wr ? $"$z   $AAATMX WR $8DF{FormatTime(wr)}" : details is not null ? "$z   $AAANo TMX record yet" : string.Empty);
-        b.Append($"<label posn=\"1 -7.5 0.02\" sizen=\"21 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(line3)}\"/>");
+        b.Append($"<label posn=\"0.8 {Inv(y)} 0.02\" sizen=\"{Inv(inner / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(timesLine)}\"/>");
+        y -= 2.0;
 
-        // buttons
+        // buttons: TMX logo, Skip vote, Map vote - the panel is exactly as wide as they need
         var x = 0.8;
         void Button(double w, string text, string attributes)
         {
-            b.Append($"<quad posn=\"{Inv(x)} -9.4 0.02\" sizen=\"{Inv(w)} 2.2\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\" {attributes}/>");
-            b.Append($"<label posn=\"{Inv(x + w / 2)} -10.5 0.03\" sizen=\"{Inv(w)} 2\" halign=\"center\" valign=\"center\" textsize=\"1\" scale=\"0.85\" text=\"{Esc(text)}\"/>");
+            b.Append($"<quad posn=\"{Inv(x)} {Inv(y)} 0.02\" sizen=\"{Inv(w)} 2.2\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\" {attributes}/>");
+            b.Append($"<label posn=\"{Inv(x + w / 2)} {Inv(y - 1.1)} 0.03\" sizen=\"{Inv(w)} 2\" halign=\"center\" valign=\"center\" textsize=\"1\" scale=\"0.85\" text=\"{Esc(text)}\"/>");
             x += w + 0.4;
         }
 
         if (trackId is { } tmxId)
         {
-            // the TMX logo as the button, like Records Eyepiece's TMX tile
-            b.Append($"<quad posn=\"{Inv(x)} -9.4 0.02\" sizen=\"5.2 2.2\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\" url=\"{tmxRules.GetSiteUrl()}/trackshow/{tmxId}\"/>");
-            b.Append($"<quad posn=\"{Inv(x + 0.5)} -9.55 0.03\" sizen=\"4.2 1.9\" image=\"{AssetBaseUrl}/tmx-logo.png\"/>");
+            b.Append($"<quad posn=\"{Inv(x)} {Inv(y)} 0.02\" sizen=\"5.2 2.2\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\" url=\"{tmxRules.GetSiteUrl()}/trackshow/{tmxId}\"/>");
+            b.Append($"<quad posn=\"{Inv(x + 0.5)} {Inv(y - 0.15)} 0.03\" sizen=\"4.2 1.9\" image=\"{AssetBaseUrl}/tmx-logo.png\"/>");
             x += 5.6;
         }
 
@@ -1054,7 +1127,7 @@ internal sealed partial class RandomizerGame
         foreach (var (w, draw, attributes) in tiles)
         {
             sb.Append($"<frame posn=\"{Inv(x)} 0 0\">");
-            AppendBox(sb, w, height, attributes);
+            AppendBox(sb, w, height, attributes, underlay: "0003");
             draw(sb, w);
             sb.Append("</frame>");
             x += w + gap;
@@ -1150,13 +1223,13 @@ internal sealed partial class RandomizerGame
             return string.Empty;
         }
 
-        const double width = 24;
+        const double width = MapPanelWidth;
         var all = eventMode.AllMaps;
         var open = eventMode.OpenMaps;
         var winner = eventMode.EndedAt is not null ? eventMode.Standings().FirstOrDefault() : null;
         var title = winner is not null
-            ? $"{eventMode.Title} $AAA· winner $z{winner.Nickname}"
-            : $"{eventMode.Title} $AAA· {all.Count - open.Count}/{all.Count} done";
+            ? $"{Fit(eventMode.Title, 7, CharWidth1)} $AAA· winner $z{Fit(winner.Nickname, 7, CharWidth1)}"
+            : $"{Fit(eventMode.Title, 9, CharWidth1)} $AAA· {all.Count - open.Count}/{all.Count} done";
 
         var b = new StringBuilder();
         b.Append("<frame posn=\"-63.6 23.5 1\">");
@@ -1189,9 +1262,13 @@ internal sealed partial class RandomizerGame
         var y = -2.75;
         if (shown.Length == 0)
         {
-            b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"21 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"3F5F\" text=\"All maps finished - GG!\"/>");
+            b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv(width - 2)} 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"3F5F\" text=\"All maps finished - GG!\"/>");
             y -= LineHeight;
         }
+
+        const double nameX = 3.0;
+        const double tagWidth = 4.4;
+        var nameWidth = width - 0.8 - nameX - tagWidth - 0.3;
 
         for (var i = 0; i < shown.Length; i++)
         {
@@ -1199,7 +1276,7 @@ internal sealed partial class RandomizerGame
             var number = page * EventRowsPerPage + i + 1;
             var name = eventMapDetails.TryGetValue(map.TrackId, out var d) ? d.Name : $"TMX #{map.TrackId}";
             var tag = map.TrackId == runningHere ? "$0F0here"
-                : runningElsewhere.TryGetValue(map.TrackId, out var label) ? $"$FC0{label}"
+                : runningElsewhere.TryGetValue(map.TrackId, out var label) ? $"$FC0{Fit(label, tagWidth, CharWidth1 * 0.8)}"
                 : map.Unlimiter ? "$F80Unlim."
                 : d is not null ? $"$AAA{FormatTime(d.AuthorTimeMs)}" : string.Empty;
 
@@ -1211,27 +1288,28 @@ internal sealed partial class RandomizerGame
             // the whole row votes for the map
             b.Append($"<quad posn=\"0.4 {Inv(y + 0.15)} 0.016\" sizen=\"{Inv(width - 0.8)} {Inv(LineHeight)}\" bgcolor=\"0000\" action=\"{ActionEventRowBase + i}\"/>");
             b.Append($"<label posn=\"2.6 {Inv(y)} 0.02\" sizen=\"2.4 2\" halign=\"right\" textsize=\"1\" scale=\"0.9\" text=\"{number}.\"/>");
-            b.Append($"<label posn=\"3.0 {Inv(y)} 0.02\" sizen=\"{Inv(15 / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(name)}\"/>");
-            b.Append($"<label posn=\"{Inv(width - 0.8)} {Inv(y)} 0.02\" sizen=\"{Inv(5 / 0.8)} 2\" halign=\"right\" textsize=\"1\" scale=\"0.8\" text=\"{Esc(tag)}\"/>");
+            b.Append($"<label posn=\"{Inv(nameX)} {Inv(y)} 0.02\" sizen=\"{Inv(nameWidth / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(Fit(name, nameWidth, CharWidth1 * 0.9))}\"/>");
+            b.Append($"<label posn=\"{Inv(width - 0.8)} {Inv(y)} 0.02\" sizen=\"{Inv(tagWidth / 0.8)} 2\" halign=\"right\" textsize=\"1\" scale=\"0.8\" text=\"{Esc(tag)}\"/>");
             y -= LineHeight;
         }
 
         // pages
         y -= 0.3;
         b.Append($"<quad posn=\"0.8 {Inv(y + 0.1)} 0.02\" sizen=\"2 2\" style=\"Icons64x64_1\" substyle=\"ArrowPrev\" action=\"{ActionEventPagePrev}\"/>");
-        b.Append($"<label posn=\"{Inv(width / 2)} {Inv(y - 0.2)} 0.02\" sizen=\"14 2\" halign=\"center\" textsize=\"1\" scale=\"0.8\" textcolor=\"CCCF\" text=\"{Esc($"page {page + 1}/{pages} · {open.Count} open · click a map to vote")}\"/>");
+        b.Append($"<label posn=\"{Inv(width / 2)} {Inv(y - 0.2)} 0.02\" sizen=\"{Inv((width - 6) / 0.8)} 2\" halign=\"center\" textsize=\"1\" scale=\"0.8\" textcolor=\"CCCF\" text=\"{Esc($"{page + 1}/{pages} · {open.Count} open · click to vote")}\"/>");
         b.Append($"<quad posn=\"{Inv(width - 2.8)} {Inv(y + 0.1)} 0.02\" sizen=\"2 2\" style=\"Icons64x64_1\" substyle=\"ArrowNext\" action=\"{ActionEventPageNext}\"/>");
         y -= 2.1;
 
         if (others.Count > 0)
         {
-            b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv(22 / 0.8)} 2\" textsize=\"1\" scale=\"0.8\" textcolor=\"FC0F\" text=\"PLAYING ON OTHER SERVERS $AAA· click to join\"/>");
+            b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv((width - 2) / 0.8)} 2\" textsize=\"1\" scale=\"0.8\" textcolor=\"FC0F\" text=\"ON OTHER SERVERS $AAA· click to join\"/>");
             y -= 1.9;
             foreach (var server in others)
             {
                 var mapName = server.TrackId is { } sid && eventMapDetails.TryGetValue(sid, out var sd) ? sd.Name : server.MapName ?? "-";
                 b.Append($"<quad posn=\"0.4 {Inv(y + 0.15)} 0.016\" sizen=\"{Inv(width - 0.8)} {Inv(LineHeight)}\" bgcolor=\"0000\" manialink=\"tmtp://#join={Esc(server.Login)}\"/>");
-                b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv(16 / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc($"$FC0{server.Label}$z  {mapName}")}\"/>");
+                b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv(5 / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"FC0F\" text=\"{Esc(Fit(server.Label, 5, CharWidth1 * 0.9))}\"/>");
+                b.Append($"<label posn=\"6.2 {Inv(y)} 0.02\" sizen=\"{Inv(9 / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(Fit(mapName, 9, CharWidth1 * 0.9))}\"/>");
                 b.Append($"<label posn=\"{Inv(width - 0.8)} {Inv(y)} 0.02\" sizen=\"{Inv(5 / 0.8)} 2\" halign=\"right\" textsize=\"1\" scale=\"0.8\" text=\"{Esc($"{server.Players}/{server.MaxPlayers} $0F0join")}\"/>");
                 y -= LineHeight;
             }
@@ -1240,16 +1318,16 @@ internal sealed partial class RandomizerGame
         if (recent.Count > 0)
         {
             y -= 0.3;
-            b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv(22 / 0.8)} 2\" textsize=\"1\" scale=\"0.8\" textcolor=\"FC0F\" text=\"JUST FINISHED $AAA· map, first finisher, time\"/>");
+            b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv((width - 2) / 0.8)} 2\" textsize=\"1\" scale=\"0.8\" textcolor=\"FC0F\" text=\"JUST FINISHED $AAA· first finisher, time\"/>");
             y -= 1.9;
             foreach (var (trackId, finish) in recent)
             {
                 var mapName = eventMapDetails.TryGetValue(trackId, out var fd) ? fd.Name : $"#{trackId}";
                 var ago = DateTimeOffset.UtcNow - finish.At;
                 var agoText = ago.TotalMinutes < 1 ? "now" : ago.TotalHours < 1 ? $"{(int)ago.TotalMinutes}m" : $"{(int)ago.TotalHours}h";
-                b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv(9.6 / 0.85)} 2\" textsize=\"1\" scale=\"0.85\" text=\"{Esc(mapName)}\"/>");
-                b.Append($"<label posn=\"11 {Inv(y)} 0.02\" sizen=\"{Inv(6.6 / 0.85)} 2\" textsize=\"1\" scale=\"0.85\" text=\"{Esc(finish.Nickname)}\"/>");
-                b.Append($"<label posn=\"{Inv(width - 0.8)} {Inv(y)} 0.02\" sizen=\"{Inv(6 / 0.8)} 2\" halign=\"right\" textsize=\"1\" scale=\"0.8\" text=\"{Esc($"$3F5{FormatTime(finish.Time)} $AAA{agoText}")}\"/>");
+                b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv(7.6 / 0.85)} 2\" textsize=\"1\" scale=\"0.85\" text=\"{Esc(Fit(mapName, 7.6, CharWidth1 * 0.85))}\"/>");
+                b.Append($"<label posn=\"8.9 {Inv(y)} 0.02\" sizen=\"{Inv(5.4 / 0.85)} 2\" textsize=\"1\" scale=\"0.85\" text=\"{Esc(Fit(finish.Nickname, 5.4, CharWidth1 * 0.85))}\"/>");
+                b.Append($"<label posn=\"{Inv(width - 0.8)} {Inv(y)} 0.02\" sizen=\"{Inv(5.6 / 0.8)} 2\" halign=\"right\" textsize=\"1\" scale=\"0.8\" text=\"{Esc($"$3F5{FormatTime(finish.Time)} $AAA{agoText}")}\"/>");
                 y -= LineHeight;
             }
         }
@@ -1258,6 +1336,8 @@ internal sealed partial class RandomizerGame
         return b.ToString();
     }
 
+    // The checkpoint counter as in the sketches: one small pill "CP 3/7 -0.42" with up to ten
+    // progress bars under it. Left of the race clock by default, or centred above it (HUD menu).
     private string BuildCheckpointCounter(string login)
     {
         if (currentMapCheckpointTotal is not { } total || total <= 0)
@@ -1277,24 +1357,28 @@ internal sealed partial class RandomizerGame
         }
 
         current = Math.Min(current, total);
-        var splitText = split is { } s ? (s <= 0 ? $" $3F5-{FormatSplit(-s)}" : $" $F33+{FormatSplit(s)}") : string.Empty;
-        var text = $"CP {current}$AAA/{total}{splitText}";
+        var splitText = split is { } s ? (s <= 0 ? $"  $3F5-{FormatSplit(-s)}" : $"  $F33+{FormatSplit(s)}") : string.Empty;
+        var text = $"$FC0CP $FFF{current}$AAA/{total}{splitText}";
 
-        const double width = 10;
-        var b = new StringBuilder("<frame posn=\"-19 -41.6 1\">");
-        AppendBox(b, width, 4.2);
-        b.Append($"<label posn=\"{Inv(width / 2)} -1.4 0.01\" sizen=\"{Inv(width - 0.6)} 2\" halign=\"center\" valign=\"center\" textsize=\"1\" text=\"{Esc(text)}\"/>");
+        const double width = 9;
+        const double height = 3.4;
+        var aboveClock = hudSettings.Get(login).CpAboveClock;
+        var (x, y) = aboveClock ? (-width / 2, -37.4) : (-31.0, -43.8);
+
+        var b = new StringBuilder($"<frame posn=\"{Inv(x)} {Inv(y)} 1\">");
+        AppendBox(b, width, height);
+        b.Append($"<label posn=\"{Inv(width / 2)} -1.25 0.01\" sizen=\"{Inv((width - 0.6) / 0.9)} 2\" halign=\"center\" valign=\"center\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(text)}\"/>");
 
         // At most 10 bars; with more checkpoints each bar stands for an even share of them
         // (20 CPs: 2 each; 12 CPs: 1 or 2) and lights up once all of its share is passed.
         var bars = Math.Min(total, 10);
-        const double gap = 0.2;
-        var barWidth = (width - 1.2 - gap * (bars - 1)) / bars;
+        const double gap = 0.15;
+        var barWidth = (width - 1.4 - gap * (bars - 1)) / bars;
         for (var i = 0; i < bars; i++)
         {
             var threshold = (int)Math.Round((i + 1) * (double)total / bars, MidpointRounding.AwayFromZero);
             var lit = current >= threshold;
-            b.Append($"<quad posn=\"{Inv(0.6 + i * (barWidth + gap))} -2.75 0.01\" sizen=\"{Inv(barWidth)} 0.7\" bgcolor=\"{(lit ? "FC0F" : "FFF4")}\"/>");
+            b.Append($"<quad posn=\"{Inv(0.7 + i * (barWidth + gap))} -2.35 0.01\" sizen=\"{Inv(barWidth)} 0.45\" bgcolor=\"{(lit ? "FC0F" : "FFF5")}\"/>");
         }
 
         b.Append("</frame>");
@@ -1303,7 +1387,9 @@ internal sealed partial class RandomizerGame
 
     private static string FormatSplit(int ms) => (ms / 1000.0).ToString("0.00", CultureInfo.InvariantCulture);
 
-    private string BuildTimesBlock(string login)
+    // personal best, server best and TMX record on this map - a widget like the others (title bar,
+    // fold arrow), an icon per line and the TMX logo for the TMX record
+    private string BuildTimesBlock(string login, bool collapsed)
     {
         int? own;
         int? best;
@@ -1315,23 +1401,39 @@ internal sealed partial class RandomizerGame
             wr = currentMapDetailsTrackId == currentMapTrackId ? currentMapDetails?.WrTimeMs : null;
         }
 
-        var lines = new List<string>
-        {
-            $"PB: {(own is { } o ? "$3F5" + FormatTime(o) : "$AAA--")}",
-            $"Server: {(best is { } s ? "$FF0" + FormatTime(s) : "$AAA--")}",
-            $"TMX: {(wr is { } w ? "$8DF" + FormatTime(w) : "$AAA--")}",
-        };
+        const double width = 14;
+        var b = new StringBuilder($"<frame posn=\"{Inv(63.6 - width)} -13 1\">");
 
-        const double width = 13;
-        var b = new StringBuilder($"<frame posn=\"{Inv(63.6 - width)} -27 1\">");
-        AppendBox(b, width, 6.8);
-        var y = -0.7;
-        foreach (var line in lines)
+        if (collapsed)
         {
-            var parts = line.Split(": ", 2);
-            b.Append($"<label posn=\"1 {Inv(y)} 0.01\" sizen=\"6 2\" textsize=\"1\" textcolor=\"CCCF\" text=\"{Esc(parts[0])}\"/>");
-            b.Append($"<label posn=\"{Inv(width - 1)} {Inv(y)} 0.01\" sizen=\"7 2\" halign=\"right\" textsize=\"1\" text=\"{Esc(parts[1])}\"/>");
-            y -= 1.9;
+            AppendWidgetFrame(b, width, 2.8, "Icons64x64_1", "StarGold", "Times", ActionHudCollapseTimes, collapsed: true);
+            b.Append("</frame>");
+            return b.ToString();
+        }
+
+        AppendWidgetFrame(b, width, 9.3, "Icons64x64_1", "StarGold", "Times", ActionHudCollapseTimes, collapsed: false);
+
+        (string Icon, string Label, string Value)[] rows =
+        [
+            ("style=\"Icons64x64_1\" substyle=\"StarGold\"", "Your best", own is { } o ? "$3F5" + FormatTime(o) : "$AAA--"),
+            ("style=\"Icons128x128_1\" substyle=\"Rankings\"", "Server", best is { } sb ? "$FF0" + FormatTime(sb) : "$AAA--"),
+            ($"image=\"{AssetBaseUrl}/tmx-logo.png\"", string.Empty, wr is { } w ? "$8DF" + FormatTime(w) : "$AAA--"),
+        ];
+
+        var y = -3.1;
+        foreach (var (icon, label, value) in rows)
+        {
+            var isLogo = label.Length == 0;
+            b.Append(isLogo
+                ? $"<quad posn=\"0.8 {Inv(y + 0.1)} 0.02\" sizen=\"4 1.8\" {icon}/>"
+                : $"<quad posn=\"0.9 {Inv(y + 0.15)} 0.02\" sizen=\"1.9 1.9\" {icon}/>");
+            if (!isLogo)
+            {
+                b.Append($"<label posn=\"3.2 {Inv(y)} 0.02\" sizen=\"6 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"DDDF\" text=\"{Esc(label)}\"/>");
+            }
+
+            b.Append($"<label posn=\"{Inv(width - 0.9)} {Inv(y)} 0.02\" sizen=\"7 2\" halign=\"right\" textsize=\"1\" text=\"{Esc(value)}\"/>");
+            y -= 2.0;
         }
 
         b.Append("</frame>");

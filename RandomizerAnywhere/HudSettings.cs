@@ -24,6 +24,9 @@ internal sealed class HudPrefs
     // F7: everything off at once, for racing
     public bool AllHidden { get; set; }
 
+    // the checkpoint counter centred above the race clock instead of left of it
+    public bool CpAboveClock { get; set; }
+
     public bool Shows(HudPart part) => !AllHidden && !Hidden.Contains(part);
 }
 
@@ -70,7 +73,7 @@ internal sealed class HudSettings
             var p = prefs.GetValueOrDefault(login);
             return p is null
                 ? new HudPrefs()
-                : new HudPrefs { Hidden = [.. p.Hidden], Collapsed = [.. p.Collapsed], AllHidden = p.AllHidden };
+                : new HudPrefs { Hidden = [.. p.Hidden], Collapsed = [.. p.Collapsed], AllHidden = p.AllHidden, CpAboveClock = p.CpAboveClock };
         }
     }
 
@@ -89,7 +92,7 @@ internal sealed class HudSettings
             change(p);
 
             // nothing worth keeping - don't grow the file with defaults
-            if (p.Hidden.Count == 0 && p.Collapsed.Count == 0 && !p.AllHidden)
+            if (p.Hidden.Count == 0 && p.Collapsed.Count == 0 && !p.AllHidden && !p.CpAboveClock)
             {
                 prefs.Remove(login);
             }
