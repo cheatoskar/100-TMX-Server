@@ -84,4 +84,21 @@ internal sealed class GlobalConfig
 
     // the preset the servers switch to once every event map is finished; empty = stay
     public string EventAfterPreset { get; set; } = string.Empty;
+
+    // Which event maps this server plays: "skip" Unlimiter maps (vanilla clients can't load them),
+    // "only" Unlimiter maps, or "include" both. Empty = "only" with EventUnlimiter, else "skip".
+    public string EventUnlimiterMaps { get; set; } = string.Empty;
+
+    // The list as an everyday "open maps" panel instead of an event: it never ends, the server
+    // falls back to its normal pool while the list is empty, and a map finished here comes back
+    // after a day if TMX still has no record for it (nobody uploaded the replay).
+    public bool EventEveryday { get; set; }
+
+    // Servers on different machines share the event list and one leaderboard through one of them,
+    // the hub. On the hub: SyncToken (and SyncAllowedIps, comma-separated, to accept only the
+    // other servers). On every other server: SyncHubUrl (the hub's status page address, e.g.
+    // http://game.100tmx.com:8090) and the same SyncToken.
+    public string SyncHubUrl { get; set; } = string.Empty;
+    public string SyncToken { get; set; } = string.Empty;
+    public string SyncAllowedIps { get; set; } = string.Empty;
 }

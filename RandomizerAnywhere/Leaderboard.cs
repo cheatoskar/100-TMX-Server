@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using RandomizerAnywhere.Config;
 
 namespace RandomizerAnywhere;
@@ -30,11 +30,28 @@ internal sealed class Leaderboard
     // write time of the file as last read or written by this process
     private DateTime loadedWriteTimeUtc;
 
-    public Leaderboard(AppConfig config)
+    // On a server that isn't the hub (SyncHubUrl set) the leaderboard lives on the hub: finishes are
+    // sent there, and the board shown here is the hub's, fetched every few seconds. A finish the hub
+    // doesn't take (it is restarting, the network hiccups) waits in leaderboard-pending.json and is
+    // sent again - a finish is never just dropped.
+    private readonly SyncClient? sync;
+    private readonly List<SyncFinish> pending = [];
+
+    // one sync at a time: two at once would both send the first pending finish
+    private readonly SemaphoreSlim syncGate = new(1, 1);
+    private DateTime lastSyncWarning;
+
+    // the hub's memory of finish ids it already counted (see SyncFinish.Id)
+    private readonly HashSet<string> countedIds = [];
+    private readonly Queue<string> countedOrder = new();
+    private string PendingPath => Path.Combine(Path.GetDirectoryName(filePath)!, "leaderboard-pending.json");
+
+    public Leaderboard(AppConfig config, SyncClient sync)
         : this(string.IsNullOrWhiteSpace(config.LeaderboardFile)
             ? Path.Combine(AppContext.BaseDirectory, "leaderboard.json")
             : config.LeaderboardFile)
     {
+        this.sync = sync;
     }
 
     internal Leaderboard(string filePath)
@@ -42,9 +59,22 @@ internal sealed class Leaderboard
         this.filePath = Path.GetFullPath(filePath);
     }
 
+    private bool Remote => sync is { Enabled: true };
+
     public string FilePath => filePath;
 
-    public Task LoadAsync(CancellationToken cancellationToken = default)
+    public async Task LoadAsync(CancellationToken cancellationToken = default)
+    {
+        if (Remote)
+        {
+            await LoadRemoteAsync(cancellationToken);
+            return;
+        }
+
+        await LoadLocalAsync();
+    }
+
+    private Task LoadLocalAsync()
     {
         Console.WriteLine($"Leaderboard: {filePath}");
 
@@ -145,7 +175,214 @@ internal sealed class Leaderboard
         TryLoadFrom(filePath, quiet: true);
     }
 
+    // ---- shared through the hub ----
+
+    private async Task LoadRemoteAsync(CancellationToken cancellationToken)
+    {
+        Console.WriteLine("Leaderboard: shared, kept by the hub (SyncHubUrl).");
+
+        // finishes that didn't reach the hub before the last stop
+        if (File.Exists(PendingPath))
+        {
+            try
+            {
+                var saved = JsonSerializer.Deserialize<List<SyncFinish>>(await File.ReadAllTextAsync(PendingPath, cancellationToken)) ?? [];
+                lock (gate)
+                {
+                    pending.AddRange(saved);
+                }
+            }
+            catch (Exception ex) when (ex is JsonException or IOException)
+            {
+                AtomicFile.QuarantineCorrupt(PendingPath);
+                Console.WriteLine($"Warning: leaderboard-pending.json couldn't be read - {ex.Message}");
+            }
+        }
+
+        // This server counted on its own before it joined the hub: those finishes move over once,
+        // and the file is renamed so they are never sent twice.
+        if (File.Exists(filePath) && TryLoadFrom(filePath, quiet: true))
+        {
+            List<SyncFinish> local;
+            lock (gate)
+            {
+                local = [.. entries.Select(kv => new SyncFinish(kv.Key, kv.Value.LastNickname, kv.Value.RawNickname, kv.Value.Finishes, Guid.NewGuid().ToString("N")))];
+                entries.Clear();
+            }
+
+            lock (gate)
+            {
+                pending.AddRange(local);
+            }
+
+            await SavePendingAsync();
+            File.Move(filePath, filePath + ".moved-to-hub", overwrite: true);
+            Console.WriteLine($"Leaderboard: {local.Sum(f => f.Count)} finish(es) of {local.Count} player(s) from this server's own leaderboard go to the hub.");
+        }
+
+        await SyncWithHubAsync(cancellationToken);
+    }
+
+    // Sends what is pending, then takes the hub's board. Called every few seconds.
+    public async Task SyncWithHubAsync(CancellationToken cancellationToken)
+    {
+        if (!Remote)
+        {
+            return;
+        }
+
+        await syncGate.WaitAsync(cancellationToken);
+        try
+        {
+            while (true)
+            {
+                SyncFinish? next;
+                lock (gate)
+                {
+                    next = pending.Count > 0 ? pending[0] : null;
+                }
+
+                if (next is null)
+                {
+                    break;
+                }
+
+                await sync!.PostFinishesAsync(next, cancellationToken);
+                lock (gate)
+                {
+                    pending.RemoveAt(0);
+                }
+
+                await SavePendingAsync();
+            }
+
+            var board = await sync!.GetLeaderboardAsync(cancellationToken);
+            lock (gate)
+            {
+                entries.Clear();
+                foreach (var (login, entry) in board)
+                {
+                    entries[login] = entry;
+                }
+
+                // what is still on its way counts already, so a player sees their finish at once
+                foreach (var finish in pending)
+                {
+                    AddLocally(finish.Login, finish.Nickname, finish.RawNickname, finish.Count);
+                }
+            }
+        }
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            Diagnostics.Trace($"leaderboard hub sync: {ex.Message}");
+
+            // finishes that don't get through are worth a line in the log, at most every 10 min
+            int waiting;
+            lock (gate)
+            {
+                waiting = pending.Count;
+            }
+
+            if (waiting > 0 && DateTime.UtcNow - lastSyncWarning > TimeSpan.FromMinutes(10))
+            {
+                lastSyncWarning = DateTime.UtcNow;
+                Console.WriteLine($"Warning: {waiting} finish(es) wait for the leaderboard hub - {ex.Message}. Kept in leaderboard-pending.json and sent again.");
+            }
+        }
+        finally
+        {
+            syncGate.Release();
+        }
+    }
+
+    public async Task RunHubSyncLoopAsync(TimeSpan interval, CancellationToken cancellationToken)
+    {
+        while (Remote)
+        {
+            await Task.Delay(interval, cancellationToken);
+            await SyncWithHubAsync(cancellationToken);
+        }
+    }
+
+    private void AddLocally(string login, string nickname, string rawNickname, int count)
+    {
+        var finishes = entries.TryGetValue(login, out var existing) ? existing.Finishes + count : count;
+        entries[login] = new LeaderboardEntry(nickname, finishes, rawNickname);
+    }
+
+    private async Task SavePendingAsync()
+    {
+        string json;
+        lock (gate)
+        {
+            json = JsonSerializer.Serialize(pending);
+        }
+
+        try
+        {
+            await AtomicFile.WriteAllTextAsync(PendingPath, json);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Warning: couldn't save leaderboard-pending.json - {ex.Message}");
+        }
+    }
+
+    // ---- the hub's side (SyncHub) ----
+
+    public Dictionary<string, LeaderboardEntry> Snapshot()
+    {
+        RefreshIfChanged();
+        lock (gate)
+        {
+            return new Dictionary<string, LeaderboardEntry>(entries);
+        }
+    }
+
     public async Task RecordFinishAsync(string login, string nickname, string rawNickname, CancellationToken cancellationToken = default)
+    {
+        if (Remote)
+        {
+            var finish = new SyncFinish(login, nickname, rawNickname, 1, Guid.NewGuid().ToString("N"));
+            lock (gate)
+            {
+                pending.Add(finish);
+                AddLocally(login, nickname, rawNickname, 1);
+            }
+
+            await SavePendingAsync();
+            _ = SyncWithHubAsync(CancellationToken.None);
+            return;
+        }
+
+        await AddFinishesAsync(login, nickname, rawNickname, 1);
+    }
+
+    // a finish another server sent; one it sent before (same id) is not counted again
+    public async Task AddRemoteFinishesAsync(SyncFinish finish)
+    {
+        if (!string.IsNullOrEmpty(finish.Id))
+        {
+            lock (gate)
+            {
+                if (!countedIds.Add(finish.Id))
+                {
+                    return;
+                }
+
+                countedOrder.Enqueue(finish.Id);
+                if (countedOrder.Count > 5000)
+                {
+                    countedIds.Remove(countedOrder.Dequeue());
+                }
+            }
+        }
+
+        await AddFinishesAsync(finish.Login, finish.Nickname, finish.RawNickname, Math.Clamp(finish.Count, 1, 100000));
+    }
+
+    // count finishes into the local file (this server's own, or as the hub for another server)
+    public async Task AddFinishesAsync(string login, string nickname, string rawNickname, int count)
     {
         // no cancellation inside: a finish that was counted must also be saved
         using var fileLock = await AcquireFileLockAsync();
@@ -155,8 +392,7 @@ internal sealed class Leaderboard
 
         lock (gate)
         {
-            var finishes = entries.TryGetValue(login, out var existing) ? existing.Finishes + 1 : 1;
-            entries[login] = new LeaderboardEntry(nickname, finishes, rawNickname);
+            AddLocally(login, nickname, rawNickname, count);
         }
 
         await SaveAsync();
@@ -164,7 +400,10 @@ internal sealed class Leaderboard
 
     public IReadOnlyList<LeaderboardEntry> GetTop(int count)
     {
-        RefreshIfChanged();
+        if (!Remote)
+        {
+            RefreshIfChanged();
+        }
 
         lock (gate)
         {
@@ -177,7 +416,10 @@ internal sealed class Leaderboard
 
     public (int Position, int Finishes)? GetRank(string login)
     {
-        RefreshIfChanged();
+        if (!Remote)
+        {
+            RefreshIfChanged();
+        }
 
         lock (gate)
         {

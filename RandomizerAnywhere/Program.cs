@@ -54,6 +54,7 @@ try
 
     var leaderboard = provider.GetRequiredService<Leaderboard>();
     await leaderboard.LoadAsync(cts.Token);
+    _ = leaderboard.RunHubSyncLoopAsync(TimeSpan.FromSeconds(15), cts.Token);
 
     var eventMode = provider.GetRequiredService<EventMode>();
     await eventMode.LoadAsync(cts.Token);
@@ -70,7 +71,11 @@ try
         _ = provider.GetRequiredService<TmxRules>().RunPoolCopyRefreshAsync(cts.Token);
 
         var statusDir = Path.Combine(AppContext.BaseDirectory, "WebStatus");
-        var replayServer = new ReplayServer(serverSetup.ReplaysDir, statusDir, appConfig.ReplayServerPort, appConfig.ServerName, appConfig.FavoriteLogin);
+        var syncHub = new SyncHub(appConfig, leaderboard, eventMode);
+        var replayServer = new ReplayServer(serverSetup.ReplaysDir, statusDir, appConfig.ReplayServerPort, appConfig.ServerName, appConfig.FavoriteLogin)
+        {
+            ExtraRoutes = syncHub.Map,
+        };
 
         // The web page (replays, status.json) is an extra - a port already in use must not stop
         // the game server, or it crash-loops through the whole setup every 5 seconds.
@@ -176,6 +181,7 @@ finally
 [Singleton(typeof(ImpossibleMaps))]
 [Singleton(typeof(SkippedMaps))]
 [Singleton(typeof(DiscordNotifier))]
+[Singleton(typeof(SyncClient))]
 [Singleton(typeof(Leaderboard))]
 [Singleton(typeof(MapPool))]
 [Singleton(typeof(PoolCache))]
@@ -302,6 +308,17 @@ internal partial class AppServiceProvider
                 ? globalConfig.EventTmxQuery
                 : new Dictionary<string, object> { ["inhasrecord"] = 0, ["inunlimiter"] = 0 },
             EventAfterPreset = Configurator.GetString(globalConfig.EventAfterPreset, cmdValue: null, "RANDANY_EVENT_AFTER_PRESET"),
+            EventUnlimiterMaps = Configurator.GetString(globalConfig.EventUnlimiterMaps, cmdValue: null, "RANDANY_EVENT_UNLIMITER_MAPS").Trim().ToLowerInvariant() switch
+            {
+                "only" => "only",
+                "include" => "include",
+                "skip" => "skip",
+                _ => Configurator.GetBool(globalConfig.EventUnlimiter, cmdValue: null, "RANDANY_EVENT_UNLIMITER") ? "only" : "skip",
+            },
+            EventEveryday = Configurator.GetBool(globalConfig.EventEveryday, cmdValue: null, "RANDANY_EVENT_EVERYDAY"),
+            SyncHubUrl = Configurator.GetString(globalConfig.SyncHubUrl, cmdValue: null, "RANDANY_SYNC_HUB_URL").Trim().TrimEnd('/'),
+            SyncToken = Configurator.GetString(globalConfig.SyncToken, cmdValue: null, "RANDANY_SYNC_TOKEN").Trim(),
+            SyncAllowedIps = Configurator.GetString(globalConfig.SyncAllowedIps, cmdValue: null, "RANDANY_SYNC_ALLOWED_IPS"),
         };
 
         if (!string.IsNullOrWhiteSpace(globalConfig.Preset))

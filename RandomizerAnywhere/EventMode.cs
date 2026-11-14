@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using RandomizerAnywhere.Config;
@@ -39,7 +40,14 @@ internal sealed class EventMode
     // with EventMapsSource = "tmx": the list as TMX last answered it (kept in the shared state file,
     // so every server works from the same list), and when it was refreshed
     private List<int> tmxPool = [];
+    private HashSet<int> tmxUnlimiter = [];
     private DateTimeOffset? tmxPoolUpdated;
+
+    // the state's revision as last read or written (see StateFileModel.Revision)
+    private long revision;
+
+    // set (SyncHubUrl): the state lives on the hub, not in StateFile
+    private readonly SyncClient sync;
 
     // set once, by whichever server saw the last open map finished; the end of the event for all
     private DateTimeOffset? endedAt;
@@ -51,10 +59,17 @@ internal sealed class EventMode
     // progress changed, so the widgets can be refreshed.
     public event Action? Changed;
 
-    public EventMode(AppConfig config)
+    public EventMode(AppConfig config, SyncClient sync)
     {
         this.config = config;
+        this.sync = sync;
     }
+
+    private bool Remote => sync.Enabled;
+
+    private DateTime lastHubWarning;
+
+    public bool Everyday => config.EventEveryday;
 
     public bool Enabled => config.EventEnabled;
 
@@ -136,7 +151,7 @@ internal sealed class EventMode
     // Maps stay in the list once in it - finished ones as done; one TMX no longer lists and nobody
     // here finished (a record came from elsewhere) leaves it; new uploads are added at the end.
     // A list cut short (complete = false) only adds, it never removes.
-    public async Task MergeTmxPoolAsync(IReadOnlyList<int> fetched, bool complete)
+    public async Task MergeTmxPoolAsync(IReadOnlyList<int> fetched, bool complete, IReadOnlyCollection<int>? unlimiterIds = null)
     {
         if (!Enabled || !UsesTmxSource)
         {
@@ -147,6 +162,8 @@ internal sealed class EventMode
 
         await UpdateStateAsync(() =>
         {
+            changed = false;
+
             // another server refreshed it while this one asked TMX
             if (tmxPoolUpdated is { } updated && DateTimeOffset.UtcNow - updated < TimeSpan.FromMinutes(config.EventTmxRefreshMinutes) / 2)
             {
@@ -154,7 +171,7 @@ internal sealed class EventMode
             }
 
             var fresh = fetched.ToHashSet();
-            var kept = tmxPool.Where(id => finished.ContainsKey(id) || fresh.Contains(id) || !complete).ToList();
+            var kept = tmxPool.Where(id => (finished.ContainsKey(id) && !Everyday) || fresh.Contains(id) || !complete).ToList();
             var added = fetched.Where(id => !kept.Contains(id)).ToList();
             var merged = kept.Concat(added).ToList();
 
@@ -164,9 +181,26 @@ internal sealed class EventMode
                 Console.WriteLine($"Event: TMX list refreshed - {merged.Count} map(s), {added.Count} new, {tmxPool.Count - kept.Count} gone (record from elsewhere).");
             }
 
+            if (unlimiterIds is not null)
+            {
+                var flagged = merged.Where(unlimiterIds.Contains).ToHashSet();
+                changed |= !flagged.SetEquals(tmxUnlimiter);
+                tmxUnlimiter = flagged;
+            }
+
             tmxPool = merged;
             tmxPoolUpdated = DateTimeOffset.UtcNow;
-            maps = [.. tmxPool.Select(id => new EventMap(id, false))];
+
+            if (Everyday)
+            {
+                // a finish on a map that left the list (its record is on TMX now) is history
+                var listed = merged.ToHashSet();
+                foreach (var id in finished.Keys.Where(id => !listed.Contains(id)).ToList())
+                {
+                    finished.Remove(id);
+                }
+            }
+            maps = [.. tmxPool.Select(id => new EventMap(id, tmxUnlimiter.Contains(id)))];
         });
 
         if (changed)
@@ -178,7 +212,7 @@ internal sealed class EventMode
     // Ends the event when no open map is left. True for the one call that ended it.
     public async Task<bool> TryEndAsync()
     {
-        if (!Enabled)
+        if (!Enabled || Everyday)
         {
             return false;
         }
@@ -187,6 +221,7 @@ internal sealed class EventMode
 
         await UpdateStateAsync(() =>
         {
+            ended = false;
             if (endedAt is null && maps.Count > 0 && maps.All(m => finished.ContainsKey(m.TrackId)))
             {
                 endedAt = DateTimeOffset.UtcNow;
@@ -226,15 +261,16 @@ internal sealed class EventMode
         }
     }
 
-    // The open maps this server is meant to play: an Unlimiter server only the Unlimiter maps,
-    // every other server only the normal ones (a client without the mod can't load the others).
+    // The open maps this server is meant to play (EventUnlimiterMaps): a vanilla server skips the
+    // Unlimiter maps (a client without the mod can't load them), an Unlimiter server plays only
+    // those or all of them.
     public IReadOnlyList<EventMap> OpenMapsForThisServer
     {
         get
         {
             lock (gate)
             {
-                return [.. maps.Where(m => !finished.ContainsKey(m.TrackId) && m.Unlimiter == config.EventUnlimiter)];
+                return [.. maps.Where(m => !finished.ContainsKey(m.TrackId) && PlaysHere(m))];
             }
         }
     }
@@ -242,6 +278,13 @@ internal sealed class EventMode
     // What this server should draw its next map from: its open maps minus the ones another server
     // is playing right now, so two servers never run the same map at once. When only maps that
     // run elsewhere are left, those come back rather than nothing.
+    public bool PlaysHere(EventMap map) => config.EventUnlimiterMaps switch
+    {
+        "only" => map.Unlimiter,
+        "include" => true,
+        _ => !map.Unlimiter,
+    };
+
     public IReadOnlyList<int> PickableIds()
     {
         var open = OpenMapsForThisServer.Select(m => m.TrackId).ToList();
@@ -313,14 +356,13 @@ internal sealed class EventMode
         }
 
         ReloadMapsIfChanged(force: true);
-        ReloadStateIfChanged(force: true);
+        await ReloadStateAsync(force: true);
 
         lock (gate)
         {
-            Console.WriteLine($"Event: '{Title}' - {maps.Count} map(s) {(UsesTmxSource ? "from TMX (refreshed every " + config.EventTmxRefreshMinutes + " min)" : "in " + MapsFile)}, {maps.Count(m => finished.ContainsKey(m.TrackId))} finished (progress in {StateFile}), this server is '{ServerLabel}'{(config.EventUnlimiter ? " (Unlimiter maps)" : string.Empty)}{(endedAt is not null ? " - already finished" : string.Empty)}.");
+            Console.WriteLine($"Event: '{Title}' - {maps.Count} map(s) {(UsesTmxSource ? "from TMX (refreshed every " + config.EventTmxRefreshMinutes + " min)" : "in " + MapsFile)}, {maps.Count(m => finished.ContainsKey(m.TrackId))} finished (progress in {StateFile}), this server is '{ServerLabel}' (Unlimiter maps: {config.EventUnlimiterMaps}){(Everyday ? ", everyday list" : string.Empty)}{(Remote ? ", shared through the hub " + config.SyncHubUrl : string.Empty)}{(endedAt is not null ? " - already finished" : string.Empty)}.");
         }
 
-        await Task.CompletedTask;
     }
 
     public async Task RunReloadLoopAsync(TimeSpan interval, CancellationToken cancellationToken = default)
@@ -337,7 +379,8 @@ internal sealed class EventMode
             try
             {
                 var changed = ReloadMapsIfChanged(force: false);
-                changed |= ReloadStateIfChanged(force: false);
+                changed |= await ReloadStateAsync(force: false);
+                changed |= await ForgetStaleFinishesAsync();
 
                 if (changed)
                 {
@@ -363,6 +406,7 @@ internal sealed class EventMode
 
         await UpdateStateAsync(() =>
         {
+            isFirst = false;
             if (!finished.ContainsKey(trackId))
             {
                 finished[trackId] = new EventFinish(login, nickname, time, DateTimeOffset.UtcNow, ServerLabel);
@@ -376,6 +420,51 @@ internal sealed class EventMode
         }
 
         return isFirst;
+    }
+
+    // Everyday list: a map finished here but still without a TMX record a day later (nobody
+    // uploaded the replay) is open again. Only maps TMX still lists count - a map that got its
+    // record leaves the list at the next TMX refresh anyway.
+    public static readonly TimeSpan EverydayFinishKeptFor = TimeSpan.FromDays(1);
+    private DateTimeOffset lastStaleCheck;
+
+    private async Task<bool> ForgetStaleFinishesAsync()
+    {
+        if (!Everyday || DateTimeOffset.UtcNow - lastStaleCheck < TimeSpan.FromMinutes(10))
+        {
+            return false;
+        }
+
+        lastStaleCheck = DateTimeOffset.UtcNow;
+
+        bool any;
+        lock (gate)
+        {
+            any = finished.Any(kv => DateTimeOffset.UtcNow - kv.Value.At > EverydayFinishKeptFor);
+        }
+
+        if (!any)
+        {
+            return false;
+        }
+
+        var removed = 0;
+        await UpdateStateAsync(() =>
+        {
+            var stale = finished.Where(kv => DateTimeOffset.UtcNow - kv.Value.At > EverydayFinishKeptFor).Select(kv => kv.Key).ToList();
+            removed = stale.Count;
+            foreach (var id in stale)
+            {
+                finished.Remove(id);
+            }
+        });
+
+        if (removed > 0)
+        {
+            Console.WriteLine($"Open maps: {removed} map(s) finished more than a day ago still have no TMX record - open again.");
+        }
+
+        return removed > 0;
     }
 
     // this server's heartbeat: what it plays and how full it is
@@ -491,12 +580,50 @@ internal sealed class EventMode
 
     private sealed class StateFileModel
     {
+        // +1 on every write; a write through the hub only goes through on the revision it read
+        public long Revision { get; set; }
         public Dictionary<string, EventFinish> Finished { get; set; } = [];
         public Dictionary<string, EventServerInfo> Servers { get; set; } = [];
         public List<int> TmxPool { get; set; } = [];
+        public List<int> TmxUnlimiter { get; set; } = [];
         public DateTimeOffset? TmxPoolUpdated { get; set; }
         public DateTimeOffset? EndedAt { get; set; }
     }
+
+    private static readonly JsonSerializerOptions StateJson = new() { WriteIndented = true };
+
+    // memory <- model; call under gate
+    private void ApplyModel(StateFileModel model)
+    {
+        revision = model.Revision;
+        finished = model.Finished
+            .Where(kv => int.TryParse(kv.Key, out _))
+            .ToDictionary(kv => int.Parse(kv.Key), kv => kv.Value);
+        servers = new Dictionary<string, EventServerInfo>(model.Servers, StringComparer.OrdinalIgnoreCase);
+        tmxPool = model.TmxPool;
+        tmxUnlimiter = [.. model.TmxUnlimiter];
+        tmxPoolUpdated = model.TmxPoolUpdated;
+        endedAt = model.EndedAt;
+
+        if (UsesTmxSource)
+        {
+            maps = [.. tmxPool.Select(id => new EventMap(id, tmxUnlimiter.Contains(id)))];
+        }
+    }
+
+    // model <- memory; call under gate
+    private StateFileModel BuildModel() => new()
+    {
+        Revision = revision,
+        Finished = finished.ToDictionary(kv => kv.Key.ToString(CultureInfo.InvariantCulture), kv => kv.Value),
+        Servers = new Dictionary<string, EventServerInfo>(servers),
+        TmxPool = [.. tmxPool],
+        TmxUnlimiter = [.. tmxUnlimiter],
+        TmxPoolUpdated = tmxPoolUpdated,
+        EndedAt = endedAt,
+    };
+
+    private Task<bool> ReloadStateAsync(bool force) => Remote ? ReloadRemoteStateAsync(force) : Task.FromResult(ReloadStateIfChanged(force));
 
     private bool ReloadStateIfChanged(bool force)
     {
@@ -514,18 +641,7 @@ internal sealed class EventMode
 
             lock (gate)
             {
-                finished = model.Finished
-                    .Where(kv => int.TryParse(kv.Key, out _))
-                    .ToDictionary(kv => int.Parse(kv.Key), kv => kv.Value);
-                servers = new Dictionary<string, EventServerInfo>(model.Servers, StringComparer.OrdinalIgnoreCase);
-                tmxPool = model.TmxPool;
-                tmxPoolUpdated = model.TmxPoolUpdated;
-                endedAt = model.EndedAt;
-
-                if (UsesTmxSource)
-                {
-                    maps = [.. tmxPool.Select(id => new EventMap(id, false))];
-                }
+                ApplyModel(model);
             }
 
             stateWriteTimeUtc = writeTime;
@@ -539,9 +655,45 @@ internal sealed class EventMode
         }
     }
 
-    // read-modify-write of the shared state file under the cross-process lock
+    // the hub's copy, when it moved on since the last look
+    private async Task<bool> ReloadRemoteStateAsync(bool force)
+    {
+        try
+        {
+            using var budget = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var model = JsonSerializer.Deserialize<StateFileModel>(await sync.GetEventStateAsync(budget.Token)) ?? new StateFileModel();
+
+            lock (gate)
+            {
+                if (!force && model.Revision == revision)
+                {
+                    return false;
+                }
+
+                ApplyModel(model);
+            }
+
+            return true;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
+        {
+            Diagnostics.Trace($"event state from the hub: {ex.Message}");
+            return false;
+        }
+    }
+
+    // Read-modify-write of the shared state: under the cross-process lock on the local file, or
+    // through the hub, where a write only lands on the revision it was based on - when another
+    // server wrote in between, read again and redo the change. modify() may therefore run more
+    // than once and must set every outcome it reports (not just flip it on).
     private async Task UpdateStateAsync(Action modify)
     {
+        if (Remote)
+        {
+            await UpdateRemoteStateAsync(modify);
+            return;
+        }
+
         using var fileLock = await AcquireFileLockAsync();
 
         ReloadStateIfChanged(force: false);
@@ -550,18 +702,71 @@ internal sealed class EventMode
         lock (gate)
         {
             modify();
-            model = new StateFileModel
-            {
-                Finished = finished.ToDictionary(kv => kv.Key.ToString(), kv => kv.Value),
-                Servers = new Dictionary<string, EventServerInfo>(servers),
-                TmxPool = [.. tmxPool],
-                TmxPoolUpdated = tmxPoolUpdated,
-                EndedAt = endedAt,
-            };
+            revision++;
+            model = BuildModel();
         }
 
+        await WriteStateFileAsync(model);
+    }
+
+    private async Task UpdateRemoteStateAsync(Action modify)
+    {
+        for (var attempt = 0; attempt < 5; attempt++)
+        {
+            try
+            {
+                using var budget = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                var current = JsonSerializer.Deserialize<StateFileModel>(await sync.GetEventStateAsync(budget.Token)) ?? new StateFileModel();
+
+                string json;
+                long baseRevision;
+                lock (gate)
+                {
+                    ApplyModel(current);
+                    baseRevision = revision;
+                    modify();
+                    json = JsonSerializer.Serialize(BuildModel(), StateJson);
+                }
+
+                if (await sync.PutEventStateAsync(baseRevision, json, budget.Token) is { } written)
+                {
+                    lock (gate)
+                    {
+                        revision = written;
+                    }
+
+                    return;
+                }
+
+                // another server wrote first - take its state and do the change again
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException or InvalidOperationException)
+            {
+                // the hub is away: the change stays in this server's memory only and the next
+                // read from the hub replaces it
+                Diagnostics.Trace($"event hub update failed: {ex.Message}");
+                if (DateTime.UtcNow - lastHubWarning > TimeSpan.FromMinutes(10))
+                {
+                    lastHubWarning = DateTime.UtcNow;
+                    Console.WriteLine($"Warning: the event hub can't be reached ({ex.Message}) - this server shows what it last had and keeps trying.");
+                }
+
+                lock (gate)
+                {
+                    modify();
+                }
+
+                return;
+            }
+        }
+
+        Console.WriteLine("Warning: the event hub kept changing under this server's update - gave up after 5 tries.");
+    }
+
+    private async Task WriteStateFileAsync(StateFileModel model)
+    {
         Directory.CreateDirectory(Path.GetDirectoryName(StateFile)!);
-        await AtomicFile.WriteAllTextAsync(StateFile, JsonSerializer.Serialize(model, new JsonSerializerOptions { WriteIndented = true }));
+        await AtomicFile.WriteAllTextAsync(StateFile, JsonSerializer.Serialize(model, StateJson));
 
         try
         {
@@ -571,6 +776,47 @@ internal sealed class EventMode
         {
             // the next reload just reads it again
         }
+    }
+
+    // ---- the hub's side (SyncHub) ----
+
+    public string ExportStateJson()
+    {
+        ReloadStateIfChanged(force: false);
+        lock (gate)
+        {
+            return JsonSerializer.Serialize(BuildModel(), StateJson);
+        }
+    }
+
+    // Another server's write: taken only when it was based on the current revision. Returns the
+    // new revision, or null when someone else wrote first (the caller reads again and retries).
+    public async Task<long?> ImportStateAsync(string json, long baseRevision)
+    {
+        var incoming = JsonSerializer.Deserialize<StateFileModel>(json) ?? throw new JsonException("empty state");
+
+        StateFileModel model;
+        using (await AcquireFileLockAsync())
+        {
+            ReloadStateIfChanged(force: false);
+
+            lock (gate)
+            {
+                if (revision != baseRevision)
+                {
+                    return null;
+                }
+
+                incoming.Revision = baseRevision + 1;
+                ApplyModel(incoming);
+                model = BuildModel();
+            }
+
+            await WriteStateFileAsync(model);
+        }
+
+        RaiseChanged();
+        return model.Revision;
     }
 
     private async Task<IDisposable?> AcquireFileLockAsync()
