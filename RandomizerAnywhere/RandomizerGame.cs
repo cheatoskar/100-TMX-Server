@@ -2049,10 +2049,11 @@ internal sealed partial class RandomizerGame
 
         var tmxUrl = $"https://{tmxRules.GetSiteUrl()}/trackshow/{id}";
 
-        tmxRules.ExcludeForSession(id);
-
-        var skipSuffix = isCurrent ? ", skipping" : string.Empty;
-        await SendMessageAsync($"$F00Map {id} reported impossible by {GetNicknameOrLogin(login)} - won't be shown again until reviewed{skipSuffix}.", cancellationToken);
+        // A report skips the map once and goes to Discord; it no longer keeps the map out. Whether
+        // a map is really impossible is decided in the review (the shared sheet, see ImpossibleMaps):
+        // a single player's word used to hide a map until the next restart.
+        var skipSuffix = isCurrent ? " - skipping it" : string.Empty;
+        await SendMessageAsync($"$F00Map {id} reported impossible by {GetNicknameOrLogin(login)}, sent to Discord for review{skipSuffix}.", cancellationToken);
 
         if (reportedMaps.Add(("imp", id)))
         {
