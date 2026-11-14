@@ -15,6 +15,10 @@ internal sealed class ReplayServer
 
     private WebApplication? app;
 
+    // <login>_<yyyyMMdd-HHmmss>_<16 hex>.Replay.Gbx, nothing else (no sub-folders)
+    private static readonly System.Text.RegularExpressions.Regex SecureReplayName =
+        new(@"^[^/\\]+_[0-9a-f]{16}\.Replay\.Gbx$", System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
     public ReplayServer(string replaysDir, string statusDir, ushort port, string serverName, string favoriteLogin)
     {
         this.replaysDir = replaysDir;
@@ -61,6 +65,21 @@ internal sealed class ReplayServer
 
             context.Response.Headers.CacheControl = "public, max-age=31536000, immutable";
             return Results.Bytes(png, "image/png");
+        });
+
+        // Only replays with the random part in their name (see SendReplayLinkAsync) are handed
+        // out. Older ones were named login + time and could be guessed; they stay on disk but
+        // answer 404, like a file that isn't there.
+        app.Use(async (context, next) =>
+        {
+            if (context.Request.Path.StartsWithSegments("/replays", out var rest)
+                && !SecureReplayName.IsMatch(rest.Value?.TrimStart('/') ?? string.Empty))
+            {
+                context.Response.StatusCode = StatusCodes.Status404NotFound;
+                return;
+            }
+
+            await next();
         });
 
         app.UseStaticFiles(new StaticFileOptions
