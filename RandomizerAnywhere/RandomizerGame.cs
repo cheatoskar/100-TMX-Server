@@ -2160,22 +2160,15 @@ internal sealed partial class RandomizerGame
             return;
         }
 
-        var result = await skippedMaps.RemoveAsync(id, cancellationToken);
-
-        switch (result)
+        if (!await skippedMaps.RemoveAsync(id, cancellationToken))
         {
-            case SkippedMaps.RemoveResult.Removed:
-                tmxRules.AllowForSession(id);
-                Console.WriteLine($"Skip list: {GetPlainNickname(login)} removed map {id} ({skippedMaps.Count} on the list).");
-                await SendMessageAsync($"$FF0Map {id} taken off this server's skip list by {GetNicknameOrLogin(login)} - it can be picked again.", cancellationToken);
-                break;
-            case SkippedMaps.RemoveResult.BuiltIn:
-                await SendMessageAsync(login, $"$F00Map {id} is on the built-in skip list (it does not load on this game) and cannot be removed here.", cancellationToken);
-                break;
-            default:
-                await SendMessageAsync(login, $"$F00Map {id} is not on this server's skip list.", cancellationToken);
-                break;
+            await SendMessageAsync(login, $"$F00Map {id} is not on this server's skip list.", cancellationToken);
+            return;
         }
+
+        tmxRules.AllowForSession(id);
+        Console.WriteLine($"Skip list: {GetPlainNickname(login)} removed map {id} ({skippedMaps.Count} on the list).");
+        await SendMessageAsync($"$FF0Map {id} taken off this server's skip list by {GetNicknameOrLogin(login)} - it can be picked again.", cancellationToken);
     }
 
     // skipped-maps.json was edited by hand and now lists the map that is running - usually because
