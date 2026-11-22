@@ -11,11 +11,12 @@ namespace RandomizerAnywhere;
 // while the server runs: RunReloadLoopAsync picks it up within seconds, no restart needed.
 internal sealed class SkippedMaps
 {
-    // Maps known to be unplayable here, shipped with the build so a fresh deploy already has them -
-    // the live server's list file is created from this on first start. Add an id here when a map
-    // is confirmed broken; the runtime file (and /blockmap) can add more without a rebuild.
+    // What a brand-new TMNF server's list starts with, written into skipped-maps.json only when the
+    // file does not exist yet. After that they are ordinary entries: /unblockmap and the website's
+    // admin panel can take them off like any other. (Until 2026-11-22 they were merged back in on
+    // every load and reload, so they could never be removed and the file did not tell the truth.)
     //   8468597  "Lunatic Sextreme 002" - built with blocks the game does not have, fails to load
-    private static readonly int[] BuiltInSkippedMapIds = [8468597];
+    private static readonly int[] InitialSkippedMapIds = [8468597];
 
     private readonly string filePath = Path.Combine(AppContext.BaseDirectory, "skipped-maps.json");
     private readonly HashSet<int> trackIds = [];
@@ -60,9 +61,11 @@ internal sealed class SkippedMaps
 
     public async Task LoadAsync(CancellationToken cancellationToken = default)
     {
+        var fresh = !File.Exists(filePath);
+
         try
         {
-            if (File.Exists(filePath))
+            if (!fresh)
             {
                 var json = await File.ReadAllTextAsync(filePath, cancellationToken);
                 var ids = JsonSerializer.Deserialize<int[]>(json) ?? [];
@@ -78,24 +81,24 @@ internal sealed class SkippedMaps
         }
         catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
         {
-            // Kept, not overwritten: the write below would otherwise replace the admins' list
-            // with just the built-in ids, and the maps it blocked ("drop every player") return.
+            // Kept, not overwritten: nothing below writes unless the file was missing, so the
+            // admins' list ("drop every player" maps among it) is not replaced by an empty one.
             var quarantined = AtomicFile.QuarantineCorrupt(filePath);
             Console.WriteLine($"ERROR: failed to read skipped-maps.json - {ex.Message}. "
-                + (quarantined is null ? "Starting with the built-in list only." : $"The file was kept as {Path.GetFileName(quarantined)}; fix it and put it back."));
+                + (quarantined is null ? "Starting with an empty list." : $"The file was kept as {Path.GetFileName(quarantined)}; fix it and put it back."));
         }
 
-        // merge in the built-in ids; if any were missing, write the file so it shows the full list
+        // A server without a list yet starts with the known-broken maps. Track ids belong to ONE
+        // exchange - 8468597 is a TMNF map and means something else on tmuf.exchange - so only a
+        // server drawing from tmnf.exchange gets them.
         var changed = false;
         int[] snapshot;
 
         lock (gate)
         {
-            // track ids belong to ONE exchange - 8468597 is a TMNF map and means something else on
-            // tmuf.exchange - so the built-in ids only apply to a server drawing from tmnf.exchange
-            if (config.EffectiveTmxGame == GameTitle.TMNF)
+            if (fresh && config.EffectiveTmxGame == GameTitle.TMNF)
             {
-                foreach (var id in BuiltInSkippedMapIds)
+                foreach (var id in InitialSkippedMapIds)
                 {
                     changed |= trackIds.Add(id);
                 }
@@ -173,6 +176,42 @@ internal sealed class SkippedMaps
         return isNew;
     }
 
+    // /unblockmap. Returns false if the map was not on the list.
+    public async Task<bool> RemoveAsync(int trackId, CancellationToken cancellationToken = default)
+    {
+        int[] added;
+        bool removed;
+
+        await fileLock.WaitAsync(cancellationToken);
+
+        try
+        {
+            // an edit nobody has picked up yet would be lost under the write below
+            added = await ReadIfChangedAsync(cancellationToken);
+
+            int[] snapshot;
+
+            lock (gate)
+            {
+                removed = trackIds.Remove(trackId);
+                snapshot = [.. trackIds.Order()];
+            }
+
+            if (removed)
+            {
+                await AtomicFile.WriteAllTextAsync(filePath, JsonSerializer.Serialize(snapshot));
+                knownWriteTimeUtc = CurrentWriteTimeUtc();
+            }
+        }
+        finally
+        {
+            fileLock.Release();
+        }
+
+        RaiseMapsAdded(added);
+        return removed;
+    }
+
     private async Task ReloadIfChangedAsync(CancellationToken cancellationToken)
     {
         int[] added;
@@ -225,11 +264,6 @@ internal sealed class SkippedMaps
         lock (gate)
         {
             var fresh = new HashSet<int>(ids);
-
-            if (config.EffectiveTmxGame == GameTitle.TMNF)
-            {
-                fresh.UnionWith(BuiltInSkippedMapIds);
-            }
 
             added = [.. fresh.Except(trackIds).Order()];
             removed = trackIds.Count(id => !fresh.Contains(id));

@@ -415,7 +415,7 @@ internal sealed partial class RandomizerGame
     // commandHandlers, which the constructor checks.
     internal static readonly string[] ChatCommandNames =
     [
-        "start", "stop", "end", "skip", "imp", "blockmap", "hard", "top", "rank", "map", "history",
+        "start", "stop", "end", "skip", "imp", "blockmap", "unblockmap", "hard", "top", "rank", "map", "history",
         "rounds", "info", "help", "testhud", "votepreset", "yes", "no", "commands", "source",
         "timelimit", "tl", "preset", "presets", "loadmap", "votemap", "afk", "hud", "event",
     ];
@@ -444,6 +444,7 @@ internal sealed partial class RandomizerGame
             ["skip"] = SkipAsync,
             ["imp"] = ImpossibleAsync,
             ["blockmap"] = BlockMapAsync,
+            ["unblockmap"] = UnblockMapAsync,
             ["hard"] = HardAsync,
             ["top"] = TopAsync,
             ["rank"] = RankAsync,
@@ -2098,12 +2099,25 @@ internal sealed partial class RandomizerGame
             return;
         }
 
-        var (trackId, isCurrent, invalid) = ResolveMapReference(args);
+        int? trackId;
+        bool isCurrent;
 
-        if (invalid)
+        // "/blockmap 1234567" names a map by its TMX id, so a map can be kept out before it ever
+        // comes up. Only a positive number means that: negative numbers stay the history offsets.
+        if (args.Length > 0 && int.TryParse(args[0], out var tmxId) && tmxId > 0)
         {
-            await SendMapReferenceUsageAsync(login, "blockmap", cancellationToken);
-            return;
+            trackId = tmxId;
+            isCurrent = tmxId == DisplayedMapTrackId;
+        }
+        else
+        {
+            (trackId, isCurrent, var invalid) = ResolveMapReference(args);
+
+            if (invalid)
+            {
+                await SendMessageAsync(login, $"$F00Use $FF0/blockmap$F00 for the current map, $FF0/blockmap -1$F00 ... $FF0-{MaxMapHistory}$F00 for a past one, or $FF0/blockmap <TMX id>$F00.", cancellationToken);
+                return;
+            }
         }
 
         if (trackId is not { } id)
@@ -2128,6 +2142,33 @@ internal sealed partial class RandomizerGame
         {
             await NextRandomMapAsync(goalReached: false, cancellationToken);
         }
+    }
+
+    // Takes a map off this server's skip list again. By TMX id only: the map is not playing (it is
+    // blocked), so "the current map" would never be the one meant.
+    private async Task UnblockMapAsync(int playerUid, string login, string[] args, CancellationToken cancellationToken)
+    {
+        if (config.AdminLogins.Count > 0 && !config.AdminLogins.Contains(login))
+        {
+            await SendMessageAsync(login, "$F00Only server admins can take a map off the skip list.", cancellationToken);
+            return;
+        }
+
+        if (args.Length == 0 || !int.TryParse(args[0], out var id) || id <= 0)
+        {
+            await SendMessageAsync(login, "$F00Use $FF0/unblockmap <TMX id>$F00.", cancellationToken);
+            return;
+        }
+
+        if (!await skippedMaps.RemoveAsync(id, cancellationToken))
+        {
+            await SendMessageAsync(login, $"$F00Map {id} is not on this server's skip list.", cancellationToken);
+            return;
+        }
+
+        tmxRules.AllowForSession(id);
+        Console.WriteLine($"Skip list: {GetPlainNickname(login)} removed map {id} ({skippedMaps.Count} on the list).");
+        await SendMessageAsync($"$FF0Map {id} taken off this server's skip list by {GetNicknameOrLogin(login)} - it can be picked again.", cancellationToken);
     }
 
     // skipped-maps.json was edited by hand and now lists the map that is running - usually because
@@ -2409,7 +2450,7 @@ internal sealed partial class RandomizerGame
             "$FF0/votemap <TMX id>$FFF - propose loading a specific TMX map by id, shows name/author/difficulty/AT/tags, others confirm with $0F0/yes$FFF (doesn't count for the leaderboard)",
             "$FF0/commands$FFF - list every raw command name",
             "$FF0/source$FFF - get the source code link for this modified server (AGPLv3)",
-            "Admin-only: $FF0/start$FFF, $FF0/stop$FFF, $FF0/preset$FFF, $FF0/loadmap <TMX id>$FFF, $FF0/blockmap$FFF (server-only skip list), $FF0/timelimit$FFF",
+            "Admin-only: $FF0/start$FFF, $FF0/stop$FFF, $FF0/preset$FFF, $FF0/loadmap <TMX id>$FFF, $FF0/blockmap [TMX id]$FFF, $FF0/unblockmap <TMX id>$FFF (server-only skip list), $FF0/timelimit$FFF",
         ], cancellationToken);
     }
 

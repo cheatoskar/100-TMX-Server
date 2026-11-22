@@ -346,7 +346,7 @@ internal partial class AppServiceProvider
 
         if (appConfig.AdminLogins.Count == 0)
         {
-            Console.WriteLine("Warning: AdminLogins is empty - EVERY player can use the admin commands (/stop, /preset, /loadmap, /blockmap, /timelimit).");
+            Console.WriteLine("Warning: AdminLogins is empty - EVERY player can use the admin commands (/stop, /preset, /loadmap, /blockmap, /unblockmap, /timelimit).");
         }
 
         return appConfig;
