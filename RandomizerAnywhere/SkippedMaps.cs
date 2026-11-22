@@ -173,6 +173,50 @@ internal sealed class SkippedMaps
         return isNew;
     }
 
+    public enum RemoveResult { Removed, NotListed, BuiltIn }
+
+    // /unblockmap. A built-in id is refused rather than removed: the next load or reload would put
+    // it straight back, and the admin would be told something that is not true.
+    public async Task<RemoveResult> RemoveAsync(int trackId, CancellationToken cancellationToken = default)
+    {
+        if (config.EffectiveTmxGame == GameTitle.TMNF && BuiltInSkippedMapIds.Contains(trackId))
+        {
+            return RemoveResult.BuiltIn;
+        }
+
+        int[] added;
+        bool removed;
+
+        await fileLock.WaitAsync(cancellationToken);
+
+        try
+        {
+            // an edit nobody has picked up yet would be lost under the write below
+            added = await ReadIfChangedAsync(cancellationToken);
+
+            int[] snapshot;
+
+            lock (gate)
+            {
+                removed = trackIds.Remove(trackId);
+                snapshot = [.. trackIds.Order()];
+            }
+
+            if (removed)
+            {
+                await AtomicFile.WriteAllTextAsync(filePath, JsonSerializer.Serialize(snapshot));
+                knownWriteTimeUtc = CurrentWriteTimeUtc();
+            }
+        }
+        finally
+        {
+            fileLock.Release();
+        }
+
+        RaiseMapsAdded(added);
+        return removed ? RemoveResult.Removed : RemoveResult.NotListed;
+    }
+
     private async Task ReloadIfChangedAsync(CancellationToken cancellationToken)
     {
         int[] added;

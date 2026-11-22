@@ -56,7 +56,8 @@ Chat commands (case does not matter). "Admin" means: restricted to `AdminLogins`
 | `/votepreset <name>` | Starts a vote to switch preset; others support it with `/yes` (or the Yes/No widget) within the vote window. Without a name it opens the preset list like `/presets`. |
 | `/loadmap <TMX id>` | Loads a specific TMX map by id, no vote (admin). |
 | `/votemap <TMX id>` | Starts a vote to load a specific TMX map; shows name, author, difficulty, awards, author time and style tags first. Finishes on a map loaded this way (or with `/loadmap`) don't count for the leaderboard. |
-| `/blockmap [-1..-10]` | Adds the current (or a past) map to this server's own skip list (`skipped-maps.json`) and skips it now. For maps that can't be played here. Permanent, local to the server, never sent to Discord (admin). |
+| `/blockmap [-1..-10 \| TMX id]` | Adds the current map, a past one, or any map by its TMX id to this server's own skip list (`skipped-maps.json`); if that map is running it is skipped now. Permanent, local to the server, never sent to Discord (admin). |
+| `/unblockmap <TMX id>` | Takes a map off this server's skip list again (admin). The built-in entries cannot be removed. |
 | `/yes`, `/no` | Supports or withdraws support from an active preset or map vote. The skip vote with several players is TrackMania's own vote (F5). |
 | `/info`, `/help` | Shows a summary of what the server can do. |
 | `/commands` | Lists every raw command name. |

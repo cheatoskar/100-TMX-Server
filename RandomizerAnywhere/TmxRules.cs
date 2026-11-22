@@ -70,6 +70,15 @@ internal sealed class TmxRules
         }
     }
 
+    // an admin took the map off the skip list again (/unblockmap) - it may come up this session
+    public void AllowForSession(int trackId)
+    {
+        lock (gate)
+        {
+            sessionExcludedTrackIds.Remove(trackId);
+        }
+    }
+
     private bool IsSessionExcluded(int trackId)
     {
         lock (gate)
