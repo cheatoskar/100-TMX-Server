@@ -136,13 +136,19 @@ internal sealed class EventMode
         }
     }
 
+    // With the site's list a poll is a 304 until its sync changes something: every few minutes is fine
+    // and the list follows the sync closely. Asking TMX itself stays at EventTmxRefreshMinutes.
+    public TimeSpan RefreshEvery => string.IsNullOrWhiteSpace(config.EventListUrl)
+        ? TimeSpan.FromMinutes(config.EventTmxRefreshMinutes)
+        : TimeSpan.FromMinutes(Math.Min(config.EventTmxRefreshMinutes, 10));
+
     public bool TmxRefreshDue
     {
         get
         {
             lock (gate)
             {
-                return UsesTmxSource && (tmxPoolUpdated is null || DateTimeOffset.UtcNow - tmxPoolUpdated > TimeSpan.FromMinutes(config.EventTmxRefreshMinutes));
+                return UsesTmxSource && (tmxPoolUpdated is null || DateTimeOffset.UtcNow - tmxPoolUpdated > RefreshEvery);
             }
         }
     }
@@ -165,7 +171,7 @@ internal sealed class EventMode
             changed = false;
 
             // another server refreshed it while this one asked TMX
-            if (tmxPoolUpdated is { } updated && DateTimeOffset.UtcNow - updated < TimeSpan.FromMinutes(config.EventTmxRefreshMinutes) / 2)
+            if (tmxPoolUpdated is { } updated && DateTimeOffset.UtcNow - updated < RefreshEvery / 2)
             {
                 return;
             }

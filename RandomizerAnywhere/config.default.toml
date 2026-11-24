@@ -60,6 +60,11 @@ EventUnlimiter = false
 EventMapsSource = "file"
 EventTitle = ""
 EventTmxRefreshMinutes = 60
+# Where the open maps come from: the 100% TMX site's own list (its sync is the one scan of TMX, the
+# server polls it every few minutes and gets "not modified" until the next sync). Used when
+# [EventTmxQuery] only has inhasrecord = 0 and inunlimiter; TMX is asked directly when the site
+# can't be reached for hours, or with EventListUrl = "".
+# EventListUrl = "https://100tmx.com"
 # Once every map on the list is finished, every server shows the results (winner = most maps
 # finished first) and switches to this preset, e.g. "100tmx_tmnf". Empty = stay on the event.
 EventAfterPreset = ""

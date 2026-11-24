@@ -39,6 +39,10 @@ internal sealed class AppConfig
     public bool EventMapsFromTmx { get; init; }
     public string EventTitle { get; init; } = string.Empty;
     public int EventTmxRefreshMinutes { get; init; } = 60;
+
+    // The open maps come from this site's /api/public/open (its sync is the one scan of TMX);
+    // empty = ask TMX directly.
+    public string EventListUrl { get; init; } = string.Empty;
     public IReadOnlyDictionary<string, object> EventTmxQuery { get; init; } = new Dictionary<string, object>();
     public string EventAfterPreset { get; init; } = string.Empty;
 

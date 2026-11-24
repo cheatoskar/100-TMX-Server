@@ -761,6 +761,86 @@ internal sealed class TmxRules
         return result;
     }
 
+    // ---- the open list of the 100% TMX site (one scan of TMX for all of us) ----
+
+    public sealed record WebsiteOpenList(bool NotModified, int[] Ids, HashSet<int>? UnlimiterIds, Dictionary<int, TrackDetails> Details);
+
+    private string? websiteEtag;
+    private WebsiteOpenList? websiteLast;
+
+    private string? WebsiteSiteId() => game switch
+    {
+        GameTitle.TMNF => "tmnf",
+        GameTitle.TMUF => "tmuf",
+        GameTitle.TMN => "tmn",
+        GameTitle.TMS => "tms",
+        GameTitle.TMO => "tmo",
+        _ => null,
+    };
+
+    // The site only lists maps without a record, so the query must ask for exactly that (and may say
+    // what to do with Unlimiter maps); any other filter (tags, length...) is TMX's to answer.
+    public bool CanUseWebsiteList =>
+        !string.IsNullOrWhiteSpace(config.EventListUrl) && WebsiteSiteId() is not null
+        && config.EventTmxQuery.Keys.All(k => k.Equals("inhasrecord", StringComparison.OrdinalIgnoreCase) || k.Equals("inunlimiter", StringComparison.OrdinalIgnoreCase))
+        && config.EventTmxQuery.TryGetValue("inhasrecord", out var rec) && Convert.ToString(rec, CultureInfo.InvariantCulture) == "0";
+
+    public async Task<WebsiteOpenList> FetchWebsiteOpenListAsync(CancellationToken cancellationToken)
+    {
+        var site = WebsiteSiteId() ?? throw new InvalidOperationException("This game has no list on the 100% TMX site.");
+        using var request = new HttpRequestMessage(HttpMethod.Get, $"{config.EventListUrl.TrimEnd('/')}/api/public/open?site={site}");
+        if (websiteEtag is not null && websiteLast is not null)
+        {
+            request.Headers.TryAddWithoutValidation("If-None-Match", websiteEtag);
+        }
+
+        using var response = await http.SendAsync(request, cancellationToken);
+        if (response.StatusCode == System.Net.HttpStatusCode.NotModified && websiteLast is not null)
+        {
+            return websiteLast with { NotModified = true };
+        }
+
+        response.EnsureSuccessStatusCode();
+        using var document = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync(cancellationToken), cancellationToken: cancellationToken);
+
+        // inunlimiter = 0: the Unlimiter maps stay out; = 1: only those; absent: all, flagged
+        var unlimiterMode = config.EventTmxQuery.TryGetValue("inunlimiter", out var u) ? Convert.ToString(u, CultureInfo.InvariantCulture) : null;
+        var ids = new List<int>();
+        var unlimiter = new HashSet<int>();
+        var details = new Dictionary<int, TrackDetails>();
+
+        foreach (var row in document.RootElement.GetProperty("maps").EnumerateArray())
+        {
+            var id = row[0].GetInt32();
+            var isUnlimiter = row[5].GetInt32() == 1;
+            if ((unlimiterMode == "0" && isUnlimiter) || (unlimiterMode == "1" && !isUnlimiter))
+            {
+                continue;
+            }
+
+            ids.Add(id);
+            if (isUnlimiter)
+            {
+                unlimiter.Add(id);
+            }
+
+            var name = row[1].GetString();
+            var author = row[2].GetString();
+            details[id] = new TrackDetails(
+                string.IsNullOrEmpty(name) ? $"Track {id}" : name,
+                string.IsNullOrEmpty(author) ? "unknown" : author,
+                row[3].ValueKind == JsonValueKind.Number ? DifficultyLabel(row[3].GetInt32()) : "unknown",
+                0,
+                row[4].ValueKind == JsonValueKind.Number ? row[4].GetInt32() : 0,
+                []);
+        }
+
+        var list = new WebsiteOpenList(false, [.. ids], unlimiterMode == "0" ? null : unlimiter, details);
+        websiteLast = list;
+        websiteEtag = response.Headers.ETag?.ToString();
+        return list;
+    }
+
     private static string DifficultyLabel(int difficulty)
         => difficulty >= 0 && difficulty < DifficultyLabels.Length ? DifficultyLabels[difficulty] : $"Difficulty {difficulty}";
 

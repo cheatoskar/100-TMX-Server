@@ -653,6 +653,13 @@ internal sealed partial class RandomizerGame
     {
         LoadEventMapDetailsCacheOnce();
 
+        if (tmxRules.CanUseWebsiteList && websiteFailingSince is null)
+        {
+            // the site's list carries names, authors and times; only the coloured names are left to read
+            LoadEventMapRawNamesInBackground();
+            return;
+        }
+
         var missing = eventMode.AllMaps.Select(m => m.TrackId).Where(id => !eventMapDetails.ContainsKey(id)).ToList();
         if (missing.Count == 0)
         {
@@ -856,18 +863,7 @@ internal sealed partial class RandomizerGame
             {
                 if (eventMode.Enabled && eventMode.TmxRefreshDue && eventMode.EndedAt is null)
                 {
-                    try
-                    {
-                        using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                        budget.CancelAfter(TimeSpan.FromSeconds(40));
-                        var (ids, complete) = await tmxRules.ListEventPoolAsync(budget.Token);
-                        var unlimiter = await tmxRules.ListEventUnlimiterIdsAsync(budget.Token);
-                        await eventMode.MergeTmxPoolAsync([.. ids.Where(id => !tmxRules.IsExcludedFromRotation(id))], complete, unlimiter);
-                    }
-                    catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
-                    {
-                        Console.WriteLine($"Warning: couldn't refresh the event list from TMX - {ex.Message}. Keeping the current list.");
-                    }
+                    await RefreshEventListAsync(cancellationToken);
                 }
 
                 if (eventMode.Enabled)
@@ -888,6 +884,85 @@ internal sealed partial class RandomizerGame
             }
 
             await Task.Delay(TimeSpan.FromSeconds(15), cancellationToken);
+        }
+    }
+
+    // The 100% TMX site scans TMX; this server only reads the site's list. TMX is asked directly when
+    // the site has been out of reach for hours (or there is no list to keep yet), and then no more
+    // often than EventTmxRefreshMinutes.
+    private static readonly TimeSpan WebsiteGrace = TimeSpan.FromHours(3);
+    private DateTimeOffset? websiteFailingSince;
+    private DateTimeOffset websiteRetryAfter;
+    private DateTimeOffset lastTmxScan;
+
+    private async Task RefreshEventListAsync(CancellationToken cancellationToken)
+    {
+        if (tmxRules.CanUseWebsiteList)
+        {
+            if (DateTimeOffset.UtcNow >= websiteRetryAfter)
+            {
+                try
+                {
+                    using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    budget.CancelAfter(TimeSpan.FromSeconds(30));
+                    var list = await tmxRules.FetchWebsiteOpenListAsync(budget.Token);
+                    var ids = list.Ids.Where(id => !tmxRules.IsExcludedFromRotation(id)).ToArray();
+
+                    // an empty or collapsed list is a broken sync, not 300 maps that all got a record
+                    var known = eventMode.AllMaps.Count;
+                    if (ids.Length == 0 || (known >= 20 && ids.Length < known / 2))
+                    {
+                        throw new InvalidOperationException($"the site lists {ids.Length} open map(s) against {known} here");
+                    }
+
+                    foreach (var (id, details) in list.Details)
+                    {
+                        eventMapDetails[id] = details;
+                    }
+
+                    await eventMode.MergeTmxPoolAsync(ids, complete: true, list.UnlimiterIds);
+                    if (!list.NotModified)
+                    {
+                        await SaveEventMapDetailsCacheAsync();
+                    }
+
+                    websiteFailingSince = null;
+                    return;
+                }
+                catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+                {
+                    websiteFailingSince ??= DateTimeOffset.UtcNow;
+                    websiteRetryAfter = DateTimeOffset.UtcNow.AddMinutes(2);
+                    Console.WriteLine($"Warning: couldn't read the open list from {config.EventListUrl} - {ex.Message}. Keeping the current list.");
+                }
+            }
+
+            var neverLoaded = eventMode.AllMaps.Count == 0;
+            var goneForHours = websiteFailingSince is { } since && DateTimeOffset.UtcNow - since > WebsiteGrace;
+            if (!(neverLoaded && websiteFailingSince is not null) && !goneForHours)
+            {
+                return;
+            }
+        }
+
+        // TMX itself, however often the loop asks: no more than once per EventTmxRefreshMinutes
+        if (DateTimeOffset.UtcNow - lastTmxScan < TimeSpan.FromMinutes(config.EventTmxRefreshMinutes))
+        {
+            return;
+        }
+
+        lastTmxScan = DateTimeOffset.UtcNow;
+        try
+        {
+            using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            budget.CancelAfter(TimeSpan.FromSeconds(90));
+            var (ids, complete) = await tmxRules.ListEventPoolAsync(budget.Token);
+            var unlimiter = await tmxRules.ListEventUnlimiterIdsAsync(budget.Token);
+            await eventMode.MergeTmxPoolAsync([.. ids.Where(id => !tmxRules.IsExcludedFromRotation(id))], complete, unlimiter);
+        }
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            Console.WriteLine($"Warning: couldn't refresh the event list from TMX - {ex.Message}. Keeping the current list.");
         }
     }
 
