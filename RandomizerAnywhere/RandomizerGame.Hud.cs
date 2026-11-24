@@ -655,7 +655,7 @@ internal sealed partial class RandomizerGame
 
     private static void AppendWindowHeader(StringBuilder b, double width, double height, string title, int closeAction, string iconStyle = "Icons128x128_1", string iconSubstyle = "Challenge")
     {
-        AppendShade(b, width, height, 5);
+        AppendShade(b, width, height, 7);
         b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\"/>");
         b.Append($"<quad posn=\"0.4 -0.36 0.01\" sizen=\"{Inv(width - 0.8)} 2.6\" style=\"BgsPlayerCard\" substyle=\"BgRacePlayerName\"/>");
         b.Append($"<quad posn=\"0.7 0 0.02\" sizen=\"3 3\" style=\"{iconStyle}\" substyle=\"{iconSubstyle}\"/>");
@@ -674,7 +674,7 @@ internal sealed partial class RandomizerGame
 
         var b = new StringBuilder();
         b.Append($"<manialink id=\"{EventResultsId}\"><frame posn=\"{Inv(-width / 2)} {Inv(height / 2 + 4)} 25\">");
-        AppendShade(b, width, height, 5);
+        AppendShade(b, width, height, 7);
         b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\"/>");
         b.Append($"<quad posn=\"0.4 -0.36 0.01\" sizen=\"{Inv(width - 0.8)} 3\" style=\"BgsPlayerCard\" substyle=\"BgRacePlayerName\"/>");
         b.Append("<quad posn=\"0.7 0 0.02\" sizen=\"3.4 3.4\" style=\"Icons128x128_1\" substyle=\"Rankings\"/>");
@@ -1466,7 +1466,7 @@ internal sealed partial class RandomizerGame
     // NavButton alone lets a bright track shine through; a light dark quad just inside its rounded
     // edge makes the text readable without turning the boxes black. Tiles get less of it, so
     // they match the game's own boxes (the "previous / best" panel top right).
-    private static void AppendBox(StringBuilder b, double width, double height, string? attributes = null, int shade = 5)
+    private static void AppendBox(StringBuilder b, double width, double height, string? attributes = null, int shade = 7)
     {
         AppendShade(b, width, height, shade);
 
@@ -1650,7 +1650,7 @@ internal sealed partial class RandomizerGame
         foreach (var (w, draw, attributes) in tiles)
         {
             sb.Append($"<frame posn=\"{Inv(x)} 0 0\">");
-            AppendBox(sb, w, height, attributes, shade: 3);
+            AppendBox(sb, w, height, attributes, shade: 5);
             draw(sb, w);
             sb.Append("</frame>");
             x += w + gap;
