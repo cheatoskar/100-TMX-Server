@@ -417,7 +417,7 @@ internal sealed partial class RandomizerGame
     [
         "start", "stop", "end", "skip", "imp", "blockmap", "unblockmap", "hard", "top", "rank", "map", "history",
         "rounds", "info", "help", "testhud", "votepreset", "yes", "no", "commands", "source",
-        "timelimit", "tl", "preset", "presets", "loadmap", "votemap", "afk", "hud", "event",
+        "timelimit", "tl", "preset", "presets", "loadmap", "votemap", "afk", "hud", "event", "search",
     ];
 
     private readonly EventMode eventMode;
@@ -467,7 +467,8 @@ internal sealed partial class RandomizerGame
             ["votemap"] = VoteMapAsync,
             ["afk"] = AfkAsync,
             ["hud"] = HudAsync,
-            ["event"] = EventAsync
+            ["event"] = EventAsync,
+            ["search"] = SearchAsync
         };
 
         if (!commandHandlers.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase).SetEquals(ChatCommandNames))
@@ -841,6 +842,11 @@ internal sealed partial class RandomizerGame
                 var login = (string)methodParams[1];
                 var answer = (int)methodParams[2];
                 RememberMapSearchEntry(login, methodParams);
+                if (answer == ActionMapVoteSearch)
+                {
+                    Console.WriteLine($"Map search click by {login}: {DescribeCallbackParams(methodParams.Skip(3))}");
+                }
+
                 await HandleManialinkAnswerAsync(playerUid, login, answer, cancellationToken);
             }
             catch (Exception ex)
@@ -852,6 +858,15 @@ internal sealed partial class RandomizerGame
 
     // action IDs for clickable manialink widgets - sent back verbatim by the client as the
     // A click on a button also carries what is typed into the page's boxes: a list of {Name, Value}.
+    private static string DescribeCallbackParams(IEnumerable<object?> values) => string.Join(" | ", values.Select(v => v switch
+    {
+        null => "null",
+        string s => $"\"{s}\"",
+        System.Collections.IDictionary d => "{" + string.Join(", ", d.Keys.Cast<object>().Select(k => $"{k}={DescribeCallbackParams([d[k]])}")) + "}",
+        System.Collections.IEnumerable e => "[" + DescribeCallbackParams(e.Cast<object?>()) + "]",
+        _ => $"{v.GetType().Name}:{v}",
+    }));
+
     private void RememberMapSearchEntry(string login, object[] callbackParams)
     {
         if (callbackParams.Length < 4 || callbackParams[3] is not System.Collections.IEnumerable entries || callbackParams[3] is string)
@@ -4023,47 +4038,40 @@ internal sealed partial class RandomizerGame
         </manialink>
         """;
 
-    private static string BuildVotePopupManialink(string presetName)
+    // The vote popups share the HUD's frame (shaded box, game border); YES / NO are the buttons.
+    private static string VotePopup(double height, Action<System.Text.StringBuilder> body)
     {
-        var text = System.Security.SecurityElement.Escape($"Switch preset to '{presetName}'?");
-        return $"""
-            <manialink id="{VotePopupManialinkId}" version="1">
-                <quad posn="-25 46 4" sizen="50 10" halign="left" valign="top" bgcolor="000C"/>
-                <label posn="0 44 5" halign="center" valign="center" textsize="1.5" textcolor="FF0F" text="{text}"/>
-                <quad posn="-15 40 5" sizen="12 3.5" halign="center" valign="center" bgcolor="0B3A" action="{ActionVoteYes}"/>
-                <label posn="-15 40 6" halign="center" valign="center" textsize="1.2" textcolor="FFF" text="YES"/>
-                <quad posn="15 40 5" sizen="12 3.5" halign="center" valign="center" bgcolor="B00A" action="{ActionVoteNo}"/>
-                <label posn="15 40 6" halign="center" valign="center" textsize="1.2" textcolor="FFF" text="NO"/>
-            </manialink>
-            """;
+        const double width = 52;
+        var b = new System.Text.StringBuilder();
+        b.Append($"<manialink id=\"{VotePopupManialinkId}\" version=\"1\"><frame posn=\"{Inv(-width / 2)} 49 4\">");
+        AppendBox(b, width, height);
+        body(b);
+        var y = -(height - 3.6);
+        b.Append($"<quad posn=\"{Inv(width / 2 - 13)} {Inv(y)} 0.02\" sizen=\"12 2.6\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\" action=\"{ActionVoteYes}\"/>");
+        b.Append($"<label posn=\"{Inv(width / 2 - 7)} {Inv(y - 0.6)} 0.03\" sizen=\"12 2\" halign=\"center\" textsize=\"1\" text=\"$0F0YES\"/>");
+        b.Append($"<quad posn=\"{Inv(width / 2 + 1)} {Inv(y)} 0.02\" sizen=\"12 2.6\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\" action=\"{ActionVoteNo}\"/>");
+        b.Append($"<label posn=\"{Inv(width / 2 + 7)} {Inv(y - 0.6)} 0.03\" sizen=\"12 2\" halign=\"center\" textsize=\"1\" text=\"$F55NO\"/>");
+        b.Append("</frame></manialink>");
+        return b.ToString();
     }
+
+    private static string BuildVotePopupManialink(string presetName) => VotePopup(10.5, b =>
+    {
+        b.Append("<label posn=\"26 -1.4 0.02\" sizen=\"48 2\" halign=\"center\" textsize=\"1\" textcolor=\"FC0F\" text=\"Vote: switch the preset\"/>");
+        b.Append($"<label posn=\"26 -3.6 0.02\" sizen=\"48 2.6\" halign=\"center\" textsize=\"2\" text=\"{System.Security.SecurityElement.Escape(presetName)}\"/>");
+    });
 
     // shares the same manialink id/YES-NO actions as BuildVotePopupManialink - only one vote (preset
     // or map) can ever be active at a time (see the votePresetName/voteMapTrackId mutual-exclusion
     // guards), so there's no risk of the two colliding on screen
-    private static string BuildMapVotePopupManialink(TmxRules.TrackDetails details)
+    private static string BuildMapVotePopupManialink(TmxRules.TrackDetails details) => VotePopup(14.5, b =>
     {
-        var difficultyColor = GetDifficultyColor(details.DifficultyLabel);
-        var nameText = System.Security.SecurityElement.Escape(details.Name);
-        var authorText = System.Security.SecurityElement.Escape($"by {details.Author}");
-        var difficultyText = System.Security.SecurityElement.Escape($"{details.DifficultyLabel} · {details.Awards} award{(details.Awards == 1 ? "" : "s")}");
-        var tagsSummary = details.Tags.Count > 0 ? string.Join(", ", details.Tags) : "no tags";
-        var atTagsText = System.Security.SecurityElement.Escape($"AT {new TimeInt32(details.AuthorTimeMs)} · {tagsSummary}");
-
-        return $"""
-            <manialink id="{VotePopupManialinkId}" version="1">
-                <quad posn="-35 50 4" sizen="70 17" halign="left" valign="top" bgcolor="000C"/>
-                <label posn="0 47.5 5" halign="center" valign="center" textsize="1.6" textcolor="FF0F" text="$o{nameText}"/>
-                <label posn="0 44.8 5" halign="center" valign="center" textsize="1.1" textcolor="FFFF" text="{authorText}"/>
-                <label posn="0 42.3 5" halign="center" valign="center" textsize="1.1" textcolor="{difficultyColor}F" text="{difficultyText}"/>
-                <label posn="0 39.8 5" halign="center" valign="center" textsize="1.1" textcolor="0F0F" text="{atTagsText}"/>
-                <quad posn="-15 36 5" sizen="12 3.5" halign="center" valign="center" bgcolor="0B3A" action="{ActionVoteYes}"/>
-                <label posn="-15 36 6" halign="center" valign="center" textsize="1.2" textcolor="FFF" text="YES"/>
-                <quad posn="15 36 5" sizen="12 3.5" halign="center" valign="center" bgcolor="B00A" action="{ActionVoteNo}"/>
-                <label posn="15 36 6" halign="center" valign="center" textsize="1.2" textcolor="FFF" text="NO"/>
-            </manialink>
-            """;
-    }
+        var tags = details.Tags.Count > 0 ? string.Join(", ", details.Tags) : "no tags";
+        b.Append("<label posn=\"26 -1.4 0.02\" sizen=\"48 2\" halign=\"center\" textsize=\"1\" textcolor=\"FC0F\" text=\"Vote: load this map\"/>");
+        b.Append($"<label posn=\"26 -3.6 0.02\" sizen=\"48 2.6\" halign=\"center\" textsize=\"2\" text=\"{System.Security.SecurityElement.Escape(details.Name)}\"/>");
+        b.Append($"<label posn=\"26 -6.3 0.02\" sizen=\"48 2\" halign=\"center\" textsize=\"1\" text=\"{System.Security.SecurityElement.Escape($"by {details.Author} $AAA· {DifficultyColorCode(details.DifficultyLabel)}{details.DifficultyLabel}$AAA · AT {new TimeInt32(details.AuthorTimeMs)}")}\"/>");
+        b.Append($"<label posn=\"26 -8.4 0.02\" sizen=\"48 2\" halign=\"center\" textsize=\"1\" scale=\"0.85\" textcolor=\"CCCF\" text=\"{System.Security.SecurityElement.Escape(tags)}\"/>");
+    });
 
     // "lunatic" for lunatic_tmnf, or the short display name ("100% TMX", "Short & LOL") - whatever
     // a player types that names exactly one preset of this game; anything else is passed on as typed

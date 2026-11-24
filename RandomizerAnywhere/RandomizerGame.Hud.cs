@@ -429,6 +429,21 @@ internal sealed partial class RandomizerGame
         });
     }
 
+    private async Task SearchAsync(int playerUid, string login, string[] args, CancellationToken cancellationToken)
+    {
+        if (!eventMode.Enabled || !HudAvailable)
+        {
+            await SendMessageAsync(login, "There is no open map list on this server.", cancellationToken);
+            return;
+        }
+
+        var text = string.Join(' ', args).Trim();
+        mapVoteQuery[login] = text[..Math.Min(text.Length, 40)];
+        mapVoteEntry[login] = mapVoteQuery[login];
+        mapVotePage[login] = 0;
+        await ShowWindowAsync(login, BuildMapVoteWindow(login), cancellationToken);
+    }
+
     private async Task EventAsync(int playerUid, string login, string[] args, CancellationToken cancellationToken)
     {
         if (!eventMode.Enabled)
@@ -488,12 +503,12 @@ internal sealed partial class RandomizerGame
         b.Append($"<manialink id=\"{MapVoteWindowId}\"><frame posn=\"{Inv(-width / 2)} {Inv(height / 2 + 4)} 20\">");
         var title = view.Count == maps.Count ? $"Vote for a map $AAA· {maps.Count} open" : $"Vote for a map $AAA· {view.Count} of {maps.Count}";
         AppendWindowHeader(b, width, height, title, ActionMapVoteClose);
-        b.Append("<label posn=\"1.5 -3.9 0.02\" sizen=\"60 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"CCCF\" text=\"Search by name, author or TMX id, then click a map to start a vote.\"/>");
+        b.Append("<label posn=\"1.5 -3.9 0.02\" sizen=\"60 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"CCCF\" text=\"Search by name, author or TMX id (or type /search and the words in the chat), then click a map to start a vote.\"/>");
 
         // search row: the box, Search, Clear, and how the list is sorted
-        b.Append("<quad posn=\"1 -6 0.01\" sizen=\"32.5 2.4\" style=\"BgsPlayerCard\" substyle=\"BgRacePlayerName\"/>");
+        b.Append("<quad posn=\"1 -6 0.01\" sizen=\"32.5 2.4\" bgcolor=\"000A\"/>");
         b.Append($"<entry name=\"{MapVoteEntryName}\" default=\"{Esc(query)}\" posn=\"1.5 -6.25 0.03\" sizen=\"31.5 2\" textsize=\"1\" textcolor=\"FFFF\"/>");
-        AppendSmallButton(b, 34, -6, 9, "Search", ActionMapVoteSearch);
+        AppendSmallButton(b, 34, -6, 9, "Find", ActionMapVoteSearch);
         AppendSmallButton(b, 44, -6, 7, "Clear", ActionMapVoteClear);
         AppendSmallButton(b, 52, -6, 11, $"Sort: {MapVoteSortNames[sort]}", ActionMapVoteSort);
 
@@ -537,7 +552,7 @@ internal sealed partial class RandomizerGame
 
     private static void AppendSmallButton(StringBuilder b, double x, double y, double width, string text, int action)
     {
-        b.Append($"<quad posn=\"{Inv(x)} {Inv(y)} 0.02\" sizen=\"{Inv(width)} 2.4\" style=\"Bgs1InRace\" substyle=\"NavButton\" action=\"{action}\"/>");
+        b.Append($"<quad posn=\"{Inv(x)} {Inv(y)} 0.02\" sizen=\"{Inv(width)} 2.4\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\" action=\"{action}\"/>");
         b.Append($"<label posn=\"{Inv(x + width / 2)} {Inv(y - 0.55)} 0.03\" sizen=\"{Inv(width)} 2\" halign=\"center\" textsize=\"1\" scale=\"0.85\" text=\"{Esc(text)}\"/>");
     }
 
@@ -1544,7 +1559,7 @@ internal sealed partial class RandomizerGame
         var tiles = new List<(double Width, Action<StringBuilder, double> Draw, string? Attributes)>
         {
             (tile, (b, w) => TileText(b, w, cachedMaxPlayers is { } max ? $"{players}/{max}" : players.ToString(CultureInfo.InvariantCulture), "PLAYERS"), null),
-            (tile, (b, w) => TileText(b, w, openEventMaps is { } open ? open.ToString(CultureInfo.InvariantCulture) : mapsStartedCount.ToString(CultureInfo.InvariantCulture), openEventMaps is null ? "MAPS" : "OPEN"), null),
+            (tile, (b, w) => TileText(b, w, openEventMaps is { } open ? open.ToString(CultureInfo.InvariantCulture) : mapsStartedCount.ToString(CultureInfo.InvariantCulture), openEventMaps is null ? "MAPS" : "OPEN"), openEventMaps is null ? null : $"action=\"{ActionHudMapVoteHint}\""),
             (tile, (b, w) => TileText(b, w, session is { } s ? $"{(int)s.TotalHours}:{s.Minutes:00}" : "--", "SESSION"), null),
             (tile, (b, w) => TileText(b, w, ClockNow().Time, ClockNow().Zone), null),
             (wideTile, (b, w) => TileText(b, w, ShortPresetName(), config.PresetLocked ? "PRESET · LOCKED" : "PRESET · VOTE"), config.PresetLocked ? null : $"action=\"{ActionHudPresets}\""),
@@ -1673,6 +1688,7 @@ internal sealed partial class RandomizerGame
         if (collapsed)
         {
             AppendWidgetFrame(b, width, 2.8, "Icons128x128_1", "Challenge", title, ActionHudCollapseEvent, collapsed: true);
+            b.Append($"<quad posn=\"0.4 -0.1 0.06\" sizen=\"{Inv(width - 4.2)} 2.5\" bgcolor=\"0000\" action=\"{ActionHudMapVoteHint}\"/>");
             b.Append("</frame>");
             return b.ToString();
         }
@@ -1694,6 +1710,7 @@ internal sealed partial class RandomizerGame
         var height = 3.3 + rowsHeight + 2.4 + serversHeight + recentHeight + 0.3;
 
         AppendWidgetFrame(b, width, height, "Icons128x128_1", "Challenge", title, ActionHudCollapseEvent, collapsed: false);
+        b.Append($"<quad posn=\"0.4 -0.1 0.06\" sizen=\"{Inv(width - 4.2)} 2.5\" bgcolor=\"0000\" action=\"{ActionHudMapVoteHint}\"/>");
 
         var y = -2.75;
         if (shown.Length == 0)
