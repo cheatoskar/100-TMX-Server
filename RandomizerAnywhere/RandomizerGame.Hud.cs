@@ -97,6 +97,15 @@ internal sealed partial class RandomizerGame
     private const int ActionMapVotePrev = 1041;
     private const int ActionMapVoteNext = 1042;
     private const int ActionMapVoteRowBase = 1300;
+    private const int ActionMapVoteSearch = 1043;
+    private const int ActionMapVoteClear = 1044;
+    private const int ActionMapVoteSort = 1045;
+    private const string MapVoteEntryName = "map_search";
+    private static readonly string[] MapVoteSortNames = ["list", "name", "author", "difficulty", "AT"];
+    private readonly ConcurrentDictionary<string, string> mapVoteQuery = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, int> mapVoteSort = new(StringComparer.OrdinalIgnoreCase);
+    // what the player typed into the search box, as the last click delivered it
+    private readonly ConcurrentDictionary<string, string> mapVoteEntry = new(StringComparer.OrdinalIgnoreCase);
     private const int MapVoteRowsPerPage = 14;
     private readonly ConcurrentDictionary<string, int> mapVotePage = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, int[]> mapVoteRowsShown = new(StringComparer.OrdinalIgnoreCase);
@@ -464,25 +473,43 @@ internal sealed partial class RandomizerGame
             return b.ToString();
         }
 
-        var pages = Math.Max(1, (maps.Count + MapVoteRowsPerPage - 1) / MapVoteRowsPerPage);
+        var query = mapVoteQuery.GetValueOrDefault(login, string.Empty);
+        var sort = mapVoteSort.GetValueOrDefault(login, 0);
+        var view = FilterAndSortOpenMaps(maps, query, sort);
+
+        var pages = Math.Max(1, (view.Count + MapVoteRowsPerPage - 1) / MapVoteRowsPerPage);
         var page = Math.Clamp(mapVotePage.GetValueOrDefault(login, 0), 0, pages - 1);
         mapVotePage[login] = page;
-        var shown = maps.Skip(page * MapVoteRowsPerPage).Take(MapVoteRowsPerPage).ToArray();
+        var shown = view.Skip(page * MapVoteRowsPerPage).Take(MapVoteRowsPerPage).ToArray();
         mapVoteRowsShown[login] = [.. shown.Select(m => m.TrackId)];
         var elsewhere = eventMode.OtherServers().Where(s => s.TrackId is not null).ToDictionary(s => s.TrackId!.Value, s => s.Label);
 
-        var height = 8.5 + shown.Length * 2.2 + 3;
+        var height = 11.5 + Math.Max(shown.Length, 1) * 2.2 + 3;
         b.Append($"<manialink id=\"{MapVoteWindowId}\"><frame posn=\"{Inv(-width / 2)} {Inv(height / 2 + 4)} 20\">");
-        AppendWindowHeader(b, width, height, $"Vote for a map $AAA· {maps.Count} open", ActionMapVoteClose);
-        b.Append("<label posn=\"1.5 -3.9 0.02\" sizen=\"60 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"CCCF\" text=\"Click a map to start a vote for it. Everyone votes Yes / No.\"/>");
+        var title = view.Count == maps.Count ? $"Vote for a map $AAA· {maps.Count} open" : $"Vote for a map $AAA· {view.Count} of {maps.Count}";
+        AppendWindowHeader(b, width, height, title, ActionMapVoteClose);
+        b.Append("<label posn=\"1.5 -3.9 0.02\" sizen=\"60 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"CCCF\" text=\"Search by name, author or TMX id, then click a map to start a vote.\"/>");
+
+        // search row: the box, Search, Clear, and how the list is sorted
+        b.Append("<quad posn=\"1 -6 0.01\" sizen=\"32.5 2.4\" style=\"BgsPlayerCard\" substyle=\"BgRacePlayerName\"/>");
+        b.Append($"<entry name=\"{MapVoteEntryName}\" default=\"{Esc(query)}\" posn=\"1.5 -6.25 0.03\" sizen=\"31.5 2\" textsize=\"1\" textcolor=\"FFFF\"/>");
+        AppendSmallButton(b, 34, -6, 9, "Search", ActionMapVoteSearch);
+        AppendSmallButton(b, 44, -6, 7, "Clear", ActionMapVoteClear);
+        AppendSmallButton(b, 52, -6, 11, $"Sort: {MapVoteSortNames[sort]}", ActionMapVoteSort);
 
         // column heads
-        b.Append("<label posn=\"4.5 -6 0.02\" sizen=\"20 2\" textsize=\"1\" scale=\"0.75\" textcolor=\"FC0F\" text=\"MAP\"/>");
-        b.Append("<label posn=\"30 -6 0.02\" sizen=\"14 2\" textsize=\"1\" scale=\"0.75\" textcolor=\"FC0F\" text=\"AUTHOR\"/>");
-        b.Append("<label posn=\"45 -6 0.02\" sizen=\"10 2\" textsize=\"1\" scale=\"0.75\" textcolor=\"FC0F\" text=\"DIFFICULTY\"/>");
-        b.Append($"<label posn=\"{Inv(width - 1.5)} -6 0.02\" sizen=\"8 2\" halign=\"right\" textsize=\"1\" scale=\"0.75\" textcolor=\"FC0F\" text=\"AT\"/>");
+        b.Append("<label posn=\"4.5 -9 0.02\" sizen=\"20 2\" textsize=\"1\" scale=\"0.75\" textcolor=\"FC0F\" text=\"MAP\"/>");
+        b.Append("<label posn=\"30 -9 0.02\" sizen=\"14 2\" textsize=\"1\" scale=\"0.75\" textcolor=\"FC0F\" text=\"AUTHOR\"/>");
+        b.Append("<label posn=\"45 -9 0.02\" sizen=\"10 2\" textsize=\"1\" scale=\"0.75\" textcolor=\"FC0F\" text=\"DIFFICULTY\"/>");
+        b.Append($"<label posn=\"{Inv(width - 1.5)} -9 0.02\" sizen=\"8 2\" halign=\"right\" textsize=\"1\" scale=\"0.75\" textcolor=\"FC0F\" text=\"AT\"/>");
 
-        var y = -7.6;
+        var y = -10.6;
+        if (shown.Length == 0)
+        {
+            b.Append($"<label posn=\"4.5 {Inv(y - 0.35)} 0.02\" sizen=\"55 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"F90F\" text=\"{Esc($"No open map matches \"{query}\".")}\"/>");
+            y -= 2.2;
+        }
+
         for (var i = 0; i < shown.Length; i++)
         {
             var map = shown[i];
@@ -506,6 +533,44 @@ internal sealed partial class RandomizerGame
         b.Append($"<quad posn=\"{Inv(width - 3.4)} {Inv(y)} 0.02\" sizen=\"2.4 2.4\" style=\"Icons64x64_1\" substyle=\"ArrowNext\" action=\"{ActionMapVoteNext}\"/>");
         b.Append("</frame></manialink>");
         return b.ToString();
+    }
+
+    private static void AppendSmallButton(StringBuilder b, double x, double y, double width, string text, int action)
+    {
+        b.Append($"<quad posn=\"{Inv(x)} {Inv(y)} 0.02\" sizen=\"{Inv(width)} 2.4\" style=\"Bgs1InRace\" substyle=\"NavButton\" action=\"{action}\"/>");
+        b.Append($"<label posn=\"{Inv(x + width / 2)} {Inv(y - 0.55)} 0.03\" sizen=\"{Inv(width)} 2\" halign=\"center\" textsize=\"1\" scale=\"0.85\" text=\"{Esc(text)}\"/>");
+    }
+
+    // The open maps matching every word of the query (in the map's name, its author, its
+    // difficulty or its TMX id), in the chosen order. In memory, a few milliseconds for 40 000 maps.
+    private List<EventMap> FilterAndSortOpenMaps(IReadOnlyList<EventMap> maps, string query, int sort)
+    {
+        IEnumerable<EventMap> result = maps;
+        var words = query.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        if (words.Length > 0)
+        {
+            result = result.Where(m =>
+            {
+                eventMapDetails.TryGetValue(m.TrackId, out var d);
+                var id = m.TrackId.ToString(CultureInfo.InvariantCulture);
+                return words.All(w => id.Contains(w, StringComparison.Ordinal)
+                    || (d is not null && (d.Name.Contains(w, StringComparison.OrdinalIgnoreCase)
+                        || d.Author.Contains(w, StringComparison.OrdinalIgnoreCase)
+                        || d.DifficultyLabel.Contains(w, StringComparison.OrdinalIgnoreCase))));
+            });
+        }
+
+        result = sort switch
+        {
+            1 => result.OrderBy(m => eventMapDetails.TryGetValue(m.TrackId, out var d) ? d.Name : "\uffff", StringComparer.OrdinalIgnoreCase),
+            2 => result.OrderBy(m => eventMapDetails.TryGetValue(m.TrackId, out var d) ? d.Author : "\uffff", StringComparer.OrdinalIgnoreCase),
+            3 => result.OrderBy(m => eventMapDetails.TryGetValue(m.TrackId, out var d) ? TmxRules.DifficultyRank(d.DifficultyLabel) : int.MaxValue),
+            4 => result.OrderBy(m => eventMapDetails.TryGetValue(m.TrackId, out var d) ? d.AuthorTimeMs : int.MaxValue),
+            _ => result,
+        };
+
+        return [.. result];
     }
 
     // Only one window at a time: opening one (HUD menu, history, presets, map vote, results) clears
@@ -592,6 +657,14 @@ internal sealed partial class RandomizerGame
             return;
         }
 
+        // a big list (the search window's index): one paged pass over the event query instead of
+        // one request per 50 ids, in the background so the HUD loop is not held up
+        if (missing.Count > BulkDetailsThreshold)
+        {
+            LoadEventMapDetailsInBulkInBackground();
+            return;
+        }
+
         using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         budget.CancelAfter(TimeSpan.FromSeconds(30));
 
@@ -610,6 +683,42 @@ internal sealed partial class RandomizerGame
         LoadEventMapRawNamesInBackground();
     }
 
+    private const int BulkDetailsThreshold = 150;
+    private const int RawNamesMaxMaps = 300;
+    private int eventDetailsBulkLoading;
+
+    private void LoadEventMapDetailsInBulkInBackground()
+    {
+        if (Interlocked.Exchange(ref eventDetailsBulkLoading, 1) == 1)
+        {
+            return;
+        }
+
+        RunInBackground("loading the event maps' names (search index)", async () =>
+        {
+            try
+            {
+                using var budget = CancellationTokenSource.CreateLinkedTokenSource(appToken);
+                budget.CancelAfter(TimeSpan.FromMinutes(10));
+                var all = await tmxRules.ListEventPoolDetailsAsync(budget.Token);
+                foreach (var (id, details) in all)
+                {
+                    eventMapDetails[id] = details;
+                }
+
+                Console.WriteLine($"Open maps: names, authors and times of {all.Count} map(s) loaded for the search.");
+            }
+            catch (Exception ex) when (!appToken.IsCancellationRequested)
+            {
+                Console.WriteLine($"Warning: couldn't load the event maps' names from TMX - {ex.Message}. The search finds ids until the next try.");
+            }
+            finally
+            {
+                Interlocked.Exchange(ref eventDetailsBulkLoading, 0);
+            }
+        });
+    }
+
     private int eventRawNamesLoading;
 
     // TMX's API only has plain names. The coloured one is in the map file: each event map is
@@ -618,7 +727,8 @@ internal sealed partial class RandomizerGame
     // just leaves that map's plain name.
     private void LoadEventMapRawNamesInBackground()
     {
-        if (!HudAvailable || Interlocked.Exchange(ref eventRawNamesLoading, 1) == 1)
+        // each name is a map download; for a list of thousands the plain TMX name has to do
+        if (!HudAvailable || eventMode.AllMaps.Count > RawNamesMaxMaps || Interlocked.Exchange(ref eventRawNamesLoading, 1) == 1)
         {
             return;
         }
@@ -749,6 +859,22 @@ internal sealed partial class RandomizerGame
                 return;
             case ActionMapVoteClose:
                 await client.SendManialinkPageToLoginAsync(login, $"<manialink id=\"{MapVoteWindowId}\"></manialink>", cancellationToken: cancellationToken);
+                return;
+            case ActionMapVoteSearch:
+                mapVoteQuery[login] = mapVoteEntry.TryGetValue(login, out var typed) ? typed.Trim()[..Math.Min(typed.Trim().Length, 40)] : mapVoteQuery.GetValueOrDefault(login, string.Empty);
+                mapVotePage[login] = 0;
+                await ShowWindowAsync(login, BuildMapVoteWindow(login), cancellationToken);
+                return;
+            case ActionMapVoteClear:
+                mapVoteQuery.TryRemove(login, out _);
+                mapVoteEntry.TryRemove(login, out _);
+                mapVotePage[login] = 0;
+                await ShowWindowAsync(login, BuildMapVoteWindow(login), cancellationToken);
+                return;
+            case ActionMapVoteSort:
+                mapVoteSort.AddOrUpdate(login, 1, (_, s) => (s + 1) % MapVoteSortNames.Length);
+                mapVotePage[login] = 0;
+                await ShowWindowAsync(login, BuildMapVoteWindow(login), cancellationToken);
                 return;
             case ActionMapVotePrev:
             case ActionMapVoteNext:

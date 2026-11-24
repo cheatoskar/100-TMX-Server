@@ -558,7 +558,7 @@ internal sealed partial class ServerSetup
         }
 
         serverProcess.Start();
-        Diagnostics.SetDedicatedServerProcess(serverProcess.Id);
+        Diagnostics.SetDedicatedServerProcess(serverProcess.Id, serverProcess.StartInfo.FileName);
     }
 
     // Safe to call more than once and from any thread: only the first call gets the process. It
