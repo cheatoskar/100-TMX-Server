@@ -100,7 +100,16 @@ internal sealed partial class RandomizerGame
     private const int ActionMapVoteSearch = 1043;
     private const int ActionMapVoteClear = 1044;
     private const int ActionMapVoteSort = 1045;
+    private const int ActionMapVoteDiff = 1046;
+    private const int ActionMapVoteAuthorBase = 1500;
+    private const int ActionMapVoteLetterBase = 1600;
     private const string MapVoteEntryName = "map_search";
+    // TMF sends no text from an entry box with a click (the callback is player, login, answer), so the
+    // list is narrowed with buttons: first letter, difficulty, click on an author; /search for words
+    private static readonly string[] MapVoteDifficulties = ["all", "Beginner", "Intermediate", "Expert", "Lunatic"];
+    private const string MapVoteLetters = "#ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    private readonly ConcurrentDictionary<string, int> mapVoteLetter = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, int> mapVoteDiff = new(StringComparer.OrdinalIgnoreCase);
     private static readonly string[] MapVoteSortNames = ["list", "name", "author", "difficulty", "AT"];
     private readonly ConcurrentDictionary<string, string> mapVoteQuery = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, int> mapVoteSort = new(StringComparer.OrdinalIgnoreCase);
@@ -490,7 +499,9 @@ internal sealed partial class RandomizerGame
 
         var query = mapVoteQuery.GetValueOrDefault(login, string.Empty);
         var sort = mapVoteSort.GetValueOrDefault(login, 0);
-        var view = FilterAndSortOpenMaps(maps, query, sort);
+        var letter = mapVoteLetter.GetValueOrDefault(login, 0);
+        var difficulty = mapVoteDiff.GetValueOrDefault(login, 0);
+        var view = FilterAndSortOpenMaps(maps, query, sort, letter, difficulty);
 
         var pages = Math.Max(1, (view.Count + MapVoteRowsPerPage - 1) / MapVoteRowsPerPage);
         var page = Math.Clamp(mapVotePage.GetValueOrDefault(login, 0), 0, pages - 1);
@@ -499,26 +510,38 @@ internal sealed partial class RandomizerGame
         mapVoteRowsShown[login] = [.. shown.Select(m => m.TrackId)];
         var elsewhere = eventMode.OtherServers().Where(s => s.TrackId is not null).ToDictionary(s => s.TrackId!.Value, s => s.Label);
 
-        var height = 11.5 + Math.Max(shown.Length, 1) * 2.2 + 3;
+        var height = 14.4 + Math.Max(shown.Length, 1) * 2.2 + 3;
         b.Append($"<manialink id=\"{MapVoteWindowId}\"><frame posn=\"{Inv(-width / 2)} {Inv(height / 2 + 4)} 20\">");
         var title = view.Count == maps.Count ? $"Vote for a map $AAA· {maps.Count} open" : $"Vote for a map $AAA· {view.Count} of {maps.Count}";
         AppendWindowHeader(b, width, height, title, ActionMapVoteClose);
-        b.Append("<label posn=\"1.5 -3.9 0.02\" sizen=\"60 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"CCCF\" text=\"Search by name, author or TMX id (or type /search and the words in the chat), then click a map to start a vote.\"/>");
+        b.Append("<label posn=\"1.5 -3.9 0.02\" sizen=\"60 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"CCCF\" text=\"Click a map to start a vote.\"/>");
 
-        // search row: the box, Search, Clear, and how the list is sorted
-        b.Append("<quad posn=\"1 -6 0.01\" sizen=\"32.5 2.4\" bgcolor=\"000A\"/>");
-        b.Append($"<entry name=\"{MapVoteEntryName}\" default=\"{Esc(query)}\" posn=\"1.5 -6.25 0.03\" sizen=\"31.5 2\" textsize=\"1\" textcolor=\"FFFF\"/>");
-        AppendSmallButton(b, 34, -6, 9, "Find", ActionMapVoteSearch);
-        AppendSmallButton(b, 44, -6, 7, "Clear", ActionMapVoteClear);
-        AppendSmallButton(b, 52, -6, 11, $"Sort: {MapVoteSortNames[sort]}", ActionMapVoteSort);
+        // filter row: what is active, Clear, difficulty, sort
+        b.Append("<quad posn=\"1 -6 0.01\" sizen=\"29 2.4\" style=\"BgsPlayerCard\" substyle=\"BgRacePlayerName\"/>");
+        var active = new List<string>();
+        if (letter > 0) { active.Add($"starts with $FF0{MapVoteLetters[letter]}$FFF"); }
+        if (query.Length > 0) { active.Add($"$FF0{query}$FFF"); }
+        var filterLine = active.Count > 0 ? string.Join(" · ", active) : "Pick a letter or an author, or $FF0/search words";
+        b.Append($"<label posn=\"2 -6.5 0.03\" sizen=\"{Inv(27 / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(filterLine)}\"/>");
+        AppendSmallButton(b, 31, -6, 7, "Clear", ActionMapVoteClear);
+        AppendSmallButton(b, 39, -6, 10, $"Diff: {MapVoteDifficulties[difficulty]}", ActionMapVoteDiff);
+        AppendSmallButton(b, 50, -6, 11, $"Sort: {MapVoteSortNames[sort]}", ActionMapVoteSort);
+
+        // letter bar
+        for (var i = 0; i < MapVoteLetters.Length; i++)
+        {
+            var lx = 1.0 + i * 2.2;
+            b.Append($"<quad posn=\"{Inv(lx)} -8.7 0.02\" sizen=\"2 2\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\" action=\"{ActionMapVoteLetterBase + i}\"/>");
+            b.Append($"<label posn=\"{Inv(lx + 1)} -9.15 0.03\" sizen=\"2 2\" halign=\"center\" textsize=\"1\" scale=\"0.75\" text=\"{(i == letter ? "$FC0" : "")}{MapVoteLetters[i]}\"/>");
+        }
 
         // column heads
-        b.Append("<label posn=\"4.5 -9 0.02\" sizen=\"20 2\" textsize=\"1\" scale=\"0.75\" textcolor=\"FC0F\" text=\"MAP\"/>");
-        b.Append("<label posn=\"30 -9 0.02\" sizen=\"14 2\" textsize=\"1\" scale=\"0.75\" textcolor=\"FC0F\" text=\"AUTHOR\"/>");
-        b.Append("<label posn=\"45 -9 0.02\" sizen=\"10 2\" textsize=\"1\" scale=\"0.75\" textcolor=\"FC0F\" text=\"DIFFICULTY\"/>");
-        b.Append($"<label posn=\"{Inv(width - 1.5)} -9 0.02\" sizen=\"8 2\" halign=\"right\" textsize=\"1\" scale=\"0.75\" textcolor=\"FC0F\" text=\"AT\"/>");
+        b.Append("<label posn=\"4.5 -11.9 0.02\" sizen=\"20 2\" textsize=\"1\" scale=\"0.75\" textcolor=\"FC0F\" text=\"MAP\"/>");
+        b.Append("<label posn=\"30 -11.9 0.02\" sizen=\"14 2\" textsize=\"1\" scale=\"0.75\" textcolor=\"FC0F\" text=\"AUTHOR\"/>");
+        b.Append("<label posn=\"45 -11.9 0.02\" sizen=\"10 2\" textsize=\"1\" scale=\"0.75\" textcolor=\"FC0F\" text=\"DIFFICULTY\"/>");
+        b.Append($"<label posn=\"{Inv(width - 1.5)} -11.9 0.02\" sizen=\"8 2\" halign=\"right\" textsize=\"1\" scale=\"0.75\" textcolor=\"FC0F\" text=\"AT\"/>");
 
-        var y = -10.6;
+        var y = -13.5;
         if (shown.Length == 0)
         {
             b.Append($"<label posn=\"4.5 {Inv(y - 0.35)} 0.02\" sizen=\"55 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"F90F\" text=\"{Esc($"No open map matches \"{query}\".")}\"/>");
@@ -536,6 +559,10 @@ internal sealed partial class RandomizerGame
             b.Append($"<label posn=\"3.6 {Inv(y - 0.35)} 0.02\" sizen=\"3 2\" halign=\"right\" textsize=\"1\" scale=\"0.9\" text=\"{page * MapVoteRowsPerPage + i + 1}.\"/>");
             b.Append($"<label posn=\"4.5 {Inv(y - 0.35)} 0.02\" sizen=\"{Inv(25 / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(Fit(EventMapName(map.TrackId), 25, CharWidth1 * 0.9))}\"/>");
             b.Append($"<label posn=\"30 {Inv(y - 0.35)} 0.02\" sizen=\"{Inv(14 / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"DDDF\" text=\"{Esc(d?.Author ?? "")}\"/>");
+            if (d is not null)
+            {
+                b.Append($"<quad posn=\"29.6 {Inv(y)} 0.025\" sizen=\"14.6 2\" bgcolor=\"0000\" action=\"{ActionMapVoteAuthorBase + i}\"/>");
+            }
             var status = here ? "$0F0playing here" : busy ? $"$FC0on {label}" : d is null ? string.Empty : DifficultyColorCode(d.DifficultyLabel) + d.DifficultyLabel;
             b.Append($"<label posn=\"45 {Inv(y - 0.35)} 0.02\" sizen=\"{Inv(11 / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(status)}\"/>");
             b.Append($"<label posn=\"{Inv(width - 1.5)} {Inv(y - 0.35)} 0.02\" sizen=\"8 2\" halign=\"right\" textsize=\"1\" scale=\"0.9\" textcolor=\"3F5F\" text=\"{(d is null || d.AuthorTimeMs <= 0 ? "" : FormatTime(d.AuthorTimeMs))}\"/>");
@@ -556,12 +583,31 @@ internal sealed partial class RandomizerGame
         b.Append($"<label posn=\"{Inv(x + width / 2)} {Inv(y - 0.55)} 0.03\" sizen=\"{Inv(width)} 2\" halign=\"center\" textsize=\"1\" scale=\"0.85\" text=\"{Esc(text)}\"/>");
     }
 
+    // 'A'..'Z' for a name starting with that letter (any case), '#' for everything else
+    private static char FirstLetter(string name)
+    {
+        var first = name.TrimStart().FirstOrDefault();
+        return first is >= 'a' and <= 'z' ? char.ToUpperInvariant(first) : first is >= 'A' and <= 'Z' ? first : '#';
+    }
+
     // The open maps matching every word of the query (in the map's name, its author, its
     // difficulty or its TMX id), in the chosen order. In memory, a few milliseconds for 40 000 maps.
-    private List<EventMap> FilterAndSortOpenMaps(IReadOnlyList<EventMap> maps, string query, int sort)
+    private List<EventMap> FilterAndSortOpenMaps(IReadOnlyList<EventMap> maps, string query, int sort, int letter = 0, int difficulty = 0)
     {
         IEnumerable<EventMap> result = maps;
         var words = query.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        if (letter > 0 && letter < MapVoteLetters.Length)
+        {
+            var wanted = MapVoteLetters[letter];
+            result = result.Where(m => eventMapDetails.TryGetValue(m.TrackId, out var d) && FirstLetter(d.Name) == wanted);
+        }
+
+        if (difficulty > 0 && difficulty < MapVoteDifficulties.Length)
+        {
+            var wanted = MapVoteDifficulties[difficulty];
+            result = result.Where(m => eventMapDetails.TryGetValue(m.TrackId, out var d) && d.DifficultyLabel.Equals(wanted, StringComparison.OrdinalIgnoreCase));
+        }
 
         if (words.Length > 0)
         {
@@ -609,7 +655,7 @@ internal sealed partial class RandomizerGame
 
     private static void AppendWindowHeader(StringBuilder b, double width, double height, string title, int closeAction, string iconStyle = "Icons128x128_1", string iconSubstyle = "Challenge")
     {
-        AppendShade(b, width, height, 5);
+        AppendShade(b, width, height, 7);
         b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\"/>");
         b.Append($"<quad posn=\"0.4 -0.36 0.01\" sizen=\"{Inv(width - 0.8)} 2.6\" style=\"BgsPlayerCard\" substyle=\"BgRacePlayerName\"/>");
         b.Append($"<quad posn=\"0.7 0 0.02\" sizen=\"3 3\" style=\"{iconStyle}\" substyle=\"{iconSubstyle}\"/>");
@@ -628,7 +674,7 @@ internal sealed partial class RandomizerGame
 
         var b = new StringBuilder();
         b.Append($"<manialink id=\"{EventResultsId}\"><frame posn=\"{Inv(-width / 2)} {Inv(height / 2 + 4)} 25\">");
-        AppendShade(b, width, height, 5);
+        AppendShade(b, width, height, 7);
         b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\"/>");
         b.Append($"<quad posn=\"0.4 -0.36 0.01\" sizen=\"{Inv(width - 0.8)} 3\" style=\"BgsPlayerCard\" substyle=\"BgRacePlayerName\"/>");
         b.Append("<quad posn=\"0.7 0 0.02\" sizen=\"3.4 3.4\" style=\"Icons128x128_1\" substyle=\"Rankings\"/>");
@@ -1019,7 +1065,14 @@ internal sealed partial class RandomizerGame
                 mapVotePage[login] = 0;
                 await ShowWindowAsync(login, BuildMapVoteWindow(login), cancellationToken);
                 return;
+            case ActionMapVoteDiff:
+                mapVoteDiff.AddOrUpdate(login, 1, (_, d) => (d + 1) % MapVoteDifficulties.Length);
+                mapVotePage[login] = 0;
+                await ShowWindowAsync(login, BuildMapVoteWindow(login), cancellationToken);
+                return;
             case ActionMapVoteClear:
+                mapVoteLetter.TryRemove(login, out _);
+                mapVoteDiff.TryRemove(login, out _);
                 mapVoteQuery.TryRemove(login, out _);
                 mapVoteEntry.TryRemove(login, out _);
                 mapVotePage[login] = 0;
@@ -1104,6 +1157,26 @@ internal sealed partial class RandomizerGame
             });
             await SendHudAsync(login, HudSection.All, cancellationToken);
             await ShowWindowAsync(login, BuildHudMenu(login), cancellationToken);
+            return;
+        }
+
+        var letterIndex = answer - ActionMapVoteLetterBase;
+        if (letterIndex >= 0 && letterIndex < MapVoteLetters.Length)
+        {
+            mapVoteLetter.AddOrUpdate(login, letterIndex, (_, current) => current == letterIndex ? 0 : letterIndex);
+            mapVotePage[login] = 0;
+            await ShowWindowAsync(login, BuildMapVoteWindow(login), cancellationToken);
+            return;
+        }
+
+        var authorRow = answer - ActionMapVoteAuthorBase;
+        if (authorRow >= 0 && authorRow < MapVoteRowsPerPage && mapVoteRowsShown.TryGetValue(login, out var authorIds) && authorRow < authorIds.Length
+            && eventMapDetails.TryGetValue(authorIds[authorRow], out var authorDetails))
+        {
+            mapVoteQuery[login] = authorDetails.Author[..Math.Min(authorDetails.Author.Length, 40)];
+            mapVoteLetter.TryRemove(login, out _);
+            mapVotePage[login] = 0;
+            await ShowWindowAsync(login, BuildMapVoteWindow(login), cancellationToken);
             return;
         }
 
@@ -1393,7 +1466,7 @@ internal sealed partial class RandomizerGame
     // NavButton alone lets a bright track shine through; a light dark quad just inside its rounded
     // edge makes the text readable without turning the boxes black. Tiles get less of it, so
     // they match the game's own boxes (the "previous / best" panel top right).
-    private static void AppendBox(StringBuilder b, double width, double height, string? attributes = null, int shade = 5)
+    private static void AppendBox(StringBuilder b, double width, double height, string? attributes = null, int shade = 7)
     {
         AppendShade(b, width, height, shade);
 
@@ -1577,7 +1650,7 @@ internal sealed partial class RandomizerGame
         foreach (var (w, draw, attributes) in tiles)
         {
             sb.Append($"<frame posn=\"{Inv(x)} 0 0\">");
-            AppendBox(sb, w, height, attributes, shade: 3);
+            AppendBox(sb, w, height, attributes, shade: 5);
             draw(sb, w);
             sb.Append("</frame>");
             x += w + gap;
