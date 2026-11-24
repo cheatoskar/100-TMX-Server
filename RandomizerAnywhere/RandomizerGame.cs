@@ -840,6 +840,7 @@ internal sealed partial class RandomizerGame
                 var playerUid = (int)methodParams[0];
                 var login = (string)methodParams[1];
                 var answer = (int)methodParams[2];
+                RememberMapSearchEntry(login, methodParams);
                 await HandleManialinkAnswerAsync(playerUid, login, answer, cancellationToken);
             }
             catch (Exception ex)
@@ -850,6 +851,29 @@ internal sealed partial class RandomizerGame
     }
 
     // action IDs for clickable manialink widgets - sent back verbatim by the client as the
+    // A click on a button also carries what is typed into the page's boxes: a list of {Name, Value}.
+    private void RememberMapSearchEntry(string login, object[] callbackParams)
+    {
+        if (callbackParams.Length < 4 || callbackParams[3] is not System.Collections.IEnumerable entries || callbackParams[3] is string)
+        {
+            return;
+        }
+
+        foreach (var entry in entries)
+        {
+            if (entry is not System.Collections.IDictionary fields)
+            {
+                continue;
+            }
+
+            if (fields["Name"] as string == MapVoteEntryName)
+            {
+                mapVoteEntry[login] = fields["Value"] as string ?? string.Empty;
+                return;
+            }
+        }
+    }
+
     // "Answer" param of TrackMania.PlayerManialinkPageAnswer when a player clicks a button
     private const int ActionVoteYes = 1;
     private const int ActionVoteNo = 2;

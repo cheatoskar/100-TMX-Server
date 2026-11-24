@@ -47,6 +47,10 @@ internal sealed class TmxRules
 
     private const int PoolPageSize = 1000;
     private const int MaxPoolPages = 3;
+
+    // The event list is not a rotation pool: every open map is listed and searchable, so it may be
+    // far bigger (100 pages = 100 000 maps).
+    private const int EventMaxPoolPages = 100;
     private static readonly TimeSpan PoolRefreshInterval = TimeSpan.FromMinutes(20);
     private static readonly TimeSpan PoolLoadBudget = TimeSpan.FromSeconds(15);
 
@@ -706,12 +710,148 @@ internal sealed class TmxRules
 
     // The event list's TMX source (EventMapsSource = "tmx"): every map [EventTmxQuery] matches.
     public async Task<(int[] Ids, bool Complete)> ListEventPoolAsync(CancellationToken cancellationToken)
+        => await ListPoolAsync(EventQueryString(), cancellationToken, EventMaxPoolPages);
+
+    private string EventQueryString() => string.Join('&', config.EventTmxQuery
+        .Where(kv => !string.IsNullOrWhiteSpace(kv.Key))
+        .Select(kv => $"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(Convert.ToString(kv.Value, CultureInfo.InvariantCulture) ?? string.Empty)}"));
+
+    // Name, author, difficulty and AT of every map the event query matches, 1000 per request - the
+    // search window's index. One pass of 40 requests for 40 000 maps, instead of one request per 50
+    // ids; the caller runs it in the background.
+    public async Task<Dictionary<int, TrackDetails>> ListEventPoolDetailsAsync(CancellationToken cancellationToken)
     {
-        var query = string.Join('&', config.EventTmxQuery
-            .Where(kv => !string.IsNullOrWhiteSpace(kv.Key))
-            .Select(kv => $"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(Convert.ToString(kv.Value, CultureInfo.InvariantCulture) ?? string.Empty)}"));
-        return await ListPoolAsync(query, cancellationToken);
+        var query = EventQueryString();
+        var result = new Dictionary<int, TrackDetails>();
+        int? after = null;
+
+        for (var page = 0; page < EventMaxPoolPages; page++)
+        {
+            var url = $"https://{GetSiteUrl()}/api/tracks?{query}&fields=TrackId,TrackName,Uploader.Name,Difficulty,AuthorTime&count={PoolPageSize}"
+                + (after is { } a ? $"&after={a.ToString(CultureInfo.InvariantCulture)}" : string.Empty);
+
+            using var response = await http.GetAsync(url, cancellationToken);
+            response.EnsureSuccessStatusCode();
+
+            var payload = await response.Content.ReadFromJsonAsync<TmxApiTrackDetailsPage>(cancellationToken)
+                ?? throw new InvalidOperationException("TMX returned an empty page.");
+
+            var results = payload.Results ?? [];
+            foreach (var r in results)
+            {
+                if (r.TrackId is not { } id)
+                {
+                    continue;
+                }
+
+                result[id] = new TrackDetails(
+                    r.TrackName is { Length: > 0 } n ? n : $"Track {id}",
+                    r.Uploader?.Name is { Length: > 0 } author ? author : "unknown",
+                    DifficultyLabel(r.Difficulty), r.Awards, r.AuthorTime, []);
+            }
+
+            if (!payload.More || results.Count == 0 || results[^1].TrackId is not { } last)
+            {
+                break;
+            }
+
+            after = last;
+        }
+
+        return result;
     }
+
+    // ---- the open list of the 100% TMX site (one scan of TMX for all of us) ----
+
+    public sealed record WebsiteOpenList(bool NotModified, int[] Ids, HashSet<int>? UnlimiterIds, Dictionary<int, TrackDetails> Details);
+
+    private string? websiteEtag;
+    private WebsiteOpenList? websiteLast;
+
+    private string? WebsiteSiteId() => game switch
+    {
+        GameTitle.TMNF => "tmnf",
+        GameTitle.TMUF => "tmuf",
+        GameTitle.TMN => "tmn",
+        GameTitle.TMS => "tms",
+        GameTitle.TMO => "tmo",
+        _ => null,
+    };
+
+    // The site only lists maps without a record, so the query must ask for exactly that (and may say
+    // what to do with Unlimiter maps); any other filter (tags, length...) is TMX's to answer.
+    public bool CanUseWebsiteList =>
+        !string.IsNullOrWhiteSpace(config.EventListUrl) && WebsiteSiteId() is not null
+        && config.EventTmxQuery.Keys.All(k => k.Equals("inhasrecord", StringComparison.OrdinalIgnoreCase) || k.Equals("inunlimiter", StringComparison.OrdinalIgnoreCase))
+        && config.EventTmxQuery.TryGetValue("inhasrecord", out var rec) && Convert.ToString(rec, CultureInfo.InvariantCulture) == "0";
+
+    public async Task<WebsiteOpenList> FetchWebsiteOpenListAsync(CancellationToken cancellationToken)
+    {
+        var site = WebsiteSiteId() ?? throw new InvalidOperationException("This game has no list on the 100% TMX site.");
+        using var request = new HttpRequestMessage(HttpMethod.Get, $"{config.EventListUrl.TrimEnd('/')}/api/public/open?site={site}");
+        if (websiteEtag is not null && websiteLast is not null)
+        {
+            request.Headers.TryAddWithoutValidation("If-None-Match", websiteEtag);
+        }
+
+        using var response = await http.SendAsync(request, cancellationToken);
+        if (response.StatusCode == System.Net.HttpStatusCode.NotModified && websiteLast is not null)
+        {
+            return websiteLast with { NotModified = true };
+        }
+
+        response.EnsureSuccessStatusCode();
+        using var document = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync(cancellationToken), cancellationToken: cancellationToken);
+
+        // inunlimiter = 0: the Unlimiter maps stay out; = 1: only those; absent: all, flagged
+        var unlimiterMode = config.EventTmxQuery.TryGetValue("inunlimiter", out var u) ? Convert.ToString(u, CultureInfo.InvariantCulture) : null;
+        var ids = new List<int>();
+        var unlimiter = new HashSet<int>();
+        var details = new Dictionary<int, TrackDetails>();
+
+        foreach (var row in document.RootElement.GetProperty("maps").EnumerateArray())
+        {
+            var id = row[0].GetInt32();
+            var isUnlimiter = row[5].GetInt32() == 1;
+            if ((unlimiterMode == "0" && isUnlimiter) || (unlimiterMode == "1" && !isUnlimiter))
+            {
+                continue;
+            }
+
+            ids.Add(id);
+            if (isUnlimiter)
+            {
+                unlimiter.Add(id);
+            }
+
+            var name = row[1].GetString();
+            var author = row[2].GetString();
+            details[id] = new TrackDetails(
+                string.IsNullOrEmpty(name) ? $"Track {id}" : name,
+                string.IsNullOrEmpty(author) ? "unknown" : author,
+                row[3].ValueKind == JsonValueKind.Number ? DifficultyLabel(row[3].GetInt32()) : "unknown",
+                0,
+                row[4].ValueKind == JsonValueKind.Number ? row[4].GetInt32() : 0,
+                []);
+        }
+
+        var list = new WebsiteOpenList(false, [.. ids], unlimiterMode == "0" ? null : unlimiter, details);
+        websiteLast = list;
+        websiteEtag = response.Headers.ETag?.ToString();
+        return list;
+    }
+
+    private static string DifficultyLabel(int difficulty)
+        => difficulty >= 0 && difficulty < DifficultyLabels.Length ? DifficultyLabels[difficulty] : $"Difficulty {difficulty}";
+
+    // sort key for the label TrackDetails carries (unknown labels last)
+    public static int DifficultyRank(string label)
+    {
+        var i = Array.IndexOf(DifficultyLabels, label);
+        return i < 0 ? int.MaxValue : i;
+    }
+
+    private sealed record TmxApiTrackDetailsPage(bool More, List<TmxApiTrackDetailsResult>? Results);
 
     // The Unlimiter maps among the event query's: the same query, Unlimiter only. Null when the
     // query already leaves them out (inunlimiter = 0) - then there are none to mark.
@@ -726,17 +866,17 @@ internal sealed class TmxRules
             .Where(kv => !string.IsNullOrWhiteSpace(kv.Key) && !kv.Key.Equals("inunlimiter", StringComparison.OrdinalIgnoreCase))
             .Select(kv => $"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(Convert.ToString(kv.Value, CultureInfo.InvariantCulture) ?? string.Empty)}")
             .Append("inunlimiter=1"));
-        var (ids, _) = await ListPoolAsync(query, cancellationToken);
+        var (ids, _) = await ListPoolAsync(query, cancellationToken, EventMaxPoolPages);
         return [.. ids];
     }
 
     // Every map the query matches (up to MaxPoolPages pages); Complete=false when there are more.
-    private async Task<(int[] Ids, bool Complete)> ListPoolAsync(string query, CancellationToken cancellationToken)
+    private async Task<(int[] Ids, bool Complete)> ListPoolAsync(string query, CancellationToken cancellationToken, int maxPages = MaxPoolPages)
     {
         var ids = new List<int>();
         int? after = null;
 
-        for (var page = 0; page < MaxPoolPages; page++)
+        for (var page = 0; page < maxPages; page++)
         {
             var url = $"https://{GetSiteUrl()}/api/tracks?{query}&fields=TrackId&count={PoolPageSize}"
                 + (after is { } a ? $"&after={a.ToString(CultureInfo.InvariantCulture)}" : string.Empty);

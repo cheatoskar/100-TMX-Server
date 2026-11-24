@@ -35,7 +35,48 @@ internal static class Diagnostics
     // started by hand). Only that one is measured; other instances on the box are not ours.
     private static int dedicatedPid;
 
-    public static void SetDedicatedServerProcess(int pid) => Volatile.Write(ref dedicatedPid, pid);
+    private static string? dedicatedExecutable;
+
+    public static void SetDedicatedServerProcess(int pid, string? executablePath = null)
+    {
+        dedicatedExecutable = executablePath is null ? null : Path.GetFullPath(executablePath);
+        Volatile.Write(ref dedicatedPid, pid);
+    }
+
+    // The TMF server daemonizes on Linux: the process we start forks the real server and exits, so
+    // its pid is gone at once. Find the server by its command line instead (the process NAME is
+    // cut to 15 characters there, "TrackmaniaServe", so GetProcessesByName never matches either).
+    private static Process[] FindDaemonizedServer()
+    {
+        if (!OperatingSystem.IsLinux() || dedicatedExecutable is null)
+        {
+            return [];
+        }
+
+        var found = new List<Process>();
+        foreach (var dir in Directory.EnumerateDirectories("/proc"))
+        {
+            if (!int.TryParse(Path.GetFileName(dir), out var id))
+            {
+                continue;
+            }
+
+            try
+            {
+                var argv0 = File.ReadAllText(Path.Combine(dir, "cmdline")).Split('\0')[0];
+                if (argv0.Length > 0 && Path.GetFullPath(argv0) == dedicatedExecutable)
+                {
+                    found.Add(Process.GetProcessById(id));
+                }
+            }
+            catch (Exception)
+            {
+                // the process ended meanwhile, or is not ours to read
+            }
+        }
+
+        return [.. found];
+    }
 
     public static void Trace(string message)
     {
@@ -128,7 +169,7 @@ internal static class Diagnostics
                 }
                 catch (ArgumentException)
                 {
-                    servers = []; // our server has exited
+                    servers = FindDaemonizedServer(); // the one we started has exited (TMF forks a daemon)
                 }
             }
             else
