@@ -303,7 +303,7 @@ internal partial class AppServiceProvider
             EventUnlimiter = Configurator.GetBool(globalConfig.EventUnlimiter, cmdValue: null, "RANDANY_EVENT_UNLIMITER"),
             EventMapsFromTmx = Configurator.GetString(globalConfig.EventMapsSource, cmdValue: null, "RANDANY_EVENT_MAPS_SOURCE").Trim().Equals("tmx", StringComparison.OrdinalIgnoreCase),
             EventTitle = Configurator.GetString(globalConfig.EventTitle, cmdValue: null, "RANDANY_EVENT_TITLE"),
-            EventTmxRefreshMinutes = globalConfig.EventTmxRefreshMinutes > 0 ? globalConfig.EventTmxRefreshMinutes : 5,
+            EventTmxRefreshMinutes = globalConfig.EventTmxRefreshMinutes > 0 ? globalConfig.EventTmxRefreshMinutes : 60,
             EventTmxQuery = globalConfig.EventTmxQuery.Count > 0
                 ? globalConfig.EventTmxQuery
                 : new Dictionary<string, object> { ["inhasrecord"] = 0, ["inunlimiter"] = 0 },

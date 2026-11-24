@@ -38,7 +38,7 @@ internal sealed class AppConfig
     public bool EventUnlimiter { get; init; }
     public bool EventMapsFromTmx { get; init; }
     public string EventTitle { get; init; } = string.Empty;
-    public int EventTmxRefreshMinutes { get; init; } = 5;
+    public int EventTmxRefreshMinutes { get; init; } = 60;
     public IReadOnlyDictionary<string, object> EventTmxQuery { get; init; } = new Dictionary<string, object>();
     public string EventAfterPreset { get; init; } = string.Empty;
 

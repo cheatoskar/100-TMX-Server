@@ -523,7 +523,7 @@ internal sealed partial class RandomizerGame
             b.Append($"<label posn=\"30 {Inv(y - 0.35)} 0.02\" sizen=\"{Inv(14 / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"DDDF\" text=\"{Esc(d?.Author ?? "")}\"/>");
             var status = here ? "$0F0playing here" : busy ? $"$FC0on {label}" : d is null ? string.Empty : DifficultyColorCode(d.DifficultyLabel) + d.DifficultyLabel;
             b.Append($"<label posn=\"45 {Inv(y - 0.35)} 0.02\" sizen=\"{Inv(11 / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(status)}\"/>");
-            b.Append($"<label posn=\"{Inv(width - 1.5)} {Inv(y - 0.35)} 0.02\" sizen=\"8 2\" halign=\"right\" textsize=\"1\" scale=\"0.9\" textcolor=\"3F5F\" text=\"{(d is null ? "" : FormatTime(d.AuthorTimeMs))}\"/>");
+            b.Append($"<label posn=\"{Inv(width - 1.5)} {Inv(y - 0.35)} 0.02\" sizen=\"8 2\" halign=\"right\" textsize=\"1\" scale=\"0.9\" textcolor=\"3F5F\" text=\"{(d is null || d.AuthorTimeMs <= 0 ? "" : FormatTime(d.AuthorTimeMs))}\"/>");
             y -= 2.2;
         }
 
@@ -566,7 +566,7 @@ internal sealed partial class RandomizerGame
             1 => result.OrderBy(m => eventMapDetails.TryGetValue(m.TrackId, out var d) ? d.Name : "\uffff", StringComparer.OrdinalIgnoreCase),
             2 => result.OrderBy(m => eventMapDetails.TryGetValue(m.TrackId, out var d) ? d.Author : "\uffff", StringComparer.OrdinalIgnoreCase),
             3 => result.OrderBy(m => eventMapDetails.TryGetValue(m.TrackId, out var d) ? TmxRules.DifficultyRank(d.DifficultyLabel) : int.MaxValue),
-            4 => result.OrderBy(m => eventMapDetails.TryGetValue(m.TrackId, out var d) ? d.AuthorTimeMs : int.MaxValue),
+            4 => result.OrderBy(m => eventMapDetails.TryGetValue(m.TrackId, out var d) && d.AuthorTimeMs > 0 ? d.AuthorTimeMs : int.MaxValue),
             _ => result,
         };
 
@@ -651,17 +651,18 @@ internal sealed partial class RandomizerGame
 
     private async Task LoadEventMapDetailsAsync(CancellationToken cancellationToken)
     {
+        LoadEventMapDetailsCacheOnce();
+
         var missing = eventMode.AllMaps.Select(m => m.TrackId).Where(id => !eventMapDetails.ContainsKey(id)).ToList();
         if (missing.Count == 0)
         {
             return;
         }
 
-        // a big list (the search window's index): one paged pass over the event query instead of
-        // one request per 50 ids, in the background so the HUD loop is not held up
+        // many missing (first start with a big list): in the background, so the HUD loop is not held up
         if (missing.Count > BulkDetailsThreshold)
         {
-            LoadEventMapDetailsInBulkInBackground();
+            LoadEventMapDetailsInBackground(missing);
             return;
         }
 
@@ -674,6 +675,8 @@ internal sealed partial class RandomizerGame
             {
                 eventMapDetails[id] = details;
             }
+
+            await SaveEventMapDetailsCacheAsync();
         }
         catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
         {
@@ -684,10 +687,68 @@ internal sealed partial class RandomizerGame
     }
 
     private const int BulkDetailsThreshold = 150;
+
+    // from this many missing maps one paged pass over the whole query (1000 per request) is cheaper
+    // than asking for the missing ids 50 at a time
+    private const int FullPassThreshold = 2000;
+
+    // What TMX said about the open maps, kept on disk: a restart asks only for what is new instead
+    // of everything again. Only the maps still on the list are written back.
+    private sealed record CachedMapDetails(string Name, string Author, string Difficulty, int AuthorTimeMs);
+
+    private bool eventDetailsCacheLoaded;
+
+    private string EventMapDetailsCachePath => Path.Combine(Path.GetDirectoryName(Path.GetFullPath(eventMode.StateFile)) ?? ".", "event-map-details.json");
+
+    private void LoadEventMapDetailsCacheOnce()
+    {
+        if (eventDetailsCacheLoaded)
+        {
+            return;
+        }
+
+        eventDetailsCacheLoaded = true;
+
+        try
+        {
+            if (!File.Exists(EventMapDetailsCachePath))
+            {
+                return;
+            }
+
+            var cached = System.Text.Json.JsonSerializer.Deserialize<Dictionary<int, CachedMapDetails>>(File.ReadAllText(EventMapDetailsCachePath));
+            foreach (var (id, c) in cached ?? [])
+            {
+                eventMapDetails.TryAdd(id, new TmxRules.TrackDetails(c.Name, c.Author, c.Difficulty, 0, c.AuthorTimeMs, []));
+            }
+
+            Console.WriteLine($"Open maps: {eventMapDetails.Count} map(s) known from {EventMapDetailsCachePath}.");
+        }
+        catch (Exception ex)
+        {
+            // only a cache: ask TMX again
+            Console.WriteLine($"Warning: couldn't read {EventMapDetailsCachePath} - {ex.Message}. Asking TMX instead.");
+        }
+    }
+
+    private async Task SaveEventMapDetailsCacheAsync()
+    {
+        try
+        {
+            var open = eventMode.AllMaps.Select(m => m.TrackId).ToHashSet();
+            var keep = eventMapDetails.Where(kv => open.Contains(kv.Key))
+                .ToDictionary(kv => kv.Key, kv => new CachedMapDetails(kv.Value.Name, kv.Value.Author, kv.Value.DifficultyLabel, kv.Value.AuthorTimeMs));
+            await AtomicFile.WriteAllTextAsync(EventMapDetailsCachePath, System.Text.Json.JsonSerializer.Serialize(keep));
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Warning: couldn't write {EventMapDetailsCachePath} - {ex.Message}");
+        }
+    }
     private const int RawNamesMaxMaps = 300;
     private int eventDetailsBulkLoading;
 
-    private void LoadEventMapDetailsInBulkInBackground()
+    private void LoadEventMapDetailsInBackground(List<int> missing)
     {
         if (Interlocked.Exchange(ref eventDetailsBulkLoading, 1) == 1)
         {
@@ -700,13 +761,16 @@ internal sealed partial class RandomizerGame
             {
                 using var budget = CancellationTokenSource.CreateLinkedTokenSource(appToken);
                 budget.CancelAfter(TimeSpan.FromMinutes(10));
-                var all = await tmxRules.ListEventPoolDetailsAsync(budget.Token);
+                var all = missing.Count > FullPassThreshold
+                    ? await tmxRules.ListEventPoolDetailsAsync(budget.Token)
+                    : await tmxRules.GetTrackDetailsBatchAsync(missing, budget.Token);
                 foreach (var (id, details) in all)
                 {
                     eventMapDetails[id] = details;
                 }
 
-                Console.WriteLine($"Open maps: names, authors and times of {all.Count} map(s) loaded for the search.");
+                await SaveEventMapDetailsCacheAsync();
+                Console.WriteLine($"Open maps: names, authors and times of {all.Count} map(s) loaded for the search ({missing.Count} were missing).");
             }
             catch (Exception ex) when (!appToken.IsCancellationRequested)
             {
