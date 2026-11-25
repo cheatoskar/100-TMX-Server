@@ -319,7 +319,7 @@ internal sealed partial class RandomizerGame
         RunInBackground("refreshing the event list", async () =>
         {
             await LoadEventMapDetailsAsync(appToken);
-            await BroadcastHudAsync(HudSection.Event | HudSection.Toolbar, appToken);
+            await BroadcastHudAsync(HudSection.Event | HudSection.Toolbar | HudSection.Top, appToken);
 
             if (eventMode.EndedAt is { } ended && handledEventEnd != ended)
             {
@@ -1740,26 +1740,50 @@ internal sealed partial class RandomizerGame
         }
     }
 
+    // During an event (started, not the everyday list) the widget shows the event's ranking - maps
+    // finished first per player, both servers together - instead of the all-time finishes, so there
+    // is one ranking on screen and it is the one that counts.
+    private bool ShowsEventRanking => eventMode.Enabled && !eventMode.Everyday && !EventStartPending && eventMode.AllMaps.Count > 0;
+
+    private sealed record RankLine(int Finishes, string Nickname);
+
     private string BuildTopFinishers(string login, bool collapsed)
     {
         const double width = 15.5;
-        var top = leaderboard.GetTop(10);
-        var own = leaderboard.GetRank(login);
+        List<RankLine> top;
+        (int Position, int Finishes)? own;
+        string widgetTitle;
+        if (ShowsEventRanking)
+        {
+            var standings = eventMode.Standings();
+            top = [.. standings.Take(10).Select(s => new RankLine(s.Maps, s.Nickname))];
+            var index = standings.ToList().FindIndex(s => s.Login.Equals(login, StringComparison.OrdinalIgnoreCase));
+            own = index >= 0 ? (index + 1, standings[index].Maps) : null;
+            widgetTitle = "Event Ranking";
+        }
+        else
+        {
+            top = [.. leaderboard.GetTop(10).Select(e => new RankLine(e.Finishes, string.IsNullOrEmpty(e.RawNickname) ? e.LastNickname : e.RawNickname))];
+            own = leaderboard.GetRank(login) is { } r ? (r.Position, r.Finishes) : null;
+            widgetTitle = "Top Finishers";
+        }
+
         var ownInTop = own is { } o && o.Position <= top.Count;
+        var countWidth = RankCountWidth(Math.Max(top.Count > 0 ? top.Max(t => t.Finishes) : 0, own?.Finishes ?? 0));
 
         var b = new StringBuilder();
         b.Append($"<frame posn=\"{Inv(63.6 - width)} 23.5 1\">");
 
         if (collapsed)
         {
-            AppendWidgetFrame(b, width, 2.8, "Icons128x128_1", "Rankings", "Top Finishers", ActionHudCollapseTop, collapsed: true);
+            AppendWidgetFrame(b, width, 2.8, "Icons128x128_1", "Rankings", widgetTitle, ActionHudCollapseTop, collapsed: true);
             b.Append("</frame>");
             return b.ToString();
         }
 
         var rows = top.Count + (own is not null && !ownInTop ? 1 : 0);
         var height = 3.3 + Math.Max(rows, 1) * LineHeight + (own is not null && !ownInTop ? 0.6 : 0) + 0.4;
-        AppendWidgetFrame(b, width, height, "Icons128x128_1", "Rankings", "Top Finishers", ActionHudCollapseTop, collapsed: false);
+        AppendWidgetFrame(b, width, height, "Icons128x128_1", "Rankings", widgetTitle, ActionHudCollapseTop, collapsed: false);
 
         // Records Eyepiece colours: top 3 yellow, ahead of you red, you green, behind you grey
         string CountColor(int position) =>
@@ -1780,31 +1804,36 @@ internal sealed partial class RandomizerGame
                 b.Append($"<quad posn=\"0.4 {Inv(y + 0.15)} 0.015\" sizen=\"{Inv(width - 0.8)} {Inv(LineHeight + 0.1)}\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\"/>");
             }
 
-            AppendRankRow(b, y, position, top[i].Finishes, string.IsNullOrEmpty(top[i].RawNickname) ? top[i].LastNickname : top[i].RawNickname, CountColor(position), width);
+            AppendRankRow(b, y, position, top[i].Finishes, top[i].Nickname, CountColor(position), width, countWidth);
             y -= LineHeight;
         }
 
         if (top.Count == 0)
         {
-            b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv(width - 2)} 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"CCCF\" text=\"No finishes yet\"/>");
+            b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv(width - 2)} 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"CCCF\" text=\"{(ShowsEventRanking ? "No event map done yet" : "No finishes yet")}\"/>");
         }
 
         if (own is { } mine && !ownInTop)
         {
             y -= 0.6;
             b.Append($"<quad posn=\"0.4 {Inv(y + 0.15)} 0.015\" sizen=\"{Inv(width - 0.8)} {Inv(LineHeight + 0.1)}\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\"/>");
-            AppendRankRow(b, y, mine.Position, mine.Finishes, GetRawNickname(login), "3F5F", width);
+            AppendRankRow(b, y, mine.Position, mine.Finishes, GetRawNickname(login), "3F5F", width, countWidth);
         }
 
         b.Append("</frame>");
         return b.ToString();
     }
 
-    private static void AppendRankRow(StringBuilder b, double y, int position, int count, string nickname, string countColor, double width)
+    // the count column is as wide as the longest count shown (5 maps or 1234 finishes), the name
+    // starts right after it
+    private static double RankCountWidth(int maxCount) => maxCount.ToString(CultureInfo.InvariantCulture).Length * CharWidth1 * 0.9 + 0.7;
+
+    private static void AppendRankRow(StringBuilder b, double y, int position, int count, string nickname, string countColor, double width, double countWidth = 3.5)
     {
+        var nameX = 2.9 + countWidth;
         b.Append($"<label posn=\"2.6 {Inv(y)} 0.02\" sizen=\"2.4 2\" halign=\"right\" textsize=\"1\" scale=\"0.9\" text=\"{position}.\"/>");
-        b.Append($"<label posn=\"2.9 {Inv(y)} 0.02\" sizen=\"3.4 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"{countColor}\" text=\"{count}\"/>");
-        b.Append($"<label posn=\"6.4 {Inv(y)} 0.02\" sizen=\"{Inv((width - 7) / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(Fit(nickname, width - 7, CharWidth1 * 0.9))}\"/>");
+        b.Append($"<label posn=\"2.9 {Inv(y)} 0.02\" sizen=\"{Inv(countWidth)} 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"{countColor}\" text=\"{count}\"/>");
+        b.Append($"<label posn=\"{Inv(nameX)} {Inv(y)} 0.02\" sizen=\"{Inv((width - nameX - 0.6) / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(Fit(nickname, width - nameX - 0.6, CharWidth1 * 0.9))}\"/>");
     }
 
     private string BuildEventPanel(string login, bool collapsed)

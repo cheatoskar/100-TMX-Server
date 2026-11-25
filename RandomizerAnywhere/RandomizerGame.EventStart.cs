@@ -198,7 +198,7 @@ internal sealed partial class RandomizerGame
             await SendMessageAsync($"$FC0» {eventMode.Title} has started! Everyone plays now - good luck!", cancellationToken);
         }
 
-        await BroadcastHudAsync(HudSection.Event, cancellationToken);
+        await BroadcastHudAsync(HudSection.Event | HudSection.Top, cancellationToken);
     }
 
     // The last open map was just finished: before the results, one direct look at TMX, so maps
