@@ -740,6 +740,7 @@ internal sealed partial class RandomizerGame
                 nicknameCache[login] = await client.GetPlayerNicknameAsync(login, cancellationToken);
 
                 await SendWelcomeMessageAsync(login, cancellationToken);
+                await HoldForEventStartAsync(login, cancellationToken);
                 await SendMapWidgetsToLoginAsync(login, cancellationToken);
             }
             catch (Exception ex)
@@ -1187,6 +1188,7 @@ internal sealed partial class RandomizerGame
         _ = StatusWriteLoopAsync(cancellationToken);
         _ = StalledMapWatchLoopAsync(cancellationToken);
         _ = HudLoopAsync(cancellationToken);
+        ScheduleEventStart();
 
         if (config.IsLegacyServer)
         {

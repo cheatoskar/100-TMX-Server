@@ -220,7 +220,7 @@ internal sealed partial class RandomizerGame
 
         RecordMapFinishTime(login, time);
 
-        if (eventMode.Enabled && eventMode.EndedAt is null && currentMapTrackId is { } trackId && eventMode.IsListed(trackId))
+        if (eventMode.Enabled && eventMode.EndedAt is null && !EventStartPending && currentMapTrackId is { } trackId && eventMode.IsListed(trackId))
         {
             if (await eventMode.RecordFinishAsync(trackId, login, GetRawNickname(login), time))
             {
@@ -230,7 +230,11 @@ internal sealed partial class RandomizerGame
                     ? $"$FC0» {GetNicknameOrLogin(login)}$z$FC0 finished {name} ({FormatTime(time)}) - upload the replay to TMX! {left} open map(s) left."
                     : $"$FC0» Event: {GetNicknameOrLogin(login)}$z$FC0 finished {name} first ({FormatTime(time)}) - {left} map(s) left.", cancellationToken);
 
-                if (left == 0)
+                if (left == 0 && !eventMode.Everyday && await EventListGrewOnTmxAsync(cancellationToken))
+                {
+                    await SendMessageAsync($"$FC0» New maps were uploaded to TMX - {eventMode.OpenMaps.Count} more to go!", cancellationToken);
+                }
+                else if (left == 0)
                 {
                     await eventMode.TryEndAsync();
                 }
@@ -1754,6 +1758,11 @@ internal sealed partial class RandomizerGame
             : winner is not null
             ? $"{Fit(eventMode.Title, 5, CharWidth1)} $AAA· $z{Fit(winner.Nickname, 5, CharWidth1)}"
             : $"{Fit(eventMode.Title, 6.5, CharWidth1)} $AAA· {all.Count - open.Count}/{all.Count}";
+
+        if (EventStartPending)
+        {
+            title = $"{Fit(eventMode.Title, 6.5, CharWidth1)} $AAA· starts {EventStartClock()}";
+        }
 
         var b = new StringBuilder();
         b.Append("<frame posn=\"-63.6 23.5 1\">");
