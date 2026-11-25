@@ -12,7 +12,47 @@ internal sealed partial class RandomizerGame
     private readonly ConcurrentDictionary<string, byte> heldForEventStart = new(StringComparer.OrdinalIgnoreCase);
     private int eventStartDone;
 
-    private bool EventStartPending => eventMode.Enabled && config.EventStartsAt is { } at && DateTimeOffset.UtcNow < at;
+    private bool EventStartPending => eventMode.Enabled && config.EventStartsAt is { } at && DateTimeOffset.UtcNow < at && Volatile.Read(ref eventStartDone) == 0;
+
+    private bool IsAdmin(string login) => config.AdminLogins.Count == 0 || config.AdminLogins.Contains(login);
+
+    // before the start nothing is voted: no map is played, skipped or loaded ahead of everyone
+    private async Task<bool> RefusedBeforeEventStartAsync(string login, CancellationToken cancellationToken)
+    {
+        if (!EventStartPending || config.AdminLogins.Contains(login))
+        {
+            return false;
+        }
+
+        await SendMessageAsync(login, $"$FC0» Votes open when {eventMode.Title} starts at {EventStartClock()}.", cancellationToken);
+        return true;
+    }
+
+    // "/event start": an admin opens the event now instead of at EventStartsAt
+    private async Task<bool> TryStartEventByHandAsync(string login, string[] args, CancellationToken cancellationToken)
+    {
+        if (args.Length == 0 || !args[0].Equals("start", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (!IsAdmin(login))
+        {
+            await SendMessageAsync(login, "$F00Only server admins can start the event.", cancellationToken);
+        }
+        else if (!EventStartPending)
+        {
+            await SendMessageAsync(login, "The event is not waiting for its start.", cancellationToken);
+        }
+        else
+        {
+            // a chat command holds the game lock; the preset switch takes it again - so not inline
+            Console.WriteLine($"Event: started by hand by {login}.");
+            RunInBackground("starting the event by hand", () => StartEventAsync(appToken));
+        }
+
+        return true;
+    }
 
     // "20:00" in the HUD's clock zone
     private string EventStartClock()
@@ -172,7 +212,7 @@ internal sealed partial class RandomizerGame
             var before = eventMode.AllMaps.Count;
             var (ids, complete) = await tmxRules.ListEventPoolAsync(budget.Token);
             var unlimiter = await tmxRules.ListEventUnlimiterIdsAsync(budget.Token);
-            await eventMode.MergeTmxPoolAsync([.. ids.Where(id => !tmxRules.IsExcludedFromRotation(id))], complete, unlimiter);
+            await eventMode.MergeTmxPoolAsync([.. ids.Where(id => !tmxRules.IsExcludedFromRotation(id))], complete, unlimiter, force: true);
             var grown = eventMode.AllMaps.Count - before;
             if (grown > 0)
             {

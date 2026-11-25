@@ -1898,6 +1898,11 @@ internal sealed partial class RandomizerGame
 
     private async Task SkipAsync(int playerUid, string login, string[] args, CancellationToken cancellationToken)
     {
+        if (await RefusedBeforeEventStartAsync(login, cancellationToken))
+        {
+            return;
+        }
+
         if (!SessionActive)
         {
             await SendMessageAsync(login, "$F00No session is running - nothing to skip.", cancellationToken);
@@ -2772,6 +2777,11 @@ internal sealed partial class RandomizerGame
 
     private async Task VotePresetAsync(int playerUid, string login, string[] args, CancellationToken cancellationToken)
     {
+        if (await RefusedBeforeEventStartAsync(login, cancellationToken))
+        {
+            return;
+        }
+
         if (args.Length == 0)
         {
             // players type /votepreset expecting the clickable list, not a usage line
@@ -3113,6 +3123,11 @@ internal sealed partial class RandomizerGame
 
     private async Task VoteMapAsync(int playerUid, string login, string[] args, CancellationToken cancellationToken)
     {
+        if (await RefusedBeforeEventStartAsync(login, cancellationToken))
+        {
+            return;
+        }
+
         if (args.Length == 0 || !int.TryParse(args[0], out var trackId))
         {
             await SendMessageAsync(login, "Usage: $FF0/votemap <TMX id>$FFF, then others type $FF0/yes$FFF to support.", cancellationToken);

@@ -157,7 +157,8 @@ internal sealed class EventMode
     // Maps stay in the list once in it - finished ones as done; one TMX no longer lists and nobody
     // here finished (a record came from elsewhere) leaves it; new uploads are added at the end.
     // A list cut short (complete = false) only adds, it never removes.
-    public async Task MergeTmxPoolAsync(IReadOnlyList<int> fetched, bool complete, IReadOnlyCollection<int>? unlimiterIds = null)
+    // force: the check before the event ends - it must not be dropped because another refresh was recent
+    public async Task MergeTmxPoolAsync(IReadOnlyList<int> fetched, bool complete, IReadOnlyCollection<int>? unlimiterIds = null, bool force = false)
     {
         if (!Enabled || !UsesTmxSource)
         {
@@ -171,7 +172,7 @@ internal sealed class EventMode
             changed = false;
 
             // another server refreshed it while this one asked TMX
-            if (tmxPoolUpdated is { } updated && DateTimeOffset.UtcNow - updated < RefreshEvery / 2)
+            if (!force && tmxPoolUpdated is { } updated && DateTimeOffset.UtcNow - updated < RefreshEvery / 2)
             {
                 return;
             }
