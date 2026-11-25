@@ -220,7 +220,7 @@ internal sealed partial class RandomizerGame
 
         RecordMapFinishTime(login, time);
 
-        if (eventMode.Enabled && eventMode.EndedAt is null && currentMapTrackId is { } trackId && eventMode.IsListed(trackId))
+        if (eventMode.Enabled && eventMode.EndedAt is null && !EventStartPending && currentMapTrackId is { } trackId && eventMode.IsListed(trackId))
         {
             if (await eventMode.RecordFinishAsync(trackId, login, GetRawNickname(login), time))
             {
@@ -230,7 +230,11 @@ internal sealed partial class RandomizerGame
                     ? $"$FC0» {GetNicknameOrLogin(login)}$z$FC0 finished {name} ({FormatTime(time)}) - upload the replay to TMX! {left} open map(s) left."
                     : $"$FC0» Event: {GetNicknameOrLogin(login)}$z$FC0 finished {name} first ({FormatTime(time)}) - {left} map(s) left.", cancellationToken);
 
-                if (left == 0)
+                if (left == 0 && !eventMode.Everyday && eventMode.UsesTmxSource && await EventListGrewOnTmxAsync(cancellationToken))
+                {
+                    await SendMessageAsync($"$FC0» New maps were uploaded to TMX - {eventMode.OpenMaps.Count} more to go!", cancellationToken);
+                }
+                else if (left == 0)
                 {
                     await eventMode.TryEndAsync();
                 }
@@ -315,7 +319,7 @@ internal sealed partial class RandomizerGame
         RunInBackground("refreshing the event list", async () =>
         {
             await LoadEventMapDetailsAsync(appToken);
-            await BroadcastHudAsync(HudSection.Event | HudSection.Toolbar, appToken);
+            await BroadcastHudAsync(HudSection.Event | HudSection.Toolbar | HudSection.Top, appToken);
 
             if (eventMode.EndedAt is { } ended && handledEventEnd != ended)
             {
@@ -395,22 +399,38 @@ internal sealed partial class RandomizerGame
         var span = eventMode.FinishSpan();
         var duration = span is { } s ? s.Last - s.First : TimeSpan.Zero;
 
-        await client.SendManialinkPageAsync(BuildEventResultsWindow(), cancellationToken: cancellationToken);
-        await SendMessageAsync(
-        [
-            $"$FC0» {eventMode.Title} is finished! {eventMode.AllMaps.Count} maps in {(int)duration.TotalHours}:{duration.Minutes:00} h.",
-            standings.Count > 0
-                ? $"$FC0» Winner: {standings[0].Nickname}$z$FC0 with {standings[0].Maps} map(s). GG everyone!"
-                : "$FC0» GG everyone!",
-        ], cancellationToken);
+        // with the XML head and <manialinks> like every other window - sent bare, the client drew the
+        // boxes and medals but none of the text. Revealed in steps: the title, 3rd, 2nd, the winner.
+        await SendMessageAsync($"$FC0» $o{eventMode.Title} is finished!$z$FC0 {eventMode.AllMaps.Count} maps in {(int)duration.TotalHours}:{duration.Minutes:00} h - the podium:", cancellationToken);
+        await client.SendManialinkPageAsync(AsManialinkPage(BuildEventResultsWindow(stage: 0)), cancellationToken: cancellationToken);
+
+        string[] places = ["$FC0» 1st and WINNER", "$CCD» 2nd", "$C84» 3rd"];
+        for (var stage = 1; stage <= 3; stage++)
+        {
+            var rank = 4 - stage;
+            if (standings.Count < rank)
+            {
+                continue;
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(3), cancellationToken);
+            await client.SendManialinkPageAsync(AsManialinkPage(BuildEventResultsWindow(stage)), cancellationToken: cancellationToken);
+            var st = standings[rank - 1];
+            await SendMessageAsync($"{places[rank - 1]}: {st.Nickname}$z$FFF with {st.Maps} map{(st.Maps == 1 ? "" : "s")}{(rank == 1 ? " - GG everyone!" : ".")}", cancellationToken);
+        }
+
+        await client.SendManialinkPageAsync(AsManialinkPage(BuildEventResultsWindow(stage: 3)), cancellationToken: cancellationToken);
 
         if (string.IsNullOrWhiteSpace(config.EventAfterPreset) || !config.SourceFromEventList)
         {
             return;
         }
 
-        // a moment to look at the results before the next map loads
-        await Task.Delay(TimeSpan.FromSeconds(15), cancellationToken);
+        // time to look at the results before the next preset's map loads; then the window goes (it
+        // comes back with /event)
+        await Task.Delay(TimeSpan.FromSeconds(45), cancellationToken);
+        await client.SendManialinkPageAsync($"<manialink id=\"{EventResultsId}\"></manialink>", cancellationToken: cancellationToken);
+        await SendMessageAsync("$FC0» Type $FFF/event$FC0 to see the results again.", cancellationToken);
 
         await RunUnderGameLockAsync("switching to the preset after the event", async token =>
         {
@@ -458,6 +478,11 @@ internal sealed partial class RandomizerGame
         if (!eventMode.Enabled)
         {
             await SendMessageAsync(login, "No event is running on this server.", cancellationToken);
+            return;
+        }
+
+        if (await TryStartEventByHandAsync(login, args, cancellationToken))
+        {
             return;
         }
 
@@ -663,52 +688,95 @@ internal sealed partial class RandomizerGame
         b.Append($"<quad posn=\"{Inv(width - 3.2)} -0.5 0.03\" sizen=\"2.4 2.4\" style=\"Icons64x64_1\" substyle=\"Close\" action=\"{closeAction}\"/>");
     }
 
-    private string BuildEventResultsWindow()
+    // The end of the event, shown on every server: the screen dims, the title, the numbers, then the
+    // podium is revealed from 3rd to 1st (stage 1..3), the rest of the top 10 with the winner. A
+    // Close button; the window stays until it is closed or the next preset loads.
+    private string BuildEventResultsWindow(int stage = 3)
     {
         var standings = eventMode.Standings();
         var span = eventMode.FinishSpan();
         var duration = span is { } s ? s.Last - s.First : TimeSpan.Zero;
-        const double width = 56;
-        var rest = standings.Skip(3).Take(7).ToList();
-        var height = 21 + rest.Count * LineHeight + 2;
+        const double width = 84;
+        const double height = 62;
+        const double left = -width / 2;
+        const double top = 33;
 
         var b = new StringBuilder();
-        b.Append($"<manialink id=\"{EventResultsId}\"><frame posn=\"{Inv(-width / 2)} {Inv(height / 2 + 4)} 25\">");
-        AppendShade(b, width, height, 7);
+        // z 22: the client draws no text and no icons from z 25 up (quads like the medals it does) -
+        // the window used to sit at 25 and showed boxes and medals only
+        b.Append($"<manialink id=\"{EventResultsId}\"><frame posn=\"{Inv(left)} {Inv(top)} 22\">");
+
+        // the whole screen a shade darker, the window on top
+        b.Append($"<quad posn=\"{Inv(-64 - left)} {Inv(48 - top)} -0.02\" sizen=\"128 96\" bgcolor=\"000A\"/>");
+        AppendShade(b, width, height, 10);
         b.Append($"<quad posn=\"0 0 0\" sizen=\"{Inv(width)} {Inv(height)}\" style=\"Bgs1InRace\" substyle=\"NavButton\"/>");
         b.Append($"<quad posn=\"0.4 -0.36 0.01\" sizen=\"{Inv(width - 0.8)} 3\" style=\"BgsPlayerCard\" substyle=\"BgRacePlayerName\"/>");
         b.Append("<quad posn=\"0.7 0 0.02\" sizen=\"3.4 3.4\" style=\"Icons128x128_1\" substyle=\"Rankings\"/>");
-        b.Append($"<label posn=\"4.6 -0.8 0.02\" sizen=\"44 2\" textsize=\"3\" text=\"{Esc($"$o{eventMode.Title} finished!")}\"/>");
+        b.Append($"<label posn=\"4.6 -0.8 0.02\" sizen=\"60 2\" textsize=\"2\" text=\"{Esc($"$o{eventMode.Title}")}\"/>");
         b.Append($"<quad posn=\"{Inv(width - 3.4)} -0.6 0.03\" sizen=\"2.6 2.6\" style=\"Icons64x64_1\" substyle=\"Close\" action=\"{ActionEventResultsClose}\"/>");
-        b.Append($"<label posn=\"{Inv(width / 2)} -4.4 0.02\" sizen=\"50 2\" halign=\"center\" textsize=\"1\" textcolor=\"DDDF\" text=\"{Esc($"{eventMode.AllMaps.Count} maps done in {(int)duration.TotalHours}:{duration.Minutes:00} h - thanks for playing!")}\"/>");
 
-        // podium: 2nd left, 1st middle (raised), 3rd right
-        (int Rank, double X, double Y, string Medal)[] podium = [(1, width / 2, -7, "MedalGold"), (2, width / 2 - 17, -8.5, "MedalSilver"), (3, width / 2 + 17, -9.5, "MedalBronze")];
-        foreach (var (rank, x, y, medal) in podium)
+        b.Append($"<label posn=\"{Inv(width / 2)} -5 0.02\" sizen=\"80 5\" halign=\"center\" textsize=\"6\" text=\"$o$FC0EVENT FINISHED\"/>");
+        var players = standings.Count;
+        b.Append($"<label posn=\"{Inv(width / 2)} -11 0.02\" sizen=\"80 2\" halign=\"center\" textsize=\"2\" textcolor=\"DDDF\" text=\"{Esc($"{eventMode.AllMaps.Count} maps  $AAA·$DDD  {(int)duration.TotalHours}:{duration.Minutes:00} h  $AAA·$DDD  {players} player{(players == 1 ? "" : "s")} on the board")}\"/>");
+
+        // podium blocks: 2nd left, 1st middle and highest, 3rd right; revealed 3rd, 2nd, 1st
+        const double baseY = -45;
+        (int Rank, double X, double H, string Medal, string Color)[] podium =
+        [
+            (2, width / 2 - 22, 10, "MedalSilver", "CCD"),
+            (1, width / 2, 14, "MedalGold", "FC0"),
+            (3, width / 2 + 22, 7, "MedalBronze", "C84"),
+        ];
+        foreach (var (rank, x, h, medal, color) in podium)
         {
+            var blockTop = baseY + h;
+            b.Append($"<quad posn=\"{Inv(x - 10)} {Inv(blockTop)} 0.01\" sizen=\"20 {Inv(h)}\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\"/>");
+            b.Append($"<label posn=\"{Inv(x)} {Inv(blockTop - 1)} 0.02\" sizen=\"18 5\" halign=\"center\" textsize=\"5\" text=\"$o${color}{rank}\"/>");
+
+            var revealed = stage >= 4 - rank;
             if (standings.Count < rank)
             {
                 continue;
             }
 
+            if (!revealed)
+            {
+                b.Append($"<label posn=\"{Inv(x)} {Inv(blockTop + 6)} 0.02\" sizen=\"18 4\" halign=\"center\" textsize=\"4\" textcolor=\"8888\" text=\"$o?\"/>");
+                continue;
+            }
+
             var st = standings[rank - 1];
-            b.Append($"<quad posn=\"{Inv(x - 2.5)} {Inv(y)} 0.02\" sizen=\"5 5\" style=\"MedalsBig\" substyle=\"{medal}\"/>");
-            b.Append($"<label posn=\"{Inv(x)} {Inv(y - 5.6)} 0.02\" sizen=\"16 2\" halign=\"center\" textsize=\"2\" text=\"{Esc(st.Nickname)}\"/>");
-            b.Append($"<label posn=\"{Inv(x)} {Inv(y - 8)} 0.02\" sizen=\"16 2\" halign=\"center\" textsize=\"1\" textcolor=\"FC0F\" text=\"{st.Maps} map{(st.Maps == 1 ? "" : "s")}\"/>");
+            var winner = rank == 1;
+            b.Append($"<quad posn=\"{Inv(x - (winner ? 3.5 : 3))} {Inv(blockTop + (winner ? 13.5 : 12))} 0.02\" sizen=\"{(winner ? 7 : 6)} {(winner ? 7 : 6)}\" style=\"MedalsBig\" substyle=\"{medal}\"/>");
+            b.Append($"<label posn=\"{Inv(x)} {Inv(blockTop + (winner ? 6.3 : 5.2))} 0.02\" sizen=\"{(winner ? 26 : 20)} 3\" halign=\"center\" textsize=\"{(winner ? 4 : 3)}\" text=\"{Esc(st.Nickname)}\"/>");
+            b.Append($"<label posn=\"{Inv(x)} {Inv(blockTop + 2.2)} 0.02\" sizen=\"20 2\" halign=\"center\" textsize=\"2\" text=\"{Esc($"${color}{st.Maps} map{(st.Maps == 1 ? "" : "s")}")}\"/>");
+            if (winner)
+            {
+                b.Append($"<label posn=\"{Inv(x)} {Inv(blockTop + 16)} 0.02\" sizen=\"30 3\" halign=\"center\" textsize=\"3\" text=\"$o$FC0WINNER\"/>");
+            }
         }
 
-        var ry = -20.0;
-        for (var i = 0; i < rest.Count; i++)
+        // 4th to 10th, once the winner is out
+        if (stage >= 3)
         {
-            b.Append($"<label posn=\"{Inv(width / 2 - 12)} {Inv(ry)} 0.02\" sizen=\"3 2\" halign=\"right\" textsize=\"1\" text=\"{i + 4}.\"/>");
-            b.Append($"<label posn=\"{Inv(width / 2 - 11)} {Inv(ry)} 0.02\" sizen=\"18 2\" textsize=\"1\" text=\"{Esc(rest[i].Nickname)}\"/>");
-            b.Append($"<label posn=\"{Inv(width / 2 + 12)} {Inv(ry)} 0.02\" sizen=\"6 2\" halign=\"right\" textsize=\"1\" textcolor=\"FC0F\" text=\"{rest[i].Maps}\"/>");
-            ry -= LineHeight;
+            var rest = standings.Skip(3).Take(7).ToList();
+            for (var i = 0; i < rest.Count; i++)
+            {
+                var colX = i < 4 ? 8.0 : width / 2 + 4;
+                var ry = baseY - 1.5 - (i % 4) * 2.1;
+                b.Append($"<label posn=\"{Inv(colX + 3)} {Inv(ry)} 0.02\" sizen=\"3 2\" halign=\"right\" textsize=\"1\" textcolor=\"AAAF\" text=\"{i + 4}.\"/>");
+                b.Append($"<label posn=\"{Inv(colX + 4)} {Inv(ry)} 0.02\" sizen=\"22 2\" textsize=\"1\" text=\"{Esc(Fit(rest[i].Nickname, 22, CharWidth1))}\"/>");
+                b.Append($"<label posn=\"{Inv(colX + 33)} {Inv(ry)} 0.02\" sizen=\"6 2\" halign=\"right\" textsize=\"1\" textcolor=\"FC0F\" text=\"{rest[i].Maps}\"/>");
+            }
         }
 
+        b.Append($"<quad posn=\"{Inv(width / 2 - 6)} {Inv(-height + 3.4)} 0.02\" sizen=\"12 2.6\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\" action=\"{ActionEventResultsClose}\"/>");
+        b.Append($"<label posn=\"{Inv(width / 2)} {Inv(-height + 2.8)} 0.03\" sizen=\"12 2\" halign=\"center\" textsize=\"1\" text=\"$FC0GG!\"/>");
         b.Append("</frame></manialink>");
         return b.ToString();
     }
+
+    private static string AsManialinkPage(string manialink) => $"<?xml version=\"1.0\" encoding=\"UTF-8\"?><manialinks>{manialink}</manialinks>";
 
     private async Task LoadEventMapDetailsAsync(CancellationToken cancellationToken)
     {
@@ -1672,26 +1740,50 @@ internal sealed partial class RandomizerGame
         }
     }
 
+    // During an event (started, not the everyday list) the widget shows the event's ranking - maps
+    // finished first per player, both servers together - instead of the all-time finishes, so there
+    // is one ranking on screen and it is the one that counts.
+    private bool ShowsEventRanking => eventMode.Enabled && !eventMode.Everyday && !EventStartPending && eventMode.AllMaps.Count > 0;
+
+    private sealed record RankLine(int Finishes, string Nickname);
+
     private string BuildTopFinishers(string login, bool collapsed)
     {
         const double width = 15.5;
-        var top = leaderboard.GetTop(10);
-        var own = leaderboard.GetRank(login);
+        List<RankLine> top;
+        (int Position, int Finishes)? own;
+        string widgetTitle;
+        if (ShowsEventRanking)
+        {
+            var standings = eventMode.Standings();
+            top = [.. standings.Take(10).Select(s => new RankLine(s.Maps, s.Nickname))];
+            var index = standings.ToList().FindIndex(s => s.Login.Equals(login, StringComparison.OrdinalIgnoreCase));
+            own = index >= 0 ? (index + 1, standings[index].Maps) : null;
+            widgetTitle = "Event Ranking";
+        }
+        else
+        {
+            top = [.. leaderboard.GetTop(10).Select(e => new RankLine(e.Finishes, string.IsNullOrEmpty(e.RawNickname) ? e.LastNickname : e.RawNickname))];
+            own = leaderboard.GetRank(login) is { } r ? (r.Position, r.Finishes) : null;
+            widgetTitle = "Top Finishers";
+        }
+
         var ownInTop = own is { } o && o.Position <= top.Count;
+        var countWidth = RankCountWidth(Math.Max(top.Count > 0 ? top.Max(t => t.Finishes) : 0, own?.Finishes ?? 0));
 
         var b = new StringBuilder();
         b.Append($"<frame posn=\"{Inv(63.6 - width)} 23.5 1\">");
 
         if (collapsed)
         {
-            AppendWidgetFrame(b, width, 2.8, "Icons128x128_1", "Rankings", "Top Finishers", ActionHudCollapseTop, collapsed: true);
+            AppendWidgetFrame(b, width, 2.8, "Icons128x128_1", "Rankings", widgetTitle, ActionHudCollapseTop, collapsed: true);
             b.Append("</frame>");
             return b.ToString();
         }
 
         var rows = top.Count + (own is not null && !ownInTop ? 1 : 0);
         var height = 3.3 + Math.Max(rows, 1) * LineHeight + (own is not null && !ownInTop ? 0.6 : 0) + 0.4;
-        AppendWidgetFrame(b, width, height, "Icons128x128_1", "Rankings", "Top Finishers", ActionHudCollapseTop, collapsed: false);
+        AppendWidgetFrame(b, width, height, "Icons128x128_1", "Rankings", widgetTitle, ActionHudCollapseTop, collapsed: false);
 
         // Records Eyepiece colours: top 3 yellow, ahead of you red, you green, behind you grey
         string CountColor(int position) =>
@@ -1712,31 +1804,36 @@ internal sealed partial class RandomizerGame
                 b.Append($"<quad posn=\"0.4 {Inv(y + 0.15)} 0.015\" sizen=\"{Inv(width - 0.8)} {Inv(LineHeight + 0.1)}\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\"/>");
             }
 
-            AppendRankRow(b, y, position, top[i].Finishes, string.IsNullOrEmpty(top[i].RawNickname) ? top[i].LastNickname : top[i].RawNickname, CountColor(position), width);
+            AppendRankRow(b, y, position, top[i].Finishes, top[i].Nickname, CountColor(position), width, countWidth);
             y -= LineHeight;
         }
 
         if (top.Count == 0)
         {
-            b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv(width - 2)} 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"CCCF\" text=\"No finishes yet\"/>");
+            b.Append($"<label posn=\"1 {Inv(y)} 0.02\" sizen=\"{Inv(width - 2)} 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"CCCF\" text=\"{(ShowsEventRanking ? "No event map done yet" : "No finishes yet")}\"/>");
         }
 
         if (own is { } mine && !ownInTop)
         {
             y -= 0.6;
             b.Append($"<quad posn=\"0.4 {Inv(y + 0.15)} 0.015\" sizen=\"{Inv(width - 0.8)} {Inv(LineHeight + 0.1)}\" style=\"BgsPlayerCard\" substyle=\"BgCardSystem\"/>");
-            AppendRankRow(b, y, mine.Position, mine.Finishes, GetRawNickname(login), "3F5F", width);
+            AppendRankRow(b, y, mine.Position, mine.Finishes, GetRawNickname(login), "3F5F", width, countWidth);
         }
 
         b.Append("</frame>");
         return b.ToString();
     }
 
-    private static void AppendRankRow(StringBuilder b, double y, int position, int count, string nickname, string countColor, double width)
+    // the count column is as wide as the longest count shown (5 maps or 1234 finishes), the name
+    // starts right after it
+    private static double RankCountWidth(int maxCount) => maxCount.ToString(CultureInfo.InvariantCulture).Length * CharWidth1 * 0.9 + 0.7;
+
+    private static void AppendRankRow(StringBuilder b, double y, int position, int count, string nickname, string countColor, double width, double countWidth = 3.5)
     {
+        var nameX = 2.9 + countWidth;
         b.Append($"<label posn=\"2.6 {Inv(y)} 0.02\" sizen=\"2.4 2\" halign=\"right\" textsize=\"1\" scale=\"0.9\" text=\"{position}.\"/>");
-        b.Append($"<label posn=\"2.9 {Inv(y)} 0.02\" sizen=\"3.4 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"{countColor}\" text=\"{count}\"/>");
-        b.Append($"<label posn=\"6.4 {Inv(y)} 0.02\" sizen=\"{Inv((width - 7) / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(Fit(nickname, width - 7, CharWidth1 * 0.9))}\"/>");
+        b.Append($"<label posn=\"2.9 {Inv(y)} 0.02\" sizen=\"{Inv(countWidth)} 2\" textsize=\"1\" scale=\"0.9\" textcolor=\"{countColor}\" text=\"{count}\"/>");
+        b.Append($"<label posn=\"{Inv(nameX)} {Inv(y)} 0.02\" sizen=\"{Inv((width - nameX - 0.6) / 0.9)} 2\" textsize=\"1\" scale=\"0.9\" text=\"{Esc(Fit(nickname, width - nameX - 0.6, CharWidth1 * 0.9))}\"/>");
     }
 
     private string BuildEventPanel(string login, bool collapsed)
@@ -1754,6 +1851,11 @@ internal sealed partial class RandomizerGame
             : winner is not null
             ? $"{Fit(eventMode.Title, 5, CharWidth1)} $AAA· $z{Fit(winner.Nickname, 5, CharWidth1)}"
             : $"{Fit(eventMode.Title, 6.5, CharWidth1)} $AAA· {all.Count - open.Count}/{all.Count}";
+
+        if (EventStartPending)
+        {
+            title = $"{Fit(eventMode.Title, 6.5, CharWidth1)} $AAA· starts {EventStartClock()}";
+        }
 
         var b = new StringBuilder();
         b.Append("<frame posn=\"-63.6 23.5 1\">");

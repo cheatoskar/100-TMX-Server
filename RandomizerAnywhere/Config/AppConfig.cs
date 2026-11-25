@@ -46,6 +46,11 @@ internal sealed class AppConfig
     public IReadOnlyDictionary<string, object> EventTmxQuery { get; init; } = new Dictionary<string, object>();
     public string EventAfterPreset { get; init; } = string.Empty;
 
+    // the event opens at this time (players watch until then) and switches to EventStartPreset;
+    // null = the event runs from the controller's start, as before
+    public DateTimeOffset? EventStartsAt { get; init; }
+    public string EventStartPreset { get; init; } = string.Empty;
+
     // "skip", "only" or "include" (see GlobalConfig.EventUnlimiterMaps)
     public string EventUnlimiterMaps { get; init; } = "skip";
     public bool EventEveryday { get; init; }

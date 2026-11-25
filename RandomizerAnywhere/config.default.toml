@@ -68,6 +68,12 @@ EventTmxRefreshMinutes = 60
 # Once every map on the list is finished, every server shows the results (winner = most maps
 # finished first) and switches to this preset, e.g. "100tmx_tmnf". Empty = stay on the event.
 EventAfterPreset = ""
+# The event opens at a set time without a restart: until EventStartsAt (with its UTC offset, e.g.
+# "2026-12-04T20:00:00+01:00") every player except the admins can only watch and no finish counts;
+# then the server switches to EventStartPreset (e.g. "event_tmnf") and everyone plays. Empty = the
+# event runs from the start of the controller.
+EventStartsAt = ""
+EventStartPreset = ""
 # Which of the list's maps this server plays: "skip" the Unlimiter maps, "only" those, or
 # "include" both. Empty = "only" with EventUnlimiter = true, else "skip". With EventMapsSource =
 # "tmx" the Unlimiter maps are found on TMX (leave inunlimiter out of [EventTmxQuery] to list them).

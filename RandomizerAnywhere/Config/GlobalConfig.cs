@@ -86,6 +86,11 @@ internal sealed class GlobalConfig
     // the preset the servers switch to once every event map is finished; empty = stay
     public string EventAfterPreset { get; set; } = string.Empty;
 
+    // "2026-12-04T20:00:00+01:00": until then every player but the admins watches and no finish
+    // counts; then the server switches to EventStartPreset and everyone plays. Empty = no start time.
+    public string EventStartsAt { get; set; } = string.Empty;
+    public string EventStartPreset { get; set; } = string.Empty;
+
     // Which event maps this server plays: "skip" Unlimiter maps (vanilla clients can't load them),
     // "only" Unlimiter maps, or "include" both. Empty = "only" with EventUnlimiter, else "skip".
     public string EventUnlimiterMaps { get; set; } = string.Empty;

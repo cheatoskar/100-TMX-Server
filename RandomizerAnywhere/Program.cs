@@ -310,6 +310,8 @@ internal partial class AppServiceProvider
                 ? globalConfig.EventTmxQuery
                 : new Dictionary<string, object> { ["inhasrecord"] = 0, ["inunlimiter"] = 0 },
             EventAfterPreset = Configurator.GetString(globalConfig.EventAfterPreset, cmdValue: null, "RANDANY_EVENT_AFTER_PRESET"),
+            EventStartsAt = ParseEventStart(Configurator.GetString(globalConfig.EventStartsAt, cmdValue: null, "RANDANY_EVENT_STARTS_AT")),
+            EventStartPreset = Configurator.GetString(globalConfig.EventStartPreset, cmdValue: null, "RANDANY_EVENT_START_PRESET"),
             EventUnlimiterMaps = Configurator.GetString(globalConfig.EventUnlimiterMaps, cmdValue: null, "RANDANY_EVENT_UNLIMITER_MAPS").Trim().ToLowerInvariant() switch
             {
                 "only" => "only",
@@ -352,5 +354,24 @@ internal partial class AppServiceProvider
         }
 
         return appConfig;
+    }
+
+    // "2026-12-04T20:00:00+01:00"; empty = no start time. A time without an offset is refused - the
+    // server's clock is UTC and the event's time is not.
+    private static DateTimeOffset? ParseEventStart(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        var hasOffset = value.EndsWith("Z", StringComparison.OrdinalIgnoreCase) || System.Text.RegularExpressions.Regex.IsMatch(value, "[+-][0-9]{2}:?[0-9]{2}$");
+        if (hasOffset && DateTimeOffset.TryParse(value, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out var at))
+        {
+            return at;
+        }
+
+        Console.WriteLine($"Warning: EventStartsAt '{value}' is not a time with its offset (e.g. 2026-12-04T20:00:00+01:00) - the event runs without a start time.");
+        return null;
     }
 }
