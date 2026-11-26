@@ -4,6 +4,9 @@ internal sealed class GlobalConfig
 {
     public string Game { get; set; } = string.Empty;
     public string TmxGame { get; set; } = string.Empty;
+
+    // TM2 only: TMStadium@nadeo (default), TMCanyon@nadeo, TMValley@nadeo, TMLagoon@nadeo
+    public string TitlePack { get; set; } = string.Empty;
     public string BindIP { get; set; } = string.Empty;
     public ushort XmlRpcPort { get; set; }
     public string AutoSkipMode { get; set; } = string.Empty;

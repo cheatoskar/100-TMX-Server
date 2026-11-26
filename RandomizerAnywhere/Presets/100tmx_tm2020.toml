@@ -1,0 +1,12 @@
+DisplayName = "100% TMX Project (TM2020)"
+Description = "Random trackmania.exchange maps without a replay yet - finish them to get TMX to 100 %."
+Games = ["TM2020"]
+
+TmxGame = "TM2020"
+AutoSkipMode = "Finished"
+
+[TmxQuery]
+# trackmania.exchange runs the Mania Exchange API: "inhasreplay", not "inhasrecord" (that one is
+# silently ignored there - checked 2026-11-14). TM_Race leaves out Royal, Platform and Stunt maps.
+inhasreplay = 0
+maptype = "TM_Race"

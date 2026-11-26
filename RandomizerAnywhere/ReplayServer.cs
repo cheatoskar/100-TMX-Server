@@ -6,7 +6,7 @@ using Microsoft.Extensions.Logging;
 
 namespace RandomizerAnywhere;
 
-internal sealed class ReplayServer
+internal sealed partial class ReplayServer
 {
     private readonly string replaysDir;
     private readonly string statusDir;
@@ -33,7 +33,16 @@ internal sealed class ReplayServer
             .Replace("{{TITLE_JS}}", System.Text.Json.JsonSerializer.Serialize(serverName).Replace("<", "\u003c"))
             .Replace("{{TITLE}}", System.Net.WebUtility.HtmlEncode(serverName))
             .Replace("{{FAVORITE_LOGIN}}", System.Uri.EscapeDataString(favoriteLogin));
+
+        // no login = no button (TM2/TM2020 have no tmtp:// favourites link)
+        if (string.IsNullOrEmpty(favoriteLogin))
+        {
+            indexHtml = FavoriteButtonRegex().Replace(indexHtml, string.Empty);
+        }
     }
+
+    [System.Text.RegularExpressions.GeneratedRegex("<a class=\"btn fav\"[^\n]*?</a>")]
+    private static partial System.Text.RegularExpressions.Regex FavoriteButtonRegex();
 
     public async Task StartAsync()
     {
